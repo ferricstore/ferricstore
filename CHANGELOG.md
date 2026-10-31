@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: BF.INSERT, CF.INSERT and CF.INSERTNX, as RedisBloom answers
+  them: a missing filter is created with CAPACITY (and ERROR) or, under
+  NOCREATE, refused with `ERR not found`; a full cuckoo filter answers -1 for
+  the items it could not take.
+
 - New commands: BITFIELD and BITFIELD_RO (GET, SET, INCRBY, OVERFLOW
   WRAP/SAT/FAIL on i1..i64 and u1..u63 fields), as Redis answers them.
   BITFIELD's writes read and write the string in one compound entry from

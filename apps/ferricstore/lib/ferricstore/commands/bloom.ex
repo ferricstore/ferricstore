@@ -13,6 +13,8 @@ defmodule Ferricstore.Commands.Bloom do
     * `BF.RESERVE key error_rate capacity` -- creates a new Bloom filter
     * `BF.ADD key element` -- adds an element (auto-creates with defaults if missing)
     * `BF.MADD key element [element ...]` -- adds multiple elements
+    * `BF.INSERT key [CAPACITY c] [ERROR e] [EXPANSION x] [NOCREATE] [NONSCALING]
+      ITEMS item [item ...]` -- adds items, creating the filter with the options
     * `BF.EXISTS key element` -- checks if an element may exist
     * `BF.MEXISTS key element [element ...]` -- checks multiple elements
     * `BF.CARD key` -- returns the number of elements added
@@ -91,6 +93,29 @@ defmodule Ferricstore.Commands.Bloom do
   def handle("BF.MADD", args, store), do: bf_madd_args(args, store)
 
   # ---------------------------------------------------------------------------
+  # BF.INSERT key [CAPACITY capacity] [ERROR error_rate] [EXPANSION expansion]
+  #   [NOCREATE] [NONSCALING] ITEMS item [item ...] — BF.RESERVE of a missing
+  #   filter with the options (refused with NOCREATE), then BF.MADD
+  # ---------------------------------------------------------------------------
+
+  # The add always carries the default creation parameters: a filter the
+  # write finds missing is created, never refused. (A missing file refused
+  # in apply stops a WARaft shard's apply until it restarts.)
+  def handle("BF.INSERT", [key | args], store) do
+    with {:ok, opts, items} <- parse_insert(args, %{capacity: nil, error_rate: nil, create: true}),
+         :ok <- check_element_types(items),
+         :ok <- validate_bloom_batch_size(items),
+         :ok <- ProbType.check_expected(key, :bloom, store),
+         :ok <- ensure_insert_filter(key, opts, store) do
+      store
+      |> do_prob_write({:bloom_madd, key, items, default_auto_create_params()})
+      |> normalize_add_result()
+    end
+  end
+
+  def handle("BF.INSERT", _args, _store), do: insert_arity_error()
+
+  # ---------------------------------------------------------------------------
   # BF.EXISTS key element — local stateless pread
   # ---------------------------------------------------------------------------
 
@@ -141,6 +166,81 @@ defmodule Ferricstore.Commands.Bloom do
 
   defp bf_madd_args(_args, _store) do
     {:error, "ERR wrong number of arguments for 'bf.madd' command"}
+  end
+
+  # EXPANSION and NONSCALING are taken and change nothing: FerricStore's
+  # filters do not grow.
+  defp parse_insert(["ITEMS" | items], opts) when items != [], do: {:ok, opts, items}
+
+  defp parse_insert([option | rest], opts) do
+    case {String.upcase(option), rest} do
+      {"ITEMS", [_ | _] = items} ->
+        {:ok, opts, items}
+
+      {"CAPACITY", [raw | rest]} ->
+        with {:ok, capacity} <- parse_pos_integer(raw, "capacity"),
+             do: parse_insert(rest, %{opts | capacity: capacity})
+
+      {"ERROR", [raw | rest]} ->
+        with {:ok, error_rate} <- parse_float(raw, "error_rate"),
+             :ok <- validate_error_rate(error_rate),
+             do: parse_insert(rest, %{opts | error_rate: error_rate})
+
+      {"EXPANSION", [raw | rest]} ->
+        with {:ok, _expansion} <- parse_pos_integer(raw, "expansion"),
+             do: parse_insert(rest, opts)
+
+      {"NOCREATE", rest} ->
+        parse_insert(rest, %{opts | create: false})
+
+      {"NONSCALING", rest} ->
+        parse_insert(rest, opts)
+
+      {name, _rest} when name in ["ITEMS", "CAPACITY", "ERROR", "EXPANSION"] ->
+        insert_arity_error()
+
+      _other ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  defp parse_insert([], _opts), do: insert_arity_error()
+
+  defp insert_arity_error, do: {:error, "ERR wrong number of arguments for 'bf.insert' command"}
+
+  # A missing filter is reserved with the options, as BF.RESERVE would (one
+  # another client reserved in between is used as it is); with NOCREATE it is
+  # refused.
+  defp ensure_insert_filter(key, opts, store) do
+    cond do
+      bloom_file_exists?(key, store) ->
+        :ok
+
+      not opts.create ->
+        {:error, "ERR not found"}
+
+      true ->
+        capacity = opts.capacity || @default_capacity
+        error_rate = opts.error_rate || @default_error_rate
+
+        with :ok <- validate_bloom_capacity(capacity),
+             {:ok, num_bits, num_hashes} <- validated_bloom_params(capacity, error_rate) do
+          case check_bloom_not_exists(key, store) do
+            :ok ->
+              case do_bloom_reserve(key, capacity, error_rate, num_bits, num_hashes, store) do
+                :ok -> :ok
+                {:error, "ERR item exists"} -> :ok
+                {:error, _reason} = error -> error
+              end
+
+            {:error, "ERR item exists"} ->
+              :ok
+
+            {:error, _reason} = error ->
+              error
+          end
+        end
+    end
   end
 
   # The embedded API passes elements through as given; one that is not a

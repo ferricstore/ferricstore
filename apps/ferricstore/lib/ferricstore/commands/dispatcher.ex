@@ -65,7 +65,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @stream_raw_commands ~w(XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK XPENDING XCLAIM XAUTOCLAIM XSETID)
   @geo_raw_commands ~w(GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE)
   @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
-  @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
+  @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.INSERT CF.INSERT CF.INSERTNX BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
   @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
   @conditional_zadd_flags ~w(NX XX GT LT)
   @latched_commands ~w(HSETNX ZADD GEOADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
@@ -238,7 +238,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
   )
-  @raw_fallback_ast_tags ~w(hmset touch time lmpop lcs sort sort_ro bitfield bitfield_ro bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending xclaim xautoclaim xsetid geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @raw_fallback_ast_tags ~w(hmset touch time lmpop lcs sort sort_ro bitfield bitfield_ro bf_insert cf_insert cf_insertnx bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending xclaim xautoclaim xsetid geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
@@ -412,6 +412,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     bf_reserve: "bf.reserve",
     bf_add: "bf.add",
     bf_madd: "bf.madd",
+    bf_insert: "bf.insert",
+    cf_insert: "cf.insert",
+    cf_insertnx: "cf.insertnx",
     bf_exists: "bf.exists",
     bf_mexists: "bf.mexists",
     bf_card: "bf.card",

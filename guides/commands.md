@@ -1284,6 +1284,7 @@ Backed by mmap NIF resources. Each filter is a memory-mapped file at `data_dir/p
 | `BF.RESERVE` | `BF.RESERVE key error_rate capacity` | `+OK` or error | error_rate: (0,1), capacity: positive int |
 | `BF.ADD` | `BF.ADD key element` | `1` (added) or `0` | Auto-creates with defaults (0.01, 100) |
 | `BF.MADD` | `BF.MADD key element [element ...]` | Array of 1/0 | Auto-creates |
+| `BF.INSERT` | `BF.INSERT key [CAPACITY c] [ERROR e] [EXPANSION x] [NOCREATE] [NONSCALING] ITEMS item [item ...]` | Array of 1/0 | A missing filter is reserved with CAPACITY and ERROR (defaults 100, 0.01), or refused with `ERR not found` under NOCREATE; EXPANSION and NONSCALING are taken and change nothing |
 | `BF.EXISTS` | `BF.EXISTS key element` | `1` (may exist) or `0` | Returns 0 for non-existent keys |
 | `BF.MEXISTS` | `BF.MEXISTS key element [element ...]` | Array of 1/0 | Returns all 0s for non-existent keys |
 | `BF.CARD` | `BF.CARD key` | Integer | Items added count |
@@ -1302,6 +1303,8 @@ Backed by mmap NIF resources at `data_dir/prob/shard_N/KEY.cuckoo`. Supports del
 | `CF.RESERVE` | `CF.RESERVE key capacity` | `+OK` or error | Bucket size: 4 |
 | `CF.ADD` | `CF.ADD key element` | `1` or error (filter full) | Auto-creates with capacity 1024 |
 | `CF.ADDNX` | `CF.ADDNX key element` | `1` (added), `0` (already exists), or error | |
+| `CF.INSERT` | `CF.INSERT key [CAPACITY c] [NOCREATE] ITEMS item [item ...]` | Array: `1` added, `-1` filter full | A missing filter is created with CAPACITY (default 1024), or refused with `ERR not found` under NOCREATE |
+| `CF.INSERTNX` | `CF.INSERTNX key [CAPACITY c] [NOCREATE] ITEMS item [item ...]` | Array: `1` added, `0` may exist, `-1` full | As CF.INSERT, adding with CF.ADDNX |
 | `CF.DEL` | `CF.DEL key element` | `1` (deleted) or `0` (not found) | Deletes one occurrence |
 | `CF.EXISTS` | `CF.EXISTS key element` | `1` or `0` | |
 | `CF.MEXISTS` | `CF.MEXISTS key element [element ...]` | Array of 1/0 | |
