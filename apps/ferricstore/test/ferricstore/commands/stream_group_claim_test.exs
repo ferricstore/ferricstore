@@ -13,11 +13,16 @@ defmodule Ferricstore.Commands.StreamGroupClaimTest do
   @nokey "ERR The XGROUP subcommand requires the key to exist. Note that for CREATE " <>
            "you may want to use the MKSTREAM option to create an empty stream automatically."
 
-  defp start(level) do
+  # Feature levels never go down, so each level gets one throwaway data dir.
+  def isolate(level) do
     {:ok, _} = Application.ensure_all_started(:ferricstore)
     isolated = ShardHelpers.setup_isolated_data_dir()
-    on_exit(fn -> ShardHelpers.teardown_isolated_data_dir(isolated) end)
-    assert {:ok, %{active: ^level}} = FerricStore.raise_cluster_feature_level(level)
+    ExUnit.Callbacks.on_exit(fn -> ShardHelpers.teardown_isolated_data_dir(isolated) end)
+    {:ok, %{active: ^level}} = FerricStore.raise_cluster_feature_level(level)
+    :ok
+  end
+
+  def start do
     ctx = FerricStore.Instance.get(:default)
     tag = "xclaim:{#{System.unique_integer([:positive])}}"
     d = fn command, args -> Dispatcher.dispatch(command, args, ctx) end
@@ -31,9 +36,10 @@ defmodule Ferricstore.Commands.StreamGroupClaimTest do
 
   defp pending(d, k), do: d.("XPENDING", [k.("s"), "g", "-", "+", "100"])
 
-  describe "at feature level 11" do
-    setup do: start(11)
+  setup_all do: isolate(11)
+  setup do: start()
 
+  describe "at feature level 11" do
     test "XCLAIM moves idle entries to a consumer", %{d: d, k: k} do
       assert [["1-0", "f", "1-0"], ["2-0", "f", "2-0"]] ==
                d.("XCLAIM", [k.("s"), "g", "bob", "0", "1-0", "2-0"])
@@ -185,10 +191,18 @@ defmodule Ferricstore.Commands.StreamGroupClaimTest do
       assert {:error, "ERR no such key"} == d.("XSETID", [k.("missing"), "1-0"])
     end
   end
+end
+
+defmodule Ferricstore.Commands.StreamGroupClaimBelowLevel11Test do
+  @moduledoc "Below feature level 11 the stream group writes are refused."
+  use ExUnit.Case, async: false
+
+  alias Ferricstore.Commands.StreamGroupClaimTest
+
+  setup_all do: StreamGroupClaimTest.isolate(10)
+  setup do: StreamGroupClaimTest.start()
 
   describe "below feature level 11" do
-    setup do: start(10)
-
     test "the new stream writes are refused", %{d: d, k: k} do
       for args <- [
             ["XCLAIM", k.("s"), "g", "bob", "0", "1-0"],
