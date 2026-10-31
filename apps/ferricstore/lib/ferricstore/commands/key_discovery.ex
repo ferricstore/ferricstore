@@ -33,6 +33,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
         }
 
   @read_key_commands MapSet.new(~w(
+    SORT SORT_RO
     LCS
     GET MGET GETRANGE STRLEN
     HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN HTTL HPTTL
@@ -228,12 +229,15 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
       discovery_metadata(command, ast, acl_keys)
 
+    pattern_keys = pattern_acl_keys(command, ast)
+    read_keys = read_keys ++ pattern_keys
+
     %{
       command: command,
       args: args,
       ast: ast,
       command_keys: command_keys(command, ast, discovered_keys),
-      acl_keys: acl_keys,
+      acl_keys: acl_keys ++ pattern_keys,
       channel_keys: channel_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
@@ -282,6 +286,12 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   def extract("TOUCH", keys), do: {:ok, keys}
   def extract("LCS", [key_a, key_b | _options]), do: {:ok, [key_a, key_b]}
   def extract("LCS", keys), do: {:ok, keys}
+
+  def extract("SORT", [key | _options] = args),
+    do: {:ok, [key | List.wrap(Ferricstore.Commands.Sort.store_destination(args))]}
+
+  def extract(command, [key | _options]) when command in ["SORT", "SORT_RO"], do: {:ok, [key]}
+  def extract(command, []) when command in ["SORT", "SORT_RO"], do: {:ok, []}
 
   def extract("OBJECT", [subcommand, key | _args]) do
     if String.upcase(subcommand) in ["ENCODING", "FREQ", "IDLETIME", "REFCOUNT"] do
@@ -341,9 +351,12 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
       discovery_metadata(command, ast, acl_keys)
 
+    pattern_keys = pattern_acl_keys(command, ast)
+    read_keys = read_keys ++ pattern_keys
+
     %{
       command_keys: command_keys(command, ast, discovered_keys),
-      acl_keys: acl_keys,
+      acl_keys: acl_keys ++ pattern_keys,
       channel_keys: channel_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
@@ -459,6 +472,15 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   defp acl_resources(_command, discovered_keys), do: {discovered_keys, []}
 
+  # SORT's BY and GET patterns read keys named by the elements, which no
+  # check can list in advance: as in Redis, "*" asks for read access to every
+  # key. It is not routed or counted among the keys the command names.
+  defp pattern_acl_keys(command, {tag, args})
+       when command in ["SORT", "SORT_RO"] and tag in [:sort, :sort_ro] and is_list(args),
+       do: Ferricstore.Commands.Sort.pattern_acl_keys(args)
+
+  defp pattern_acl_keys(_command, _ast), do: []
+
   defp discovery_metadata(command, ast, acl_keys) do
     {read_keys, write_keys} = footprint(command, ast, acl_keys)
     {routing_scope, routing_keys} = routing(command, ast, acl_keys)
@@ -518,7 +540,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   defp footprint(command, _ast, keys), do: footprint(command, keys)
 
   defp footprint(command, [source, destination | _rest])
-       when command == "COPY",
+       when command in ["COPY", "SORT"],
        do: {[source], [destination]}
 
   defp footprint("RENAMENX", [source, destination | _rest]) do

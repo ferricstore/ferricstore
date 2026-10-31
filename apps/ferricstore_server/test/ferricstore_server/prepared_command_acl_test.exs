@@ -130,6 +130,21 @@ defmodule FerricstoreServer.PreparedCommandAclTest do
     assert reason =~ "channels mentioned"
   end
 
+  test "prepared SORT with BY or GET patterns needs read access to every key" do
+    assert {:ok, plain} = Dispatcher.prepare_raw("SORT", ["{t}list", "GET", "#"])
+    assert {:ok, by} = Dispatcher.prepare_raw("SORT", ["{t}list", "BY", "{t}w_*"])
+    assert {:ok, get} = Dispatcher.prepare_raw("SORT_RO", ["{t}list", "GET", "{t}o_*->f"])
+
+    scoped = cache([pattern("{t}*", :rw)])
+    assert :ok = Auth.check_keys_cached(scoped, plain)
+    assert {:error, _reason} = Auth.check_keys_cached(scoped, by)
+    assert {:error, _reason} = Auth.check_keys_cached(scoped, get)
+
+    everything = cache([pattern("*", :read)])
+    assert :ok = Auth.check_keys_cached(everything, by)
+    assert :ok = Auth.check_keys_cached(%{enabled: true, keys: :all}, get)
+  end
+
   defp cache(patterns), do: %{enabled: true, keys: patterns}
 
   defp pattern(glob, access), do: {glob, access, Acl.compile_glob(glob)}

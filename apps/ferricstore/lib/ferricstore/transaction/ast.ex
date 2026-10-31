@@ -106,6 +106,11 @@ defmodule Ferricstore.Transaction.Ast do
       when tag in [:zunion, :zinter, :zdiff, :zintercard, :zmpop, :lmpop],
       do: {tag, namespace_counted_keys(numkeys, rest, ns)}
 
+  # SORT's patterns name keys too: a namespace prefixes them, so a sandbox's
+  # SORT reads only its own keys (`#` is the element itself).
+  def namespace_ast_keys({tag, [key | options]}, ns) when tag in [:sort, :sort_ro],
+    do: {tag, [namespace_key(key, ns) | namespace_sort_options(options, ns)]}
+
   def namespace_ast_keys({:lcs, [key_a, key_b | options]}, ns),
     do: {:lcs, [namespace_key(key_a, ns), namespace_key(key_b, ns) | options]}
 
@@ -198,6 +203,12 @@ defmodule Ferricstore.Transaction.Ast do
   defp count_pairs_up_to(_improper_tail, _remaining, _count), do: :invalid
 
   @spec derive_command_keys(term()) :: [binary()]
+  def derive_command_keys({tag, [key | _options] = args}) when tag in [:sort, :sort_ro] do
+    if tag == :sort,
+      do: [key | List.wrap(Ferricstore.Commands.Sort.store_destination(args))],
+      else: [key]
+  end
+
   def derive_command_keys(ast) do
     ast
     |> namespace_ast_keys(@derivation_namespace)
@@ -263,4 +274,15 @@ defmodule Ferricstore.Transaction.Ast do
       other -> other
     end)
   end
+
+  defp namespace_sort_options([option, value | rest], ns) do
+    if String.upcase(option) in ["BY", "STORE"] or
+         (String.upcase(option) == "GET" and value != "#") do
+      [option, namespace_key(value, ns) | namespace_sort_options(rest, ns)]
+    else
+      [option | namespace_sort_options([value | rest], ns)]
+    end
+  end
+
+  defp namespace_sort_options(options, _ns), do: options
 end

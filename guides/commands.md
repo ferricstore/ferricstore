@@ -40,7 +40,7 @@ EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIM
 SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP,
 PFADD, PFCOUNT, PFMERGE,
 GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH, GEOSEARCHSTORE,
-PING, ECHO, TIME, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
+PING, ECHO, TIME, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, SORT, SORT_RO, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
 OBJECT HELP/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
 SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND DOCS/COMMAND GETKEYS,
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
@@ -267,7 +267,6 @@ These are FerricStore-native commands:
 ### Command Names Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
-`SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full cluster command family),
 `DUMP`, `RESTORE`, `MIGRATE`, `MOVE`,
@@ -1143,6 +1142,34 @@ needs cluster feature level 12.
 |---|---|
 | **Protocol command** | `TOUCH key [key ...]` |
 | **Return** | Integer |
+| **Status** | Supported |
+
+### SORT / SORT_RO
+
+Sorts the elements of a list, set or sorted set: as numbers (an element that
+is not one answers `ERR One or more scores can't be converted into double`),
+or as strings with ALPHA; DESC reverses, and ties sort by the element. BY
+sorts by weights read from keys named by a pattern (`weight_*`, or
+`hash_*->field` for a hash field; a missing weight counts as 0), and a BY
+pattern without `*` keeps a list's or sorted set's own order. GET answers
+values named by patterns instead of the elements (`#` is the element; a
+missing value is nil). LIMIT offset count takes a range of the result.
+
+As in Redis Cluster, a BY or GET pattern is taken only when the keys it names
+share the sorted key's hash slot (a `{tag}` before any wildcard), else `ERR BY
+option of SORT denied in Cluster mode ...`; and since those keys cannot be
+checked in advance, only a user with read access to every key may use one.
+
+SORT ... STORE replaces the destination (same slot) with the result as a
+list, or deletes it when the result is empty, and answers the count; a
+missing GET value is stored as an empty string. STORE needs cluster feature
+level 12, where the read and the write run as one-command transaction.
+SORT_RO refuses STORE. Inside MULTI both need level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC\|DESC] [ALPHA] [STORE destination]` |
+| **Return** | Array, or integer with STORE |
 | **Status** | Supported |
 
 ### RENAME / RENAMENX / COPY

@@ -154,6 +154,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     "BRPOP" => "rpop",
     "BLMPOP" => "lpop",
     "LMPOP" => "lpop",
+    "SORT" => "sortstore",
     "BZPOPMIN" => "zpopmin",
     "BZPOPMAX" => "zpopmax",
     "BZMPOP" => "zpopmin",
@@ -310,6 +311,16 @@ defmodule Ferricstore.KeyspaceNotifications do
       _invalid -> :ok
     end
   end
+
+  # SORT ... STORE fires on its destination when it stored elements.
+  defp notify_event("SORT", event, args, count) when is_integer(count) and count > 0 do
+    case Ferricstore.Commands.Sort.store_destination(args) do
+      destination when is_binary(destination) -> notify_key(destination, event)
+      nil -> :ok
+    end
+  end
+
+  defp notify_event("SORT", _event, _args, _result), do: :ok
 
   defp notify_event("LMPOP", _event, args, [key, _popped]) do
     case Ferricstore.Commands.Blocking.parse_lmpop_args(args) do

@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: SORT and SORT_RO, with BY, LIMIT, GET, ASC/DESC, ALPHA and
+  (SORT) STORE, as Redis in cluster mode answers them: BY and GET patterns
+  must name keys in the sorted key's slot, and need read access to every key.
+  STORE needs cluster feature level 12, where it runs as one-command
+  transaction; inside MULTI both need level 12.
+
 - New command: LCS, the longest common subsequence of two strings, with LEN,
   IDX, MINMATCHLEN and WITHMATCHLEN as Redis answers them. Strings whose
   lengths multiply past 16,777,216 are refused. Inside MULTI it needs cluster
