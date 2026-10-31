@@ -108,6 +108,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #     ones, so it works on collections past them; and a collection delete
   #     (DEL, UNLINK, SET over it) removes every member a page of the member
   #     bound at a time. Older releases refuse the same entries.
+  #     XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other than
+  #     CREATE are stream operations (`Stream.GroupWrites`) older releases do
+  #     not apply.
   @supported 11
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
