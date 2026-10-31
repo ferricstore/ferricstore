@@ -1065,6 +1065,62 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndexTest do
     end)
   end
 
+  test "row_slice skips to a middle position without stepping the catalog per member", %{
+    keydir: keydir,
+    index: index
+  } do
+    prefix = CompoundKey.list_prefix("long")
+
+    for rank <- 0..1_999 do
+      compound_key = CompoundKey.list_element("long", rank * 1_000_000_000)
+      :ets.insert(keydir, {compound_key, "v#{rank}", 0, 0, 0, 0, byte_size("v#{rank}")})
+      CompoundMemberIndex.put(index, compound_key)
+    end
+
+    # A stale catalog entry is dropped and not counted, as before.
+    stale = CompoundKey.list_element("long", 500 * 1_000_000_000)
+    :ets.delete(keydir, stale)
+
+    {steps, {forward, backward}} =
+      count_ets_steps(fn ->
+        {CompoundMemberIndex.row_slice(index, %{keydir: keydir}, prefix, 900, 2, 1_999),
+         CompoundMemberIndex.row_slice(index, %{keydir: keydir}, prefix, 1_500, 2, 1_999)}
+      end)
+
+    assert {:ok, [{_, "v901", _, _, _, _, _}, {_, "v902", _, _, _, _, _}]} = forward
+    assert {:ok, [{_, "v1501", _, _, _, _, _}, {_, "v1502", _, _, _, _, _}]} = backward
+
+    assert [] ==
+             :ets.lookup(
+               index,
+               {prefix,
+                binary_part(stale, byte_size(prefix), byte_size(stale) - byte_size(prefix))}
+             )
+
+    assert steps < 200, "row_slice stepped the catalog #{steps} times"
+  end
+
+  # ETS steps taken while `fun` runs, counted VM-wide (other processes add a
+  # few).
+  defp count_ets_steps(fun) do
+    steps = [{:ets, :next, 2}, {:ets, :prev, 2}]
+    Enum.each(steps, &:erlang.trace_pattern(&1, true, [:call_count]))
+
+    try do
+      result = fun.()
+
+      count =
+        Enum.sum_by(steps, fn mfa ->
+          {:call_count, count} = :erlang.trace_info(mfa, :call_count)
+          count
+        end)
+
+      {count, result}
+    after
+      Enum.each(steps, &:erlang.trace_pattern(&1, false, [:call_count]))
+    end
+  end
+
   test "row_slice excludes expired catalog rows before applying positional bounds", %{
     keydir: keydir,
     index: index
