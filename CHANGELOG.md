@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: HEXPIREAT and HPEXPIREAT set hash field expiries at a Unix
+  time (with NX, XX, GT or LT, as HEXPIRE), and HPEXPIRETIME answers them in
+  milliseconds. Inside MULTI they need cluster feature level 12.
+
 - New commands: HMSET (HSET answering `OK`, for older clients), TOUCH and
   TIME. Inside MULTI, HMSET and TOUCH need cluster feature level 12, as older
   releases do not have them; TIME is not taken there.

@@ -675,10 +675,15 @@ FerricStore supports per-field expiry on hash fields:
 | `HPEXPIRE` | `HPEXPIRE key ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
 | `HPTTL` | `HPTTL key FIELDS count field [field ...]` | Same as HTTL but milliseconds |
 | `HEXPIRETIME` | `HEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (seconds) |
+| `HEXPIREAT` | `HEXPIREAT key unix-seconds [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE; a time already past deletes the field (`2`) |
+| `HPEXPIREAT` | `HPEXPIREAT key unix-ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIREAT but milliseconds |
+| `HPEXPIRETIME` | `HPEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (milliseconds) |
 | `HGETDEL` | `HGETDEL key FIELDS count field [field ...]` | List of values (nil for missing) |
 | `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values; a TTL of 0 or a past time deletes the fields |
 | `HSETEX` | `HSETEX key [FNX\|FXX] [EX sec\|PX ms\|EXAT ts\|PXAT ms\|KEEPTTL] FIELDS count field value [...]` | `1` when set, `0` when FNX/FXX refused; without an expiry option it clears the fields' TTL |
 | `HSETEX` (FerricStore form) | `HSETEX key seconds field value [field value ...]` | Count of new fields |
+
+Inside MULTI, HEXPIREAT, HPEXPIREAT and HPEXPIRETIME need cluster feature level 12.
 
 **Status:** Supported for native TCP and embedded command handlers.
 
