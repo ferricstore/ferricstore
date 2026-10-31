@@ -26,7 +26,7 @@ APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
 HSET, HMSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
 HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HEXPIREAT,
 HPEXPIREAT, HPEXPIRETIME, HGETDEL, HGETEX, HSETEX,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
+LPUSH, RPUSH, LPOP, RPOP, LMPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
 SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
 SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
 ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
@@ -267,7 +267,6 @@ These are FerricStore-native commands:
 ### Command Names Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
-`LMPOP` (multi-key pop),
 `SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full cluster command family),
@@ -758,6 +757,20 @@ Push only if the list already exists. Returns 0 if the key does not exist.
 | | |
 |---|---|
 | **Protocol command** | `LPUSHX key element [element ...]`, `RPUSHX key element [element ...]` |
+| **Status** | Supported |
+
+### LMPOP
+
+Pops up to `count` elements (one by default) from the first of the keys that
+holds a list with elements, and answers `[key, [element ...]]`, or nil when
+none has. The keys must share a hash slot. Of several keys, which one has
+elements is decided where the pops apply (from cluster feature level 12; one
+key's pop is a single write already). Inside MULTI it needs level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `LMPOP numkeys key [key ...] LEFT\|RIGHT [COUNT count]` |
+| **Return** | Array `[key, [element ...]]` or nil |
 | **Status** | Supported |
 
 ### BLPOP / BRPOP / BLMOVE / BLMPOP

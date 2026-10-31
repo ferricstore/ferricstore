@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New command: LMPOP, the non-blocking BLMPOP. Of several keys it picks the
+  first with elements where the pops apply (one-command transaction, from
+  cluster feature level 12); inside MULTI it needs level 12.
+
 - New commands: HEXPIREAT and HPEXPIREAT set hash field expiries at a Unix
   time (with NX, XX, GT or LT, as HEXPIRE), and HPEXPIRETIME answers them in
   milliseconds. Inside MULTI they need cluster feature level 12.

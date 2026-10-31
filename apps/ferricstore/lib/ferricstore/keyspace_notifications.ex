@@ -153,6 +153,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     "BLPOP" => "lpop",
     "BRPOP" => "rpop",
     "BLMPOP" => "lpop",
+    "LMPOP" => "lpop",
     "BZPOPMIN" => "zpopmin",
     "BZPOPMAX" => "zpopmax",
     "BZMPOP" => "zpopmin",
@@ -206,7 +207,7 @@ defmodule Ferricstore.KeyspaceNotifications do
   @zero_result_noop ~w(SETNX MSETNX DEL UNLINK EXPIRE PEXPIRE EXPIREAT PEXPIREAT
     PERSIST RENAMENX COPY HSETNX HDEL LPUSHX RPUSHX SADD SREM SMOVE ZREM LREM PFADD
     XDEL XTRIM)
-  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP
+  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP LMPOP
     BZPOPMIN BZPOPMAX BZMPOP ZMPOP)
   @empty_list_result_noop ~w(LPOP RPOP SPOP ZPOPMIN ZPOPMAX)
 
@@ -310,8 +311,17 @@ defmodule Ferricstore.KeyspaceNotifications do
     end
   end
 
-  defp notify_event(command, _event, _args, _result) when command in ~w(BLPOP BRPOP BLMPOP),
-    do: :ok
+  defp notify_event("LMPOP", _event, args, [key, _popped]) do
+    case Ferricstore.Commands.Blocking.parse_lmpop_args(args) do
+      {:ok, _keys, :right, _count} -> notify_key(key, "rpop")
+      {:ok, _keys, :left, _count} -> notify_key(key, "lpop")
+      _invalid -> :ok
+    end
+  end
+
+  defp notify_event(command, _event, _args, _result)
+       when command in ~w(BLPOP BRPOP BLMPOP LMPOP),
+       do: :ok
 
   # The sorted-set pops name the key they served in their reply; ZMPOP and
   # BZMPOP fire the event of the side they popped.
