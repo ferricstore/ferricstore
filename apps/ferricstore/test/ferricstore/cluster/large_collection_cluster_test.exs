@@ -2,7 +2,8 @@ defmodule Ferricstore.Cluster.LargeCollectionClusterTest do
   @moduledoc """
   From feature level 11 RENAME, the STORE forms, EXPIRE and DEL apply past the
   per-command member bound as one entry each, which every replica applies (by
-  its state machine or WARaft's projection) to the same result.
+  its state machine or WARaft's projection) to the same result; from level 12
+  EXPIRE and PERSIST do so as compound command entries.
   """
   use ExUnit.Case, async: false
 
@@ -67,6 +68,44 @@ defmodule Ferricstore.Cluster.LargeCollectionClusterTest do
                  member_rows(node, @union, CompoundKey.set_prefix(@union)) == 0
              end),
              "#{node.name}: #{inspect(state(node))}"
+    end
+  end
+
+  test "from feature level 12 every replica applies EXPIRE and PERSIST alike", %{
+    nodes: [first, second, third] = nodes
+  } do
+    assert {:ok, %{active: 12}} =
+             ClusterHelper.run(first.name, FerricStore, :raise_cluster_feature_level, [12])
+
+    list = "{large-cluster}list"
+
+    for chunk <- Enum.chunk_every(1..5_000, 2_000) do
+      dispatch(first, "HSET", [@hash | Enum.flat_map(chunk, &["f#{&1}", "v#{&1}"])])
+      dispatch(first, "RPUSH", [list | Enum.map(chunk, &"e#{&1}")])
+    end
+
+    assert 1 == dispatch(second, "EXPIRE", [@hash, "1000"])
+    assert 1 == dispatch(third, "EXPIRE", [list, "1000", "NX"])
+
+    for node <- nodes do
+      assert eventually(fn ->
+               dispatch(node, "TTL", [@hash]) in 990..1000 and
+                 dispatch(node, "TTL", [list]) in 990..1000
+             end),
+             "#{node.name}: #{inspect({dispatch(node, "TTL", [@hash]), dispatch(node, "TTL", [list])})}"
+    end
+
+    assert 1 == dispatch(third, "PERSIST", [@hash])
+    assert 1 == dispatch(first, "PEXPIRE", [list, "500", "LT"])
+
+    for node <- nodes do
+      assert eventually(fn ->
+               dispatch(node, "TTL", [@hash]) == -1 and
+                 dispatch(node, "HLEN", [@hash]) == 5_000 and
+                 dispatch(node, "EXISTS", [list]) == 0 and
+                 member_rows(node, list, CompoundKey.list_prefix(list)) == 0
+             end),
+             "#{node.name}: #{inspect({dispatch(node, "TTL", [@hash]), dispatch(node, "EXISTS", [list])})}"
     end
   end
 

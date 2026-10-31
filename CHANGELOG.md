@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a hash, list, set,
+  sorted set or stream, and EXPIRE with NX, XX, GT or LT on any key, ran as
+  one-command transactions, whose journal cost 20-40 ms on macOS even for a
+  one-field hash (0.4 ms on a string). From feature level 12 they run as one
+  compound command entry: EXPIRE on a hash fell from 20 to 0.3 ms, on a list
+  from 23 to 0.4 ms. The entry keeps level 11's bounds (100,000 members,
+  64 MiB) and checks them before reading a member's value. Upgrading: raise
+  the cluster to level 12 once every node runs this release.
+
 - Stream consumer groups had no way to inspect or recover pending entries:
   a consumer that stopped held its entries for good. XPENDING (summary and
   range forms, IDLE), XINFO GROUPS and XINFO CONSUMERS now read a group's

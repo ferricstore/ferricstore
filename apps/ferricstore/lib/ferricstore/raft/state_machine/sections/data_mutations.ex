@@ -1245,7 +1245,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         with {:ok, handler} <- compound_command_handler(redis_key, ast),
              :ok <- require_compound_command_level(state, ast),
              :ok <- check_fetch_or_compute_lock(state, redis_key, nil) do
-          run_compound_command(handler, ast, compound_command_store(state, handler))
+          with_bulk_apply_context(state, handler == Ferricstore.Commands.Expiry, fn state ->
+            run_compound_command(handler, ast, compound_command_store(state, handler))
+          end)
         end
       end
 
@@ -1304,6 +1306,29 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         })
       end
 
+      # EXPIRE and PERSIST rewrite a value with its new TTL or a collection's
+      # members with theirs, and a time already past deletes the key as DEL
+      # does. The members are read first, within the entry's member and byte
+      # bounds, as a one-command transaction reads them; past those the
+      # command is refused before a value is read.
+      defp compound_command_store(state, Ferricstore.Commands.Expiry) do
+        value_store = build_string_value_store(state)
+        store = compound_command_store(state, Ferricstore.Commands.Strings)
+        budget = :counters.new(2, [])
+        :counters.put(budget, 1, state.apply_context.compound_member_apply_budget)
+        :counters.put(budget, 2, state.apply_context.transaction_result_byte_budget)
+
+        Map.merge(store, %{
+          put: value_store.put,
+          level_5_writes?: feature_level_5?(state),
+          compound_scan: fn redis_key, prefix ->
+            materialize_then(state, fn ->
+              bounded_compound_scan(state, budget, redis_key, prefix, store)
+            end)
+          end
+        })
+      end
+
       defp compound_command_store(state, _handler), do: compound_command_store(state)
 
       defp compound_command_store(state) do
@@ -1348,6 +1373,71 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         end)
       end
 
+      defp bounded_compound_scan(state, budget, redis_key, prefix, store) do
+        members = :counters.get(budget, 1)
+        bytes = :counters.get(budget, 2)
+
+        result =
+          if prefix == Ferricstore.Store.CompoundKey.zset_prefix(redis_key) and
+               zset_tree_path(state, redis_key) != nil do
+            # A tree holds members and scores only; its count bounds the read.
+            case store.compound_count.(redis_key, prefix) do
+              count when is_integer(count) and count > members ->
+                {:error, :collection_response_limit}
+
+              count when is_integer(count) ->
+                store.compound_scan.(redis_key, prefix)
+
+              failure ->
+                failure
+            end
+          else
+            data_path =
+              Ferricstore.Store.Shard.Compound.Promoted.promoted_store(state, redis_key) ||
+                state.shard_data_path
+
+            case state
+                 |> shard_ets_state()
+                 |> Ferricstore.Store.Shard.ETS.prefix_scan_entries_bounded(prefix, data_path, %{
+                   max_entries: members,
+                   max_bytes: bytes
+                 }) do
+              entries when is_list(entries) -> Enum.sort_by(entries, fn {field, _} -> field end)
+              limit_or_failure -> limit_or_failure
+            end
+          end
+
+        case result do
+          entries when is_list(entries) ->
+            :counters.sub(budget, 1, length(entries))
+            :counters.sub(budget, 2, scanned_bytes(entries))
+            entries
+
+          {:error, :collection_response_limit} ->
+            throw_compound_command_limit(state, :compound_member_apply_budget_exceeded)
+
+          {:error, :response_byte_limit} ->
+            throw_compound_command_limit(state, :transaction_result_byte_budget_exceeded)
+
+          failure ->
+            failure
+        end
+      end
+
+      defp scanned_bytes(entries) do
+        Enum.reduce(entries, 0, fn
+          {field, value}, total when is_binary(value) ->
+            total + byte_size(field) + byte_size(value)
+
+          {field, _value}, total ->
+            total + byte_size(field)
+        end)
+      end
+
+      defp throw_compound_command_limit(state, reason),
+        do:
+          throw({:compound_command_limit, Ferricstore.ErrorReasons.client_message(reason, state)})
+
       defp materializing_read(state, read) when is_function(read, 1),
         do: fn a -> materialize_then(state, fn -> read.(a) end) end
 
@@ -1383,6 +1473,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           )
 
           {:error, "ERR internal error applying #{elem(ast, 0)}"}
+      catch
+        # A read past the entry's bounds (`bounded_compound_scan/5`).
+        :throw, {:compound_command_limit, message} -> {:error, message}
       end
 
       defp compound_command_handler(key, {:hdel, [key | fields]})
@@ -1431,7 +1524,28 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
            when is_binary(key) and is_list(src_keys) and src_keys != [] and is_list(opts),
            do: binaries_handler(src_keys, Ferricstore.Commands.TDigest)
 
+      defp compound_command_handler(key, {:pexpireat, key, expire_at_ms})
+           when is_binary(key) and is_integer(expire_at_ms),
+           do: {:ok, Ferricstore.Commands.Expiry}
+
+      defp compound_command_handler(key, {:pexpireat, key, expire_at_ms, flag})
+           when is_binary(key) and is_integer(expire_at_ms) do
+        if expire_flag?(flag),
+          do: {:ok, Ferricstore.Commands.Expiry},
+          else: {:error, "ERR invalid compound command"}
+      end
+
+      defp compound_command_handler(key, {:persist, key}) when is_binary(key),
+        do: {:ok, Ferricstore.Commands.Expiry}
+
       defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
+
+      defp expire_flag?(flag) when flag in [:nx, :xx, :gt, :lt], do: true
+
+      defp expire_flag?([_ | _] = flags),
+        do: Enum.all?(flags, &(&1 in [:nx, :xx, :gt, :lt]))
+
+      defp expire_flag?(_flag), do: false
 
       defp binaries_handler(values, handler) do
         if Enum.all?(values, &is_binary/1),
@@ -1463,6 +1577,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         if feature_level_6?(state),
           do: :ok,
           else: {:error, "ERR this command requires cluster feature level 6"}
+      end
+
+      # PEXPIREAT and PERSIST joined the entry at level 12.
+      defp require_compound_command_level(state, ast)
+           when elem(ast, 0) in [:pexpireat, :persist] do
+        if feature_level_12?(state),
+          do: :ok,
+          else: {:error, "ERR this command requires cluster feature level 12"}
       end
 
       defp require_compound_command_level(state, _ast), do: require_feature_level_4(state)
@@ -1507,6 +1629,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp feature_level_11?(state),
         do:
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(11)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      defp feature_level_12?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(12)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
 
       # From feature level 11 an entry whose one command takes its members from
