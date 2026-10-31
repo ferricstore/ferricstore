@@ -1,7 +1,7 @@
 defmodule Ferricstore.Commands.SortedSet.Reads do
   @moduledoc false
 
-  alias Ferricstore.Commands.CollectionScan
+  alias Ferricstore.Commands.{CollectionScan, RandomPick}
   alias Ferricstore.Commands.SortedSet.Helpers
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
@@ -68,15 +68,18 @@ defmodule Ferricstore.Commands.SortedSet.Reads do
   end
 
   def zrandmember_one(key, store) do
-    with :ok <- TypeRegistry.command_check_type(key, :zset, store),
-         {:ok, pairs} <- scan_pairs(key, store) do
-      case pairs do
-        [] ->
+    with :ok <- TypeRegistry.command_check_type(key, :zset, store) do
+      case RandomPick.pairs(store, key, CompoundKey.zset_prefix(key), nil) do
+        {:ok, []} ->
           nil
 
-        _ ->
-          {member, _score} = Enum.random(pairs)
+        {:ok, [{member, _score}]} ->
           member
+
+        :scan ->
+          with {:ok, pairs} <- scan_pairs(key, store) do
+            if pairs == [], do: nil, else: pairs |> Enum.random() |> elem(0)
+          end
       end
     end
   end
@@ -109,8 +112,17 @@ defmodule Ferricstore.Commands.SortedSet.Reads do
       if count == 0 do
         []
       else
-        with {:ok, pairs} <- scan_pairs(key, store) do
-          Helpers.select_random_members(pairs, count, with_scores)
+        case RandomPick.pairs(store, key, CompoundKey.zset_prefix(key), count) do
+          {:ok, pairs} when with_scores ->
+            Helpers.score_string_pairs_to_flat_list(pairs)
+
+          {:ok, pairs} ->
+            Enum.map(pairs, fn {member, _score} -> member end)
+
+          :scan ->
+            with {:ok, pairs} <- scan_pairs(key, store) do
+              Helpers.select_random_members(pairs, count, with_scores)
+            end
         end
       end
     end
