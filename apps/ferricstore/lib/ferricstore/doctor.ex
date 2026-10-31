@@ -497,7 +497,7 @@ defmodule Ferricstore.Doctor do
             if type in ~w(bloom cms cuckoo topk) and (expire_at_ms == 0 or expire_at_ms > now) do
               key = CompoundKey.extract_redis_key(storage_key)
 
-              if File.exists?(ProbFile.path(prob_dir, key, type)) do
+              if FS.exists?(ProbFile.path(prob_dir, key, type)) do
                 {count + 1, missing_count, missing}
               else
                 {count + 1, missing_count + 1, [key | missing]}
