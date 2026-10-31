@@ -291,7 +291,9 @@ already correlated responses if possible, then reconnect with jitter.
 `EVENT` is server-initiated on lane `0` with `request_id=0`.
 
 PubSub pushes use `event: "PUBSUB_MESSAGE"`. The legacy payload is one
-`kind: "message"` or `kind: "pmessage"` event per delivery. A client may
+`kind: "message"` or `kind: "pmessage"` event per delivery. A shard channel
+delivery (SSUBSCRIBE, SPUBLISH) is always one `kind: "smessage"` event with
+`channel` and `message`, and is never batched. A client may
 request `pubsub_batch_v1` in `compact_response_codecs` after verifying that
 `OPTIONS.response_codecs.compact_response_opcodes.pubsub_batch_v1` contains
 `0x0010`. For an ordered same-channel publish batch, the server may then send

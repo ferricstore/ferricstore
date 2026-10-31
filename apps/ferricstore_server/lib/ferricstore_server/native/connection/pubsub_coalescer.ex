@@ -8,6 +8,8 @@ defmodule FerricstoreServer.Native.Connection.PubSubCoalescer do
           | {:pubsub_message, binary(), binary(), term()}
           | {:pubsub_pmessage, binary(), binary(), binary()}
           | {:pubsub_pmessage, binary(), binary(), binary(), term()}
+          | {:pubsub_smessage, binary(), binary()}
+          | {:pubsub_smessage, binary(), binary(), term()}
 
   @spec collect(event(), term(), term()) :: {[event()], term() | nil}
   def collect(first, max_events, max_bytes)
@@ -35,6 +37,14 @@ defmodule FerricstoreServer.Native.Connection.PubSubCoalescer do
 
   def event_bytes({:pubsub_pmessage, pattern, channel, message, _lease}) do
     byte_size(pattern) + byte_size(channel) + byte_size(message) + @event_overhead_bytes
+  end
+
+  def event_bytes({:pubsub_smessage, channel, message}) do
+    byte_size(channel) + byte_size(message) + @event_overhead_bytes
+  end
+
+  def event_bytes({:pubsub_smessage, channel, message, _lease}) do
+    byte_size(channel) + byte_size(message) + @event_overhead_bytes
   end
 
   defp collect_ready(acc, count, bytes, max_events, max_bytes)
@@ -73,6 +83,12 @@ defmodule FerricstoreServer.Native.Connection.PubSubCoalescer do
             collect_event(event, acc, count, bytes, max_events, max_bytes)
 
           {:pubsub_pmessage, _pattern, _channel, _message, _lease} = event ->
+            collect_event(event, acc, count, bytes, max_events, max_bytes)
+
+          {:pubsub_smessage, _channel, _message} = event ->
+            collect_event(event, acc, count, bytes, max_events, max_bytes)
+
+          {:pubsub_smessage, _channel, _message, _lease} = event ->
             collect_event(event, acc, count, bytes, max_events, max_bytes)
 
           barrier ->

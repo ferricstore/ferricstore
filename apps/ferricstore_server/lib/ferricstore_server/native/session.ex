@@ -21,14 +21,14 @@ defmodule FerricstoreServer.Native.Session do
   @default_subscription_byte_limit 16 * 1024 * 1024
 
   @session_commands MapSet.new(~w(
-    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
+    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE SSUBSCRIBE SUNSUBSCRIBE
     MULTI EXEC DISCARD WATCH UNWATCH
   ))
 
   @transaction_passthrough MapSet.new(~w(MULTI EXEC DISCARD WATCH UNWATCH))
   @blocked_in_transaction MapSet.new(~w(
     BLPOP BRPOP BLMOVE BLMPOP BZPOPMIN BZPOPMAX BZMPOP XREAD XREADGROUP
-    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE
+    SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE SSUBSCRIBE SUNSUBSCRIBE
   ))
 
   @spec session_command?(binary()) :: boolean()
@@ -156,6 +156,7 @@ defmodule FerricstoreServer.Native.Session do
     |> Map.merge(%{
       pubsub_channels: nil,
       pubsub_patterns: nil,
+      pubsub_shard_channels: nil,
       pubsub_subscription_bytes: 0,
       pubsub_subscription_token: nil
     })
@@ -163,7 +164,8 @@ defmodule FerricstoreServer.Native.Session do
 
   @spec cleanup_pubsub(map()) :: :ok
   def cleanup_pubsub(state) do
-    if Map.get(state, :pubsub_channels) != nil or Map.get(state, :pubsub_patterns) != nil do
+    if Map.get(state, :pubsub_channels) != nil or Map.get(state, :pubsub_patterns) != nil or
+         Map.get(state, :pubsub_shard_channels) != nil do
       PS.cleanup(self())
     end
 
@@ -189,9 +191,14 @@ defmodule FerricstoreServer.Native.Session do
     end
   end
 
-  @spec pubsub_payload(:message | :pmessage, binary(), binary() | nil, binary()) :: map()
+  @spec pubsub_payload(:message | :pmessage | :smessage, binary(), binary() | nil, binary()) ::
+          map()
   def pubsub_payload(:message, channel, _pattern, message) do
     %{"kind" => "message", "channel" => channel, "message" => message}
+  end
+
+  def pubsub_payload(:smessage, channel, _pattern, message) do
+    %{"kind" => "smessage", "channel" => channel, "message" => message}
   end
 
   def pubsub_payload(:pmessage, channel, pattern, message) do
@@ -239,6 +246,15 @@ defmodule FerricstoreServer.Native.Session do
 
   defp execute_session_command("PUNSUBSCRIBE", patterns, _ast, _keys, state),
     do: unsubscribe_patterns(patterns, state)
+
+  defp execute_session_command("SSUBSCRIBE", [], _ast, _keys, state),
+    do: {:bad_request, "ERR wrong number of arguments for 'ssubscribe' command", state}
+
+  defp execute_session_command("SSUBSCRIBE", channels, _ast, _keys, state),
+    do: subscribe_shard_channels(channels, state)
+
+  defp execute_session_command("SUNSUBSCRIBE", channels, _ast, _keys, state),
+    do: unsubscribe_shard_channels(channels, state)
 
   defp execute_session_command("MULTI", _args, _ast, _keys, %{multi_state: :queuing} = state),
     do: {:error, "ERR MULTI calls can not be nested", state}
@@ -602,13 +618,43 @@ defmodule FerricstoreServer.Native.Session do
     )
   end
 
+  defp subscribe_shard_channels(channels, state) do
+    subscribe_values(
+      channels,
+      state,
+      :pubsub_shard_channels,
+      &PS.ssubscribe_unique_many/2,
+      "ssubscribe"
+    )
+  end
+
+  defp unsubscribe_shard_channels([], state) do
+    state = ensure_pubsub_sets(state)
+
+    if MapSet.size(state.pubsub_shard_channels) == 0 do
+      {:ok, [["sunsubscribe", nil, 0]], state}
+    else
+      unsubscribe_shard_channels(MapSet.to_list(state.pubsub_shard_channels), state)
+    end
+  end
+
+  defp unsubscribe_shard_channels(channels, state) do
+    unsubscribe_values(
+      channels,
+      state,
+      :pubsub_shard_channels,
+      &PS.sunsubscribe_unique_many/2,
+      "sunsubscribe"
+    )
+  end
+
   defp subscribe_values(values, state, set_key, subscribe_fun, ack_kind) do
     state = ensure_pubsub_sets(state)
     current = Map.fetch!(state, set_key)
     new_values = values |> MapSet.new() |> MapSet.difference(current)
 
     cond do
-      subscription_count(state) + MapSet.size(new_values) > @max_subscriptions ->
+      total_subscription_count(state) + MapSet.size(new_values) > @max_subscriptions ->
         {:error, "ERR max subscriptions per connection (#{@max_subscriptions}) reached", state}
 
       true ->
@@ -672,7 +718,7 @@ defmodule FerricstoreServer.Native.Session do
             acc
           end
 
-        {[ack_kind, value, subscription_count(acc)], acc}
+        {[ack_kind, value, ack_count(acc, set_key)], acc}
       end)
 
     {:ok, acks, sync_subscription_lease(state)}
@@ -689,7 +735,7 @@ defmodule FerricstoreServer.Native.Session do
        when map_size(detached) == length(values) do
     retained = MapSet.union(Map.fetch!(state, set_key), MapSet.new(detached_values))
     updated_state = Map.put(state, set_key, retained)
-    {acks, _count} = subscription_acks(values, ack_kind, subscription_count(state), 1)
+    {acks, _count} = subscription_acks(values, ack_kind, ack_count(state, set_key), 1)
     {acks, updated_state}
   end
 
@@ -706,7 +752,7 @@ defmodule FerricstoreServer.Native.Session do
             acc
         end
 
-      {[ack_kind, value, subscription_count(acc)], acc}
+      {[ack_kind, value, ack_count(acc, set_key)], acc}
     end)
   end
 
@@ -830,7 +876,7 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp has_pubsub_subscriptions?(state) do
-    Enum.any?([:pubsub_channels, :pubsub_patterns], fn key ->
+    Enum.any?([:pubsub_channels, :pubsub_patterns, :pubsub_shard_channels], fn key ->
       case Map.get(state, key) do
         %MapSet{} = subscriptions -> MapSet.size(subscriptions) > 0
         _missing -> false
@@ -839,7 +885,7 @@ defmodule FerricstoreServer.Native.Session do
   end
 
   defp maybe_install_pubsub_delivery_guard(state, pid) do
-    if subscription_count(state) == 0 do
+    if total_subscription_count(state) == 0 do
       install_pubsub_delivery_guard(state, pid)
     else
       :ok
@@ -876,13 +922,26 @@ defmodule FerricstoreServer.Native.Session do
         state
       end
 
+    state =
+      if Map.get(state, :pubsub_shard_channels) == nil,
+        do: Map.put(state, :pubsub_shard_channels, MapSet.new()),
+        else: state
+
     state
     |> Map.put_new(:pubsub_subscription_bytes, 0)
     |> Map.put_new(:pubsub_subscription_token, nil)
   end
 
+  # What SUBSCRIBE and PSUBSCRIBE acknowledgements count; as in Redis, shard
+  # channels are counted apart, by SSUBSCRIBE's.
   defp subscription_count(state),
     do: MapSet.size(state.pubsub_channels) + MapSet.size(state.pubsub_patterns)
+
+  defp ack_count(state, :pubsub_shard_channels), do: MapSet.size(state.pubsub_shard_channels)
+  defp ack_count(state, _set_key), do: subscription_count(state)
+
+  defp total_subscription_count(state),
+    do: subscription_count(state) + MapSet.size(state.pubsub_shard_channels)
 
   defp namespace_key(nil, key), do: key
   defp namespace_key(namespace, key) when is_binary(namespace), do: namespace <> key

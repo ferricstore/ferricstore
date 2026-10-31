@@ -9,6 +9,7 @@
 <%= render_live_component("pubsub_summary", render_pubsub_summary(data)) %>
 <%= render_live_component("pubsub_channels", render_pubsub_channels(data)) %>
 <%= render_live_component("pubsub_patterns", render_pubsub_patterns(data)) %>
+<%= render_live_component("pubsub_shard_channels", render_pubsub_shard_channels(data)) %>
 <%= render_live_component("pubsub_activity", render_pubsub_activity(data)) %>
 </div>
 </main>

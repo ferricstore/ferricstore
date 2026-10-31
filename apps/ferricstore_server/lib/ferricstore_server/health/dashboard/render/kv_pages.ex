@@ -27,7 +27,8 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
       %{
         name: "Pub/Sub",
         purpose: "Ephemeral channel fanout and subscription introspection.",
-        commands: ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE)
+        commands:
+          ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE SPUBLISH SSUBSCRIBE SUNSUBSCRIBE)
       },
       %{
         name: "Large / Cold Values",
@@ -406,7 +407,10 @@ defmodule FerricstoreServer.Health.Dashboard.Render.KVPages do
   defp command_guide_anchor("X" <> _command), do: "stream-commands"
 
   defp command_guide_anchor(command)
-       when command in ~w(PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE),
+       when command in ~w(
+              PUBLISH PUBSUB SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE SPUBLISH SSUBSCRIBE
+              SUNSUBSCRIBE
+            ),
        do: "pubsub-commands"
 
   defp command_guide_anchor("FERRICSTORE." <> _command), do: "ferricstore-native-commands"

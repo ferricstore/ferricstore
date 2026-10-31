@@ -130,6 +130,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
       "pubsub_summary" => render_pubsub_summary(data),
       "pubsub_channels" => render_pubsub_channels(data),
       "pubsub_patterns" => render_pubsub_patterns(data),
+      "pubsub_shard_channels" => render_pubsub_shard_channels(data),
       "pubsub_activity" => render_pubsub_activity(data)
     })
   end
@@ -234,6 +235,7 @@ defmodule FerricstoreServer.Health.Dashboard.LivePayload do
       "pubsub_summary" => render_pubsub_summary(data),
       "pubsub_channels" => render_pubsub_channels(data),
       "pubsub_patterns" => render_pubsub_patterns(data),
+      "pubsub_shard_channels" => render_pubsub_shard_channels(data),
       "pubsub_activity" => render_pubsub_activity(data)
     })
   end

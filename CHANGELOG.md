@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: SSUBSCRIBE, SUNSUBSCRIBE, SPUBLISH, PUBSUB SHARDCHANNELS and
+  PUBSUB SHARDNUMSUB. Shard channels are their own namespace, as in Redis 7:
+  PUBLISH, PSUBSCRIBE patterns, PUBSUB CHANNELS and NUMSUB never meet them,
+  and SSUBSCRIBE acknowledgements count shard channels only. A shard message
+  is pushed as a `PUBSUB_MESSAGE` event of kind `smessage`. Every node
+  delivers it, as for PUBLISH, since FerricStore clients may subscribe on any
+  node; a member on an older release drops relayed shard messages, and has
+  no shard subscribers to give them to.
+
 - New command: LATENCY (LATEST, HISTORY, RESET, GRAPH, DOCTOR, HISTOGRAM,
   HELP), with the `latency-monitor-threshold` (milliseconds, 0 = off) and
   `latency-tracking` (default `no`, unlike Redis, so commands do not pay for

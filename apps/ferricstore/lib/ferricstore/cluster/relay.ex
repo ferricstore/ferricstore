@@ -41,6 +41,15 @@ defmodule Ferricstore.Cluster.Relay do
   def forward_publishes(publishes) when is_list(publishes), do: forward({:publish, publishes})
 
   @doc false
+  # Sends shard channel publishes (SPUBLISH) to every other member. A member
+  # on an older release drops them, and has no shard subscribers either.
+  @spec forward_shard_publishes([{binary(), binary()}]) :: :ok
+  def forward_shard_publishes([]), do: :ok
+
+  def forward_shard_publishes(publishes) when is_list(publishes),
+    do: forward({:spublish, publishes})
+
+  @doc false
   # Sends Flow claim wake-up `hints` (see `Ferricstore.Flow`) to every other member.
   @spec forward_claim_hints(list()) :: :ok
   def forward_claim_hints([]), do: :ok
@@ -99,6 +108,13 @@ defmodule Ferricstore.Cluster.Relay do
          &match?({channel, message} when is_binary(channel) and is_binary(message), &1)
        ),
        do: Ferricstore.PubSub.publish_many_local(publishes, nil)
+  end
+
+  defp deliver({:spublish, publishes}) when is_list(publishes) do
+    for {channel, message} when is_binary(channel) and is_binary(message) <- publishes,
+        do: Ferricstore.PubSub.spublish_local(channel, message)
+
+    :ok
   end
 
   defp deliver({:claim_hints, hints}) when is_list(hints),

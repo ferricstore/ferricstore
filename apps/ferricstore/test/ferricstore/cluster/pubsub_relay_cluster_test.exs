@@ -58,6 +58,41 @@ defmodule Ferricstore.Cluster.PubSubRelayClusterTest do
     refute_receive _more, 300
   end
 
+  test "SPUBLISH reaches shard subscribers on every node, and only them", %{
+    nodes: [first, second, third]
+  } do
+    channel = "shard-relay:#{System.unique_integer([:positive])}"
+
+    for node <- [second, third] do
+      assert :ok == ClusterHelper.run(node.name, PubSub, :ssubscribe_many, [[channel], self()])
+    end
+
+    # Ordinary subscribers to the same name, and a pattern, on every node.
+    for node <- [first, second, third] do
+      assert :ok == ClusterHelper.run(node.name, PubSub, :subscribe, [channel, self()])
+      assert :ok == ClusterHelper.run(node.name, PubSub, :psubscribe, ["shard-relay:*", self()])
+    end
+
+    assert 0 == dispatch(first, "SPUBLISH", [channel, "s1"])
+    assert 1 == dispatch(third, "SPUBLISH", [channel, "s2"])
+
+    messages = collect(4)
+
+    assert Enum.frequencies(for {:pubsub_smessage, ^channel, message} <- messages, do: message) ==
+             %{"s1" => 2, "s2" => 2}
+
+    refute_receive _more, 300
+
+    # Each node counts its own ordinary subscriber, and not the shard one.
+    for node <- [first, second, third] do
+      assert [^channel, 1] = dispatch(node, "PUBSUB", ["NUMSUB", channel])
+    end
+
+    assert [^channel] = dispatch(second, "PUBSUB", ["SHARDCHANNELS", "shard-relay:*"])
+    assert [^channel, 1] = dispatch(second, "PUBSUB", ["SHARDNUMSUB", channel])
+    assert [] = dispatch(first, "PUBSUB", ["SHARDCHANNELS", "shard-relay:*"])
+  end
+
   # Collects the messages that carry `payload`, expecting `count` of them.
   defp received_for(payload, count) do
     messages =

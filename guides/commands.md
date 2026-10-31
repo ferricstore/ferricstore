@@ -44,6 +44,7 @@ PING, ECHO, TIME, LATENCY, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, S
 OBJECT HELP/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
 SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND DOCS/COMMAND GETKEYS,
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
+SSUBSCRIBE, SUNSUBSCRIBE, SPUBLISH, PUBSUB SHARDCHANNELS/SHARDNUMSUB,
 CLIENT ID/SETNAME/GETNAME/INFO/LIST/TRACKING/CACHING/TRACKINGINFO/GETREDIR, HELLO, AUTH, QUIT, RESET
 
 ### FerricStore-Native Flow Commands
@@ -1646,6 +1647,22 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 | `PUBSUB CHANNELS` | `PUBSUB CHANNELS [pattern]` | Array of active channels |
 | `PUBSUB NUMSUB` | `PUBSUB NUMSUB [channel ...]` | Array of `[channel, count, ...]` |
 | `PUBSUB NUMPAT` | `PUBSUB NUMPAT` | Integer (pattern subscriptions) |
+| `SSUBSCRIBE` | `SSUBSCRIBE shardchannel [shardchannel ...]` | Push messages: `[ssubscribe, shardchannel, count]`; the count is of shard channels only |
+| `SUNSUBSCRIBE` | `SUNSUBSCRIBE [shardchannel ...]` | Push messages: `[sunsubscribe, shardchannel, count]` |
+| `SPUBLISH` | `SPUBLISH shardchannel message` | Integer (shard subscribers on this node that received; shard subscribers on other nodes receive it too) |
+| `PUBSUB SHARDCHANNELS` | `PUBSUB SHARDCHANNELS [pattern]` | Array of active shard channels |
+| `PUBSUB SHARDNUMSUB` | `PUBSUB SHARDNUMSUB [shardchannel ...]` | Array of `[shardchannel, count, ...]` |
+
+Shard channels are a namespace of their own, as in Redis 7: PUBLISH never
+reaches an SSUBSCRIBE subscriber, SPUBLISH never reaches a SUBSCRIBE or
+PSUBSCRIBE subscriber, and PUBSUB CHANNELS and NUMSUB leave shard channels out.
+A shard message arrives as a `PUBSUB_MESSAGE` event of kind `smessage`.
+
+Redis Cluster sends a shard message only to the nodes that serve the channel's
+slot, and answers MOVED to a subscriber on any other node. FerricStore clients
+may subscribe on any node, so every node delivers shard messages, as it does
+PUBLISH. The commands are there for Redis compatibility; they don't cut cluster
+traffic.
 
 ---
 

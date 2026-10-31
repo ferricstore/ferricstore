@@ -129,6 +129,7 @@ defmodule FerricstoreServer.Native.Connection do
     sandbox_namespace: nil,
     pubsub_channels: nil,
     pubsub_patterns: nil,
+    pubsub_shard_channels: nil,
     pubsub_subscription_bytes: 0,
     pubsub_subscription_token: nil,
     max_pubsub_subscription_bytes: 16 * 1024 * 1024,
@@ -476,6 +477,12 @@ defmodule FerricstoreServer.Native.Connection do
         send_pubsub_events(state, event)
 
       {:pubsub_pmessage, _pattern, _channel, _message} = event ->
+        send_pubsub_events(state, event)
+
+      {:pubsub_smessage, _channel, _message, %OutboundBudget{}} = event ->
+        send_pubsub_events(state, event)
+
+      {:pubsub_smessage, _channel, _message} = event ->
         send_pubsub_events(state, event)
 
       {:native_blocking_done, _meta, _pid} = message ->
@@ -1914,7 +1921,7 @@ defmodule FerricstoreServer.Native.Connection do
         maybe_send_event(state, "FLOW_WAKE", Commands.flow_wake_event_payload(state))
         wait.(state)
 
-      event when elem(event, 0) in [:pubsub_message, :pubsub_pmessage] ->
+      event when elem(event, 0) in [:pubsub_message, :pubsub_pmessage, :pubsub_smessage] ->
         # Pubsub is not ordered with any lane; deliver it now, coalesced as in
         # the main loop. A non-pubsub message ends the batch and is handled next.
         case deliver_pubsub_events(state, event) do
@@ -2803,6 +2810,7 @@ defmodule FerricstoreServer.Native.Connection do
       sandbox_namespace: state.sandbox_namespace,
       pubsub_channels: state.pubsub_channels,
       pubsub_patterns: state.pubsub_patterns,
+      pubsub_shard_channels: state.pubsub_shard_channels,
       pubsub_subscription_bytes: state.pubsub_subscription_bytes,
       pubsub_subscription_token: state.pubsub_subscription_token,
       max_pubsub_subscription_bytes: state.max_pubsub_subscription_bytes,
@@ -3075,9 +3083,17 @@ defmodule FerricstoreServer.Native.Connection do
   defp pubsub_event_descriptor({:pubsub_pmessage, pattern, channel, message, _lease}),
     do: {:pmessage, pattern, channel, message}
 
+  defp pubsub_event_descriptor({:pubsub_smessage, channel, message}),
+    do: {:smessage, channel, message}
+
+  defp pubsub_event_descriptor({:pubsub_smessage, channel, message, _lease}),
+    do: {:smessage, channel, message}
+
   defp pubsub_event_lease({:pubsub_message, _channel, _message, lease}), do: lease
 
   defp pubsub_event_lease({:pubsub_pmessage, _pattern, _channel, _message, lease}), do: lease
+
+  defp pubsub_event_lease({:pubsub_smessage, _channel, _message, lease}), do: lease
 
   defp pubsub_event_lease(_unbudgeted), do: nil
 
@@ -3091,6 +3107,7 @@ defmodule FerricstoreServer.Native.Connection do
     Enum.flat_map(events, fn
       {:pubsub_message, _channel, _message, %OutboundBudget{} = lease} -> [lease]
       {:pubsub_pmessage, _pattern, _channel, _message, %OutboundBudget{} = lease} -> [lease]
+      {:pubsub_smessage, _channel, _message, %OutboundBudget{} = lease} -> [lease]
       _unbudgeted -> []
     end)
   end

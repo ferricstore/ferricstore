@@ -39,9 +39,16 @@ defmodule Ferricstore.PubSub.ActivityLog do
   end
 
   @spec record_publish(binary(), non_neg_integer(), non_neg_integer()) :: :ok
-  def record_publish(channel, message_bytes, subscribers) do
-    entry = {:publish, channel, max(message_bytes, 0), max(subscribers, 0)}
+  def record_publish(channel, message_bytes, subscribers),
+    do: record_publish_entry({:publish, channel, max(message_bytes, 0), max(subscribers, 0)})
 
+  @doc false
+  # An SPUBLISH, kept like a publish and shown as SPUBLISH.
+  @spec record_shard_publish(binary(), non_neg_integer(), non_neg_integer()) :: :ok
+  def record_shard_publish(channel, message_bytes, subscribers),
+    do: record_publish_entry({:spublish, channel, max(message_bytes, 0), max(subscribers, 0)})
+
+  defp record_publish_entry(entry) do
     case :persistent_term.get(@publish_config_key, nil) do
       {max_len, 1, _counter} ->
         record(entry, max_len)
@@ -502,6 +509,13 @@ defmodule Ferricstore.PubSub.ActivityLog do
   end
 
   defp normalize_and_timestamp_entry(
+         {:spublish, channel, message_bytes, subscribers},
+         timestamp_us
+       ) do
+    {:spublish, timestamp_us, normalize_binary(channel), message_bytes, subscribers}
+  end
+
+  defp normalize_and_timestamp_entry(
          {:subscription, command, target_type, targets, target_count},
          timestamp_us
        ) do
@@ -510,13 +524,14 @@ defmodule Ferricstore.PubSub.ActivityLog do
   end
 
   defp materialize_entry(
-         {:publish, timestamp_us, target, message_bytes, subscribers},
+         {kind, timestamp_us, target, message_bytes, subscribers},
          id
-       ) do
+       )
+       when kind in [:publish, :spublish] do
     %{
       id: id,
       timestamp_us: timestamp_us,
-      command: "PUBLISH",
+      command: if(kind == :spublish, do: "SPUBLISH", else: "PUBLISH"),
       target_type: :channel,
       target: target,
       targets: 1,
