@@ -1419,6 +1419,26 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
                  StateMachine.apply(%{}, {:tx_execute, entries, nil}, at_11)
       end
 
+      test "a collection delete past the member budget removes every member from level 11", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "bulk-delete-prefix"
+        prefix = CompoundKey.hash_prefix(redis_key)
+
+        below = bulk_budget_state(state, ets, redis_key, false)
+
+        assert {_state, {:error, :compound_delete_budget_exceeded}} =
+                 StateMachine.apply(%{}, {:compound_delete_prefix, prefix}, below)
+
+        assert [_row] = :ets.lookup(ets, CompoundKey.hash_field(redis_key, "a"))
+
+        at_11 = bulk_budget_state(state, ets, redis_key, true)
+        assert {_state, :ok} = StateMachine.apply(%{}, {:compound_delete_prefix, prefix}, at_11)
+        assert [] = :ets.lookup(ets, CompoundKey.hash_field(redis_key, "a"))
+        assert [] = :ets.lookup(ets, CompoundKey.hash_field(redis_key, "b"))
+      end
+
       test "RENAME past the member budget applies from level 11", %{state: state, ets: ets} do
         source = "bulk-rename-source"
         destination = "bulk-rename-destination"

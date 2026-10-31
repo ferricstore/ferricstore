@@ -4,6 +4,24 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Upgrading: raise the cluster to feature level 11 once every node runs this
+  release. One replicated entry applies at most 4,096 members by default
+  (`:compound_member_apply_budget`) and reads at most 8 MiB, and commands
+  whose members come from stored data were refused past that: RENAME,
+  RENAMENX and COPY of a larger hash, list, set or sorted set, EXPIRE,
+  PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on one (a TTL is kept on every
+  member), ZREMRANGEBY* removing more, and the STORE forms writing more.
+  From level 11 they apply with the largest bounds, 100,000 members and
+  64 MiB, and past those answer `ERR too many members in one command (the
+  limit is 100000)` instead of an internal reason. SUNIONSTORE, SINTERSTORE
+  and SDIFFSTORE also run as one-command transactions there, so the shard
+  computes them from what it has applied.
+- DEL, UNLINK and SET over a hash, list, set or sorted set of more than
+  4,096 members were refused (`compound_delete_budget_exceeded`): a large
+  collection could be neither deleted nor overwritten. From feature level 11
+  they remove every member, a page of the member bound at a time, in one
+  replicated entry, whatever the size.
+
 ## 0.12.16 - 2026-10-31
 
 - ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and

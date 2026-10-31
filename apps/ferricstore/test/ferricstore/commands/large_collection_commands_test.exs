@@ -107,7 +107,18 @@ defmodule Ferricstore.Commands.LargeCollectionCommandsTest do
     end
   end
 
-  test "past the bulk bound RENAME is refused whole", %{
+  test "SET over a large collection replaces it", %{ctx: ctx, k: k} do
+    fill(ctx, k)
+
+    for {key, length_command} <- [{"h", "HLEN"}, {"l", "LLEN"}, {"s", "SCARD"}, {"z", "ZCARD"}] do
+      reply = d(ctx, "SET", [k.(key), "plain"])
+      assert :ok == reply, "SET over #{key}: #{inspect(reply)}"
+      assert "plain" == d(ctx, "GET", [k.(key)])
+      assert {:error, "WRONGTYPE" <> _} = d(ctx, length_command, [k.(key)])
+    end
+  end
+
+  test "past the bulk bound RENAME is refused whole and DEL still removes the key", %{
     ctx: ctx,
     k: k
   } do
@@ -121,5 +132,17 @@ defmodule Ferricstore.Commands.LargeCollectionCommandsTest do
 
     assert over == d(ctx, "HLEN", [k.("h")])
     assert 0 == d(ctx, "EXISTS", [k.("d1")])
+
+    assert 1 == d(ctx, "DEL", [k.("h")])
+    assert 0 == d(ctx, "HLEN", [k.("h")])
+  end
+
+  test "DEL and UNLINK remove large collections", %{ctx: ctx, k: k} do
+    fill(ctx, k)
+
+    assert 2 == d(ctx, "DEL", [k.("h"), k.("l")])
+    assert 2 == d(ctx, "UNLINK", [k.("s"), k.("z")])
+    assert 0 == d(ctx, "EXISTS", [k.("h"), k.("l"), k.("s"), k.("z")])
+    assert 0 == d(ctx, "HLEN", [k.("h")])
   end
 end

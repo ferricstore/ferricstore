@@ -105,8 +105,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #     (RENAME, RENAMENX, COPY, the STORE forms, ZREMRANGEBY*, EXPIRE and
   #     PERSIST) applies with the largest member and byte bounds
   #     (`Ferricstore.Raft.ApplyContext.bulk/1`) instead of the configured
-  #     ones, so it works on collections past them. Older releases refuse
-  #     the same entry.
+  #     ones, so it works on collections past them; and a collection delete
+  #     (DEL, UNLINK, SET over it) removes every member a page of the member
+  #     bound at a time. Older releases refuse the same entries.
   @supported 11
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

@@ -336,10 +336,50 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjection do
             {:ok, next_state}
 
           {:error, :limit_exceeded} ->
-            {:error, :compound_delete_budget_exceeded}
+            # From feature level 11 the state machine deletes a collection of
+            # any size a page at a time; projection does the same, and leaves
+            # the entry to the state machine when it cannot tell the level.
+            case segment_feature_level_11?(sm_state) do
+              true ->
+                segment_project_delete_prefix_pages(sm_state, redis_key, index, prefix, budget)
+
+              false ->
+                {:error, :compound_delete_budget_exceeded}
+
+              :unknown ->
+                {:error, :feature_level_unknown}
+            end
 
           :unavailable ->
             {:error, :compound_member_index_unavailable}
+        end
+      end
+
+      defp segment_project_delete_prefix_pages(sm_state, redis_key, index, prefix, budget) do
+        Enum.reduce_while(Stream.cycle([nil]), {sm_state, :start}, fn nil, {acc, cursor} ->
+          case CompoundMemberIndex.keys_for_prefix_page(index, prefix, cursor, budget) do
+            {:ok, compound_keys, next} ->
+              acc = Enum.reduce(compound_keys, acc, &segment_project_delete(&2, &1))
+
+              case next do
+                :done -> {:halt, {:ok, ZSetIndex.clear_ready_key(acc, redis_key)}}
+                {:next, cursor} -> {:cont, {acc, cursor}}
+              end
+
+            :unavailable ->
+              {:halt, {:error, :compound_member_index_unavailable}}
+          end
+        end)
+      end
+
+      defp segment_feature_level_11?(sm_state) do
+        marker = Ferricstore.Cluster.FeatureLevel.marker()
+
+        case segment_cached_live_value(sm_state, Ferricstore.Cluster.FeatureLevel.key(11)) do
+          {:ok, ^marker} -> true
+          {:ok, _not_a_marker} -> false
+          nil -> false
+          :unknown -> :unknown
         end
       end
 

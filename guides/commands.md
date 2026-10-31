@@ -1085,7 +1085,7 @@ Returns the type of a key as a simple string.
 | `RENAMENX` | `RENAMENX key newkey` | `1` (renamed) or `0` (dest exists) | Same key returns 0 |
 | `COPY` | `COPY source dest [REPLACE]` | `1` (success) or error | REPLACE overwrites existing dest |
 
-**Note:** These operate on plain string keys only. Renaming compound data structures (hash, list, set, zset) is not supported -- only the raw value is copied.
+**Note:** These move or copy any type, with its TTL. Keys must share a slot on a cluster. One command moves at most the per-command member bound (4,096 by default); from feature level 11 RENAME, RENAMENX and COPY move up to 100,000 members and 64 MiB, and are refused whole past that.
 
 ### SCAN
 
