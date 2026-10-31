@@ -150,6 +150,7 @@ defmodule Ferricstore.Commands.Cuckoo do
 
         case result do
           {:ok, n} -> n
+          {:error, "ERR " <> _message} = error -> error
           {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
           other -> other
         end
@@ -172,6 +173,7 @@ defmodule Ferricstore.Commands.Cuckoo do
     else
       case do_prob_write(store, {:cuckoo_del, key, element}) do
         {:ok, n} -> n
+        {:error, "ERR " <> _message} = error -> error
         {:error, reason} -> {:error, "ERR cuckoo del failed: #{inspect(reason)}"}
         other -> other
       end
@@ -340,6 +342,9 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   defp normalize_add_error({:fsync_dir_failed, _phase, _reason} = reason),
     do: {:error, reason}
+
+  # The state machine's own answers (a file this node lost) pass through.
+  defp normalize_add_error("ERR " <> _message = message), do: {:error, message}
 
   defp normalize_add_error(reason) do
     rendered = inspect(reason, limit: 20, printable_limit: 256)

@@ -650,6 +650,9 @@ defmodule Ferricstore.Commands.Bloom do
 
   defp normalize_add_result({:ok, result}), do: result
 
+  # The state machine's own answers (a file this node lost) pass through.
+  defp normalize_add_result({:error, "ERR " <> _message} = error), do: error
+
   defp normalize_add_result({:error, reason}),
     do: {:error, "ERR bloom add failed: #{inspect(reason)}"}
 

@@ -1064,7 +1064,9 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
         end
 
         @tag :prob_storage_failure
-        test "missing probabilistic sidecars stop every replicated mutation", %{
+        # The file is lost on this node only: the write fails here, as an
+        # ordinary reply, and the node keeps applying the shard.
+        test "missing probabilistic sidecars fail the write without stopping apply", %{
           state: state,
           dir: dir
         } do
@@ -1102,14 +1104,14 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
 
             {next_state, {:error, reason}} = StateMachine.apply(%{}, mutation, created_state)
 
-            assert {:prob_sidecar_apply_failed, ^operation, :enoent} = reason
-            assert Ferricstore.Raft.ApplyFailure.storage_reason?(reason)
+            assert reason =~ ~r/^ERR .+ file is missing on this node/, inspect(operation)
+            refute Ferricstore.Raft.ApplyFailure.storage_reason?(reason)
             next_state
           end)
         end
 
         @tag :prob_storage_failure
-        test "missing probabilistic sidecars stop batched mutations", %{
+        test "a missing sidecar fails its own batched write, not the rest", %{
           state: state,
           dir: dir
         } do
@@ -1131,18 +1133,19 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.Apply3DeleteKey do
           later_path = Ferricstore.ProbFile.path(Path.join(dir, "prob"), later_key, "bloom")
           File.rm!(path)
 
-          assert {_state, {:error, {:prob_sidecar_apply_failed, :cms_incrby, :enoent}}} =
+          assert {_state,
+                  {:ok, [{:error, "ERR count-min sketch file is missing" <> _}, {:ok, 1}]}} =
                    StateMachine.apply(
                      %{},
                      {:batch,
                       [
                         {:cms_incrby, key, [{"item", 1}]},
-                        {:bloom_add, later_key, "must-not-run", nil}
+                        {:bloom_add, later_key, "still-runs", nil}
                       ]},
                      state
                    )
 
-          assert {:ok, 0} = NIF.bloom_file_exists(later_path, "must-not-run")
+          assert {:ok, 1} = NIF.bloom_file_exists(later_path, "still-runs")
         end
 
         @tag :prob_storage_failure
