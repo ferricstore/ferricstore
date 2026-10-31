@@ -19,13 +19,11 @@ defmodule Ferricstore.Test.MockStore do
     {:ok, pid} = Agent.start_link(fn -> initial end)
 
     tmp_dir =
-      Path.join(
-        System.tmp_dir!(),
+      Ferricstore.Test.OwnedTmpDir.create(
         "ferricstore_mock_#{:os.getpid()}_#{System.unique_integer([:positive, :monotonic])}"
       )
 
     prob_dir = Path.join(tmp_dir, "prob")
-    File.rm_rf!(tmp_dir)
     File.mkdir_p!(prob_dir)
 
     # Per-type resource registries for probabilistic data structures.
