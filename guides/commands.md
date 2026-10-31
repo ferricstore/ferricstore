@@ -1293,6 +1293,18 @@ Backed by mmap NIF resources. Each filter is a memory-mapped file at `data_dir/p
 
 **Status:** Uses FerricStoreBloom module syntax. Optimal sizing uses `m = -n*ln(p) / (ln(2))^2`. No scaling/expansion support (single filter).
 
+**A lost file.** Each Bloom, Cuckoo, Count-Min and Top-K key keeps its data in
+a file on every replica. If one node loses a key's file (a disk fault, a file
+removed by hand), that key is damaged on that node only: its writes there
+answer `ERR bloom filter file is missing on this node; delete the key and
+create it again` (or the cuckoo, count-min or top-k form), its reads answer
+`ERR ... file is missing`, and RENAME and COPY carry the damage to the new
+key. The rest of the shard keeps applying and the node restarts normally.
+DEL heals the key (create it again afterwards), as does a snapshot install
+from another replica; `FERRICSTORE.DOCTOR CHECK SCOPE PROB_FILES` lists the
+damaged keys. FerricStore never rebuilds the file empty, which would silently
+forget its members.
+
 ---
 
 ## Cuckoo Filter Commands
@@ -1469,7 +1481,8 @@ Supported scopes:
 | `BITCASK` | Keydir availability, keydir binary bytes, data file count, and data bytes per shard |
 | `BLOB_REFS` | Large-value blob segment metadata and protected blob refs |
 | `FLOW_LMDB` | Flow LMDB projection health, pending ops, oldest pending age, replay-safe lag, and degraded shards |
-| `ALL` | All supported scopes |
+| `PROB_FILES` | Bloom, Cuckoo, Count-Min and Top-K keys whose file this node lost (up to 100 listed per shard). It scans every type marker, so `ALL` leaves it out; run it with `START CHECK SCOPE PROB_FILES` on a large keyspace |
+| `ALL` | `BITCASK`, `BLOB_REFS` and `FLOW_LMDB` |
 
 Subcommands:
 

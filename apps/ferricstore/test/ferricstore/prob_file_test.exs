@@ -126,7 +126,9 @@ defmodule Ferricstore.ProbFileTest do
     refute File.exists?(Path.join(prob_dir, pending_filename))
   end
 
-  test "exact startup reconciliation rejects a missing live sidecar" do
+  # A live marker's lost file is damage on this node only: the shard starts
+  # and the key answers errors (`Ferricstore.ProbMissingFileTest`).
+  test "exact startup reconciliation starts with a missing live sidecar" do
     root =
       Path.join(System.tmp_dir!(), "prob_file_missing_#{System.unique_integer([:positive])}")
 
@@ -143,8 +145,10 @@ defmodule Ferricstore.ProbFileTest do
       {storage_key, CompoundKey.encode_prob_type(:cms, 7), 0, 0, 0, 0, 10}
     )
 
-    assert {:error, {:missing_prob_sidecar, ^storage_key, ^filename}} =
-             ProbFiles.validate(root, 0, keydir)
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert :ok = ProbFiles.validate(root, 0, keydir)
+           end) =~
+             filename
 
     :ets.insert(
       keydir,
@@ -155,7 +159,7 @@ defmodule Ferricstore.ProbFileTest do
              ProbFiles.validate(root, 0, keydir)
   end
 
-  test "exact startup reconciliation rejects a missing sidecar directory" do
+  test "exact startup reconciliation starts with a missing sidecar directory" do
     root =
       Path.join(System.tmp_dir!(), "prob_file_missing_dir_#{System.unique_integer([:positive])}")
 
@@ -172,8 +176,10 @@ defmodule Ferricstore.ProbFileTest do
       {storage_key, CompoundKey.encode_prob_type(:cms, 7), 0, 0, 0, 0, 10}
     )
 
-    assert {:error, {:missing_prob_sidecar, ^storage_key, ^filename}} =
-             ProbFiles.validate(root, 0, keydir)
+    assert ExUnit.CaptureLog.capture_log(fn ->
+             assert :ok = ProbFiles.validate(root, 0, keydir)
+           end) =~
+             filename
 
     :ets.insert(
       keydir,
