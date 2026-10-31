@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Bloom, Cuckoo, Count-Min or Top-K key whose file one node lost (a disk
+  fault, a file removed by hand) stopped that node's apply for the whole
+  shard at the key's next write, and the node then refused to start the
+  shard: replay hit the same write again. The key is now damaged on that node
+  only: its writes and reads there answer `ERR ... file is missing on this
+  node`, RENAME and COPY carry the damage, the shard keeps applying and
+  starts, and DEL (or a snapshot install) heals it. `FERRICSTORE.DOCTOR CHECK
+  SCOPE PROB_FILES` lists damaged keys. The file is never rebuilt empty,
+  which would silently forget its members.
+
 - New command: LATENCY (LATEST, HISTORY, RESET, GRAPH, DOCTOR, HISTOGRAM,
   HELP), with the `latency-monitor-threshold` (milliseconds, 0 = off) and
   `latency-tracking` (default `no`, unlike Redis, so commands do not pay for

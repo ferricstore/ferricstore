@@ -13,6 +13,8 @@ defmodule Ferricstore.Doctor do
 
   alias Ferricstore.DataDir
   alias Ferricstore.FS
+  alias Ferricstore.ProbFile
+  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Flow.{LMDB, LMDBRebuilder, LMDBWriter}
 
   @default_scopes [:bitcask, :blob_refs, :flow_lmdb]
@@ -22,10 +24,12 @@ defmodule Ferricstore.Doctor do
     "ALL" => :all,
     "BITCASK" => :bitcask,
     "BLOB_REFS" => :blob_refs,
-    "FLOW_LMDB" => :flow_lmdb
+    "FLOW_LMDB" => :flow_lmdb,
+    "PROB_FILES" => :prob_files
   }
+  @max_reported_missing_prob_keys 100
 
-  @type scope :: :bitcask | :blob_refs | :flow_lmdb
+  @type scope :: :bitcask | :blob_refs | :flow_lmdb | :prob_files
 
   def start_link(opts \\ []) do
     GenServer.start_link(__MODULE__, opts, name: __MODULE__)
@@ -345,6 +349,32 @@ defmodule Ferricstore.Doctor do
     }
   end
 
+  # Bloom, Cuckoo, Count-Min and Top-K keys whose file this node lost: they
+  # answer errors here until deleted. Scans every type marker, so it is not
+  # among the default scopes (START CHECK runs it as a background job).
+  defp run_scope_check(ctx, :prob_files) do
+    shard_metrics = Enum.map(shard_indexes(ctx), &prob_files_shard_metrics(ctx, &1))
+    missing = sum_metric(shard_metrics, "missing_files")
+    status = if missing == 0, do: "ok", else: "error"
+
+    %{
+      "scope" => "prob_files",
+      "status" => status,
+      "message" =>
+        if(missing == 0,
+          do: "every probabilistic key has its file",
+          else:
+            "#{missing} probabilistic key(s) lost their file on this node; " <>
+              "delete and recreate them"
+        ),
+      "metrics" => %{
+        "shards" => shard_metrics,
+        "total_prob_keys" => sum_metric(shard_metrics, "prob_keys"),
+        "total_missing_files" => missing
+      }
+    }
+  end
+
   defp run_scope_check(ctx, :blob_refs) do
     shard_metrics = Enum.map(shard_indexes(ctx), &blob_shard_metrics(ctx, &1))
 
@@ -449,6 +479,48 @@ defmodule Ferricstore.Doctor do
       "data_files" => count_files(shard_path, ["*.log", "*.seg", "*.data", "*.hint"]),
       "data_bytes" => sum_file_bytes(shard_path, ["*.log", "*.seg", "*.data", "*.hint"])
     }
+  end
+
+  defp prob_files_shard_metrics(ctx, shard_index) do
+    keydir = elem(ctx.keydir_refs, shard_index)
+    prob_dir = Path.join(DataDir.shard_data_path(ctx.data_dir, shard_index), "prob")
+    now = System.os_time(:millisecond)
+
+    {count, missing_count, missing} =
+      :ets.foldl(
+        fn
+          {<<"T:", _rest::binary>> = storage_key, value, expire_at_ms, _lfu, _fid, _off, _size},
+          {count, missing_count, missing} = acc
+          when is_binary(value) and is_integer(expire_at_ms) ->
+            type = CompoundKey.type_name(value)
+
+            if type in ~w(bloom cms cuckoo topk) and (expire_at_ms == 0 or expire_at_ms > now) do
+              key = CompoundKey.extract_redis_key(storage_key)
+
+              if File.exists?(ProbFile.path(prob_dir, key, type)) do
+                {count + 1, missing_count, missing}
+              else
+                {count + 1, missing_count + 1, [key | missing]}
+              end
+            else
+              acc
+            end
+
+          _row, acc ->
+            acc
+        end,
+        {0, 0, []},
+        keydir
+      )
+
+    %{
+      "shard" => shard_index,
+      "prob_keys" => count,
+      "missing_files" => missing_count,
+      "missing_keys" => missing |> Enum.sort() |> Enum.take(@max_reported_missing_prob_keys)
+    }
+  rescue
+    ArgumentError -> %{"shard" => shard_index, "prob_keys" => nil, "missing_files" => 0}
   end
 
   defp blob_shard_metrics(ctx, shard_index) do

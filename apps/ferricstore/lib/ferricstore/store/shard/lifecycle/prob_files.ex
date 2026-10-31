@@ -358,8 +358,15 @@ defmodule Ferricstore.Store.Shard.Lifecycle.ProbFiles do
       MapSet.member?(orphan_files, filename) ->
         {:ok, MapSet.delete(orphan_files, filename)}
 
+      # The file is lost on this node (the other replicas have it): the key
+      # answers errors here until it is deleted, and the shard starts.
       true ->
-        {:error, {:missing_prob_sidecar, storage_key, filename}}
+        Logger.error(
+          "Prob files: #{inspect(CompoundKey.extract_redis_key(storage_key))}'s #{filename} " <>
+            "is missing; the key answers errors on this node until it is deleted"
+        )
+
+        {:ok, orphan_files}
     end
   end
 
