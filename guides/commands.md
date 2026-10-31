@@ -37,7 +37,7 @@ XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XSETID, XIN
 XINFO GROUPS, XINFO CONSUMERS, XGROUP CREATE, XGROUP DESTROY, XGROUP CREATECONSUMER,
 XGROUP DELCONSUMER, XGROUP SETID, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM,
 EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIME,
-SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP,
+SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP, BITFIELD, BITFIELD_RO,
 PFADD, PFCOUNT, PFMERGE,
 GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH, GEOSEARCHSTORE,
 PING, ECHO, TIME, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, SORT, SORT_RO, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
@@ -1253,6 +1253,13 @@ Bitmap operations work at the bit level on string values. Bits are numbered MSB-
 | `BITCOUNT` | `BITCOUNT key [start end [BYTE\|BIT]]` | Integer (count of set bits) | Supported including BYTE/BIT mode |
 | `BITPOS` | `BITPOS key bit [start [end [BYTE\|BIT]]]` | Integer (position or -1) | Supported |
 | `BITOP` | `BITOP AND\|OR\|XOR\|NOT destkey key [key ...]` | Integer (dest string length) | Supported |
+| `BITFIELD` | `BITFIELD key [GET type offset] [SET type offset value] [INCRBY type offset increment] [OVERFLOW WRAP\|SAT\|FAIL] ...` | Array: per GET the field, per SET the old value, per INCRBY the new one (nil when OVERFLOW FAIL refused it) | Supported; SET and INCRBY need cluster feature level 12 |
+| `BITFIELD_RO` | `BITFIELD_RO key [GET type offset ...]` | Array of fields | Supported |
+
+BITFIELD types are `i1`..`i64` and `u1`..`u63`; an offset `#N` is N fields of
+the type. Its SET and INCRBY run as one compound entry from cluster feature
+level 12, keeping the key's TTL, and are refused below it; inside MULTI both
+commands need level 12.
 
 ---
 

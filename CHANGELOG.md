@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: BITFIELD and BITFIELD_RO (GET, SET, INCRBY, OVERFLOW
+  WRAP/SAT/FAIL on i1..i64 and u1..u63 fields), as Redis answers them.
+  BITFIELD's writes read and write the string in one compound entry from
+  cluster feature level 12, and are refused below it.
+
 - New commands: SORT and SORT_RO, with BY, LIMIT, GET, ASC/DESC, ALPHA and
   (SORT) STORE, as Redis in cluster mode answers them: BY and GET patterns
   must name keys in the sorted key's slot, and need read access to every key.

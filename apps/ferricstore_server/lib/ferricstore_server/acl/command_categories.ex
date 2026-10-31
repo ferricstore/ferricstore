@@ -41,8 +41,8 @@ defmodule FerricstoreServer.Acl.CommandCategories do
     ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZMPOP BZPOPMIN BZPOPMAX BZMPOP
   )
 
-  @bitmap_read ~w(GETBIT BITCOUNT BITPOS)
-  @bitmap_write ~w(SETBIT BITOP)
+  @bitmap_read ~w(GETBIT BITCOUNT BITPOS BITFIELD_RO)
+  @bitmap_write ~w(SETBIT BITOP BITFIELD)
 
   @hyperloglog_read ~w(PFCOUNT)
   @hyperloglog_write ~w(PFADD PFMERGE)

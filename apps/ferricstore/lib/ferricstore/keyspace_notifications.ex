@@ -155,6 +155,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     "BLMPOP" => "lpop",
     "LMPOP" => "lpop",
     "SORT" => "sortstore",
+    "BITFIELD" => "setbit",
     "BZPOPMIN" => "zpopmin",
     "BZPOPMAX" => "zpopmax",
     "BZMPOP" => "zpopmin",
@@ -321,6 +322,24 @@ defmodule Ferricstore.KeyspaceNotifications do
   end
 
   defp notify_event("SORT", _event, _args, _result), do: :ok
+
+  # BITFIELD fires when a SET or INCRBY ran (FAIL overflows answer nil).
+  defp notify_event("BITFIELD", event, [key | args], replies) when is_list(replies) do
+    case Ferricstore.Commands.Bitfield.parse(args, :write) do
+      {:ok, ops} ->
+        wrote? =
+          ops
+          |> Enum.zip(replies)
+          |> Enum.any?(fn {op, reply} -> elem(op, 0) != :get and reply != nil end)
+
+        if wrote?, do: notify_key(key, event), else: :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp notify_event("BITFIELD", _event, _args, _result), do: :ok
 
   defp notify_event("LMPOP", _event, args, [key, _popped]) do
     case Ferricstore.Commands.Blocking.parse_lmpop_args(args) do

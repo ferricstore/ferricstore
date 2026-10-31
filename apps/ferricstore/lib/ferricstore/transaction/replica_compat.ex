@@ -51,7 +51,9 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
     :lmpop,
     :lcs,
     :sort,
-    :sort_ro
+    :sort_ro,
+    :bitfield,
+    :bitfield_ro
   ]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
