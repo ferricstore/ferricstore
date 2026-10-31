@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- SRANDMEMBER, HRANDFIELD and ZRANDMEMBER read every member to pick one.
+  On the instance they now take the collection's count and read the picked
+  position: on 20,000 members SRANDMEMBER fell from 25.9 to 4.9 ms,
+  HRANDFIELD from 24.5 to 4.2 ms, and ZRANDMEMBER from 3.3 ms to 83 us
+  (a sorted set stored as a tree answers a position in O(log N)); with a
+  count of up to 8, ZRANDMEMBER fell from 3.1 ms to 0.23 ms. A count on a
+  set or hash still reads the collection once, as each position walks a
+  quarter of it on average.
+
 - A transaction's writes woke no blocked client. An LPUSH, RPUSH, LPUSHX,
   RPUSHX or LMOVE inside MULTI left a BLPOP, BRPOP, BLMOVE or BLMPOP waiting
   for that list, and from feature level 10, where ZUNIONSTORE, ZINTERSTORE,

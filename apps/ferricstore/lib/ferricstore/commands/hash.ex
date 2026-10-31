@@ -26,7 +26,7 @@ defmodule Ferricstore.Commands.Hash do
   """
 
   alias Ferricstore.CommandTime
-  alias Ferricstore.Commands.CollectionScan
+  alias Ferricstore.Commands.{CollectionScan, RandomPick}
   alias Ferricstore.Commands.Hash.FieldOps
   alias Ferricstore.Commands.Hash.Helpers
   alias Ferricstore.Store.CompoundKey
@@ -800,15 +800,18 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   defp hrandfield_one(key, store) do
-    with :ok <- TypeRegistry.command_check_type(key, :hash, store),
-         {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
-      case pairs do
-        [] ->
+    with :ok <- TypeRegistry.command_check_type(key, :hash, store) do
+      case RandomPick.pairs(store, key, CompoundKey.hash_prefix(key), nil) do
+        {:ok, []} ->
           nil
 
-        _ ->
-          {field, _value} = Enum.random(pairs)
+        {:ok, [{field, _value}]} ->
           field
+
+        :scan ->
+          with {:ok, pairs} <- scan_pairs(key, CompoundKey.hash_prefix(key), store) do
+            if pairs == [], do: nil, else: pairs |> Enum.random() |> elem(0)
+          end
       end
     end
   end
@@ -841,9 +844,18 @@ defmodule Ferricstore.Commands.Hash do
        do: {:error, "ERR count exceeds maximum allowed response size"}
 
   defp select_random_hash_fields(key, count, with_values, store) do
-    case scan_pairs(key, CompoundKey.hash_prefix(key), store) do
-      {:ok, pairs} -> Helpers.select_random_fields(pairs, count, with_values)
-      {:error, _reason} = error -> error
+    case RandomPick.pairs(store, key, CompoundKey.hash_prefix(key), count) do
+      {:ok, pairs} when with_values ->
+        Helpers.hash_pairs_to_flat_list(pairs)
+
+      {:ok, pairs} ->
+        Enum.map(pairs, fn {field, _value} -> field end)
+
+      :scan ->
+        case scan_pairs(key, CompoundKey.hash_prefix(key), store) do
+          {:ok, pairs} -> Helpers.select_random_fields(pairs, count, with_values)
+          {:error, _reason} = error -> error
+        end
     end
   end
 
