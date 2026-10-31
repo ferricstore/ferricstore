@@ -99,7 +99,7 @@ defmodule Ferricstore.Commands.CollectionExpireTest do
   end
 
   defp fill(d, k, size) do
-    for chunk <- Enum.chunk_every(1..size, 2_000),
+    for chunk <- Enum.chunk_every(1..size, 500),
         {command, args} <- [
           {"HSET", [k.("h") | Enum.flat_map(chunk, &["f#{&1}", "v#{&1}"])]},
           {"RPUSH", [k.("l") | Enum.map(chunk, &"e#{&1}")]},
@@ -160,7 +160,7 @@ defmodule Ferricstore.Commands.CollectionExpireTest do
   test "past the bulk bound EXPIRE is refused and the TTL is kept", %{d: d, k: k} do
     over = 100_001
 
-    for chunk <- Enum.chunk_every(1..over, 2_000),
+    for chunk <- Enum.chunk_every(1..over, 1_000),
         do: d.("HSET", [k.("h") | Enum.flat_map(chunk, &["f#{&1}", "v"])])
 
     assert {:error, "ERR too many members in one command (the limit is 100000)"} ==
