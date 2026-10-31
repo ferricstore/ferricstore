@@ -1137,6 +1137,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundApply do
             case publish_pending_prob_files(flushed_state) do
               :ok ->
                 :ok = dispatch_pending_compound_promotions(flushed_state)
+                # A transaction's pushes and sorted-set writes wake their
+                # BLPOP/BZPOPMIN waiters once published, as single writes do.
+                notify_pending_list_waiters()
 
                 case publish_pending_flow_history_projections(flushed_state) do
                   :ok ->
