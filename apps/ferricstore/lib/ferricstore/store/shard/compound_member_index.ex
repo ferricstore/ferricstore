@@ -12,6 +12,7 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
   @member_expiry_tag :"$ferricstore_compound_member_expiry_lookup"
   @stream_select_min_count 128
   @stream_select_batch_max 4096
+  @row_select_batch_max 1024
 
   @waraft_location_tags [:waraft_segment, :waraft_projection, :waraft_apply_projection]
 
@@ -945,32 +946,9 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
           tail = max(total - start - requested, 0)
 
           if start <= tail do
-            case collect_row_slice(
-                   tid,
-                   keydir,
-                   prefix,
-                   first_key(tid, prefix),
-                   :forward,
-                   start,
-                   requested,
-                   expiry_context,
-                   []
-                 ) do
-              {:ok, rows} -> {:ok, Enum.reverse(rows)}
-              other -> other
-            end
+            collect_rows(tid, keydir, prefix, :forward, start, requested, expiry_context)
           else
-            collect_row_slice(
-              tid,
-              keydir,
-              prefix,
-              last_key(tid, prefix),
-              :backward,
-              tail,
-              requested,
-              expiry_context,
-              []
-            )
+            collect_rows(tid, keydir, prefix, :backward, tail, requested, expiry_context)
           end
         end
     end
@@ -1659,6 +1637,91 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   defp row_slice_next_lookup(table, key, :forward), do: :ets.next_lookup(table, key)
   defp row_slice_next_lookup(table, key, :backward), do: :ets.prev_lookup(table, key)
+
+  # Rows in collection order, `skip` live members in from `direction`'s end.
+  # The catalog is read in select chunks, so each member before the position
+  # costs one keydir lookup and no catalog search. Stream members are ID
+  # tuples after a sentinel key, so streams keep the stepped walk.
+  defp collect_rows(table, keydir, <<"X:", _rest::binary>> = prefix, :forward, skip, count, ctx) do
+    start = first_key(table, prefix)
+
+    with {:ok, rows} <-
+           collect_row_slice(table, keydir, prefix, start, :forward, skip, count, ctx, []),
+         do: {:ok, Enum.reverse(rows)}
+  end
+
+  defp collect_rows(table, keydir, <<"X:", _rest::binary>> = prefix, :backward, skip, count, ctx) do
+    start = last_key(table, prefix)
+    collect_row_slice(table, keydir, prefix, start, :backward, skip, count, ctx, [])
+  end
+
+  defp collect_rows(table, keydir, prefix, direction, skip, count, ctx) do
+    spec = [{{{prefix, :"$1"}, :"$2"}, [{:is_binary, :"$1"}], [:"$2"]}]
+    limit = min(skip + count, @row_select_batch_max)
+
+    selected =
+      case direction do
+        :forward -> :ets.select(table, spec, limit)
+        :backward -> :ets.select_reverse(table, spec, limit)
+      end
+
+    case collect_selected_rows(selected, direction, table, keydir, skip, count, ctx, []) do
+      {:ok, rows} when direction == :forward -> {:ok, Enum.reverse(rows)}
+      other -> other
+    end
+  end
+
+  defp collect_selected_rows(_selected, _direction, _table, _keydir, _skip, 0, _ctx, acc),
+    do: {:ok, acc}
+
+  defp collect_selected_rows(
+         :"$end_of_table",
+         _direction,
+         _table,
+         _keydir,
+         _skip,
+         _count,
+         _ctx,
+         acc
+       ),
+       do: {:ok, acc}
+
+  defp collect_selected_rows({[], continuation}, direction, table, keydir, skip, count, ctx, acc) do
+    continuation
+    |> continue_select(direction)
+    |> collect_selected_rows(direction, table, keydir, skip, count, ctx, acc)
+  end
+
+  defp collect_selected_rows(
+         {[compound_key | rest], continuation},
+         direction,
+         table,
+         keydir,
+         skip,
+         count,
+         ctx,
+         acc
+       ) do
+    next = {rest, continuation}
+
+    case keydir_member_row_status(%{keydir: keydir}, compound_key, ctx) do
+      {:live, _row} when skip > 0 ->
+        collect_selected_rows(next, direction, table, keydir, skip - 1, count, ctx, acc)
+
+      {:live, row} ->
+        collect_selected_rows(next, direction, table, keydir, 0, count - 1, ctx, [row | acc])
+
+      :stale ->
+        delete_stale_member(table, %{keydir: keydir}, compound_key, ctx)
+        collect_selected_rows(next, direction, table, keydir, skip, count, ctx, acc)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp continue_select(continuation, :forward), do: :ets.select(continuation)
+  defp continue_select(continuation, :backward), do: :ets.select_reverse(continuation)
 
   defp collect_row_slice(
          _table,

@@ -116,7 +116,12 @@ defmodule Ferricstore.Transaction.CoordinatorTest do
             {"KEY_INFO", ["tx-key-info"]},
             {"FETCH_OR_COMPUTE", ["tx-fetch", "1000"]},
             {"SPOP", ["tx-random-set"]},
-            {"BF.ADD", ["tx-bloom", "member"]}
+            {"BF.ADD", ["tx-bloom", "member"]},
+            # Stream commands run outside the transaction store, as XADD does.
+            {"XPENDING", ["tx-stream", "g"]},
+            {"XCLAIM", ["tx-stream", "g", "c", "0", "1-0"]},
+            {"XAUTOCLAIM", ["tx-stream", "g", "c", "0", "0-0"]},
+            {"XSETID", ["tx-stream", "1-0"]}
           ] do
         assert {:ok, prepared} = PreparedCommand.prepare(command, args)
 
