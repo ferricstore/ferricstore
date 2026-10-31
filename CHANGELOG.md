@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A transaction's writes woke no blocked client. An LPUSH, RPUSH, LPUSHX,
+  RPUSHX or LMOVE inside MULTI left a BLPOP, BRPOP, BLMOVE or BLMPOP waiting
+  for that list, and from feature level 10, where ZUNIONSTORE, ZINTERSTORE,
+  ZDIFFSTORE and ZRANGESTORE run as one-command transactions, they no longer
+  woke BZPOPMIN, BZPOPMAX or BZMPOP (0.12.16). A transaction now wakes the
+  waiters of what it pushed or added once it is published, on every node, as
+  a single write does.
+
 ## 0.12.16 - 2026-10-31
 
 - ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and

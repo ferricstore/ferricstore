@@ -36,6 +36,30 @@ defmodule Ferricstore.Commands.ZSetWaiterNotifyTest do
     end
   end
 
+  # A transaction applies through the cross-shard pending path, which must
+  # wake waiters once it publishes, as single writes do.
+  test "pushes, an LMOVE and a ZADD inside a transaction wake their waiters" do
+    tag = "{zwake-tx:#{System.unique_integer([:positive])}}"
+    list = tag <> "list"
+    zset = tag <> "zset"
+    moved = tag <> "moved"
+    for key <- [list, zset, moved], do: wait(key)
+
+    queue =
+      for {command, args} <- [
+            {"LPUSH", [list, "a"]},
+            {"ZADD", [zset, "1", "a"]},
+            {"RPUSH", [tag <> "source", "x"]},
+            {"LMOVE", [tag <> "source", moved, "LEFT", "LEFT"]}
+          ] do
+        {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare(command, args)
+        prepared
+      end
+
+    assert [1, 1, 1, "x"] == Ferricstore.Transaction.Coordinator.execute(queue, %{}, nil)
+    for key <- [list, zset, moved], do: assert_receive({:waiter_notify, ^key}, 1_000)
+  end
+
   test "a removal does not wake a waiter" do
     ctx = FerricStore.Instance.get(:default)
     key = "{zwake:#{System.unique_integer([:positive])}}rem"
@@ -43,6 +67,26 @@ defmodule Ferricstore.Commands.ZSetWaiterNotifyTest do
     wait(key)
     1 = Dispatcher.dispatch("ZREM", [key, "a"], ctx)
     refute_receive {:waiter_notify, ^key}, 200
+  end
+
+  describe "from feature level 10" do
+    setup do
+      isolated = ShardHelpers.setup_isolated_data_dir()
+      on_exit(fn -> ShardHelpers.teardown_isolated_data_dir(isolated) end)
+      ctx = FerricStore.Instance.get(:default)
+      assert {:ok, %{active: 10}} = Ferricstore.Cluster.FeatureLevel.raise(ctx, 10)
+      %{ctx: ctx}
+    end
+
+    # The STORE forms run as one-command transactions there.
+    test "a STORE into the key wakes its waiter", %{ctx: ctx} do
+      tag = "{zwake10:#{System.unique_integer([:positive])}}"
+      key = tag <> "store"
+      1 = Dispatcher.dispatch("ZADD", [tag <> "source", "1", "a"], ctx)
+      wait(key)
+      1 = Dispatcher.dispatch("ZUNIONSTORE", [key, "1", tag <> "source"], ctx)
+      assert_receive {:waiter_notify, ^key}, 1_000
+    end
   end
 
   describe "a tree-encoded set" do
