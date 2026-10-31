@@ -549,14 +549,17 @@ different hibernated Flow than the others); at level 9 a large sorted set lives
 in its own counted tree file, so ZRANK and ZRANGE by index stay O(log N) (below
 it they walk the set from its start); at level 10 MULTI takes ZUNION, ZINTER,
 ZDIFF, their STORE forms, ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX,
-ZLEXCOUNT, the ZREMRANGEBY* commands and ZMPOP. After the first start of a new
-cluster, once every node is up, raise it to the level the release supports:
+ZLEXCOUNT, the ZREMRANGEBY* commands and ZMPOP; at level 11 DEL, UNLINK, SET,
+RENAME, COPY, EXPIRE, PERSIST and the STORE forms work on collections past the
+per-command member bound (below it they are refused there). After the first
+start of a new cluster, once every node is up, raise it to the level the
+release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 10, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 11, active: 0, shards: [0, 0, 0, 0]}}
 
-bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(10))'
+bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(11))'
 ```
 
 ## Upgrading a Cluster
@@ -685,6 +688,20 @@ shard_0: 2
     writes with nothing in between. Below level 10 they read on the node the
     client is connected to, which may not have applied the latest write yet,
     and write as separate steps.
+  - 11: one replicated entry applies at most `:compound_member_apply_budget`
+    members (4,096 by default) and reads at most
+    `:transaction_result_byte_budget` bytes (8 MiB). Commands whose members
+    come from stored data rather than from the request apply past them:
+    DEL, UNLINK and SET over a collection remove every member, a page of the
+    member bound at a time; RENAME, RENAMENX, COPY, EXPIRE, PEXPIRE,
+    EXPIREAT, PEXPIREAT, PERSIST, ZREMRANGEBY* and the STORE forms apply with
+    the largest bounds, 100,000 members and 64 MiB. Past those they are
+    refused whole with `ERR too many members in one command (the limit is
+    100000)`. SUNIONSTORE, SINTERSTORE and SDIFFSTORE run as one-command
+    transactions, as the sorted-set STORE forms do from level 10. Below
+    level 11 these commands are refused for a collection past the configured
+    bound. Applying one entry holds the shard's writes for its duration:
+    about 0.7 s for a RENAME of 20,000 members on macOS.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

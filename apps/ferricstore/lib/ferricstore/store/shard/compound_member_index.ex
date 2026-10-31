@@ -710,6 +710,29 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   def keys_for_prefix(_table, _prefix, _limit), do: :unavailable
 
+  @doc false
+  # Up to `limit` keys under `prefix` after `cursor` (`:start` for the first),
+  # and where the next page starts, for work that goes through a collection in
+  # bounded steps. The table is ordered, so a cursor whose key was deleted in
+  # between still resumes after it.
+  @spec keys_for_prefix_page(table_ref(), binary(), :start | term(), pos_integer()) ::
+          {:ok, [binary()], :done | {:next, term()}} | :unavailable
+  def keys_for_prefix_page(table, prefix, cursor, limit)
+      when is_binary(prefix) and is_integer(limit) and limit > 0 do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        start = if cursor == :start, do: first_key(tid, prefix), else: :ets.next(tid, cursor)
+        scan_keys_page(tid, prefix, start, limit, nil, [])
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def keys_for_prefix_page(_table, _prefix, _cursor, _limit), do: :unavailable
+
   @spec live_keys_for_prefix(table_ref(), map(), binary(), non_neg_integer()) ::
           {:ok, [binary()], non_neg_integer(), :complete | :more}
           | {:error, term()}
@@ -2379,6 +2402,22 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   defp do_scan_keys_bounded(_table, _prefix, _other_key, _remaining, acc),
     do: {:ok, Enum.reverse(acc)}
+
+  defp scan_keys_page(_table, prefix, {prefix, _member}, 0, last, acc),
+    do: {:ok, Enum.reverse(acc), {:next, last}}
+
+  defp scan_keys_page(table, prefix, {prefix, _member} = index_key, remaining, _last, acc) do
+    {remaining, acc} =
+      case :ets.lookup(table, index_key) do
+        [{^index_key, compound_key}] -> {remaining - 1, [compound_key | acc]}
+        _missing -> {remaining, acc}
+      end
+
+    scan_keys_page(table, prefix, :ets.next(table, index_key), remaining, index_key, acc)
+  end
+
+  defp scan_keys_page(_table, _prefix, _end_or_other_key, _remaining, _last, acc),
+    do: {:ok, Enum.reverse(acc), :done}
 
   defp do_live_keys_for_prefix(
          _table,

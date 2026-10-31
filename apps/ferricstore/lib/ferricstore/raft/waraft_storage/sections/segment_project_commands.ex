@@ -446,6 +446,7 @@ defmodule Ferricstore.Raft.WARaftStorage.Sections.SegmentProjectCommands do
              true <- segment_shared_compound_projection_safe?(sm_state, redis_key) do
           case segment_project_delete_prefix(sm_state, redis_key, prefix) do
             {:ok, new_sm_state} -> {:ok, new_sm_state, :ok, 1}
+            {:error, :feature_level_unknown} -> :unsupported
             {:error, _reason} = error -> {:ok, sm_state, error, 0}
           end
         else

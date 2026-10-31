@@ -1459,6 +1459,33 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           do_get(state, Ferricstore.Cluster.FeatureLevel.key(8)) ==
             Ferricstore.Cluster.FeatureLevel.marker()
 
+      defp feature_level_11?(state),
+        do:
+          do_get(state, Ferricstore.Cluster.FeatureLevel.key(11)) ==
+            Ferricstore.Cluster.FeatureLevel.marker()
+
+      # From feature level 11 an entry whose one command takes its members from
+      # stored data applies with the bulk bounds (`ApplyContext.bulk/1`); the
+      # state it returns keeps the replicated context.
+      defp with_bulk_apply_context(state, bulk_command?, fun) do
+        if bulk_command? and feature_level_11?(state) do
+          context = state.apply_context
+
+          case fun.(%{state | apply_context: Ferricstore.Raft.ApplyContext.bulk(context)}) do
+            {:error, reason, flushed} ->
+              {:error, reason, %{flushed | apply_context: context}}
+
+            {result, %{apply_context: _} = flushed} ->
+              {result, %{flushed | apply_context: context}}
+
+            other ->
+              other
+          end
+        else
+          fun.(state)
+        end
+      end
+
       # A key's TTL is stored on each of its members. From feature level 6 a
       # member written into a collection that has one takes it (its type key's
       # expiry, while in the future), so members added after EXPIRE expire with

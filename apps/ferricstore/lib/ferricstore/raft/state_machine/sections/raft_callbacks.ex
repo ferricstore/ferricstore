@@ -70,12 +70,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
             write_result =
               case transaction_watches_clean?(watched_keys, state) do
                 :clean ->
-                  with_cross_shard_pending_writes(state, fn ->
-                    ShardTransaction.execute(
-                      queue,
-                      sandbox_namespace,
-                      build_local_raft_tx_store(state)
-                    )
+                  with_bulk_apply_context(state, bulk_transaction?(queue), fn state ->
+                    with_cross_shard_pending_writes(state, fn ->
+                      ShardTransaction.execute(
+                        queue,
+                        sandbox_namespace,
+                        build_local_raft_tx_store(state)
+                      )
+                    end)
                   end)
 
                 :changed ->
@@ -105,6 +107,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.RaftCallbacks do
           end)
         end)
       end
+
+      defp bulk_transaction?([%Ferricstore.Transaction.ExecutionEntry{command: command}]),
+        do: Ferricstore.Raft.ApplyContext.bulk_command?(command)
+
+      defp bulk_transaction?(_queue), do: false
 
       defp normalize_generic_batch_commands(commands, %{apply_context: context}),
         do: ApplyWork.normalize_batch(context, commands)

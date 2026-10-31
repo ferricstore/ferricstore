@@ -12,8 +12,17 @@ defmodule Ferricstore.ErrorReasons do
   command past that bound is refused as a whole.
   """
   @spec client_message(term(), map() | nil) :: binary() | nil
-  def client_message(:compound_member_apply_budget_exceeded, ctx),
-    do: "ERR too many members in one command" <> limit_suffix(ctx, :compound_member_apply_budget)
+  def client_message(reason, ctx)
+      when reason in [
+             :compound_member_apply_budget_exceeded,
+             :transaction_compound_read_budget_exceeded,
+             :compound_delete_budget_exceeded
+           ],
+      do:
+        "ERR too many members in one command" <> limit_suffix(ctx, :compound_member_apply_budget)
+
+  def client_message(:transaction_result_byte_budget_exceeded, ctx),
+    do: "ERR too many bytes in one command" <> limit_suffix(ctx, :transaction_result_byte_budget)
 
   def client_message(:batch_command_apply_budget_exceeded, ctx),
     do: "ERR too many items in one command" <> limit_suffix(ctx, :batch_command_apply_budget)

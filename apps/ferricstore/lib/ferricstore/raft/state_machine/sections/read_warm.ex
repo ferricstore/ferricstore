@@ -1108,16 +1108,47 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ReadWarm do
       # Collection deletion must use the exact ordered catalog. Falling back to
       # the keydir would turn one collection delete into a full-shard apply stall.
       defp do_compound_member_prefix_delete(state, redis_key, prefix) do
-        case CompoundMemberIndex.keys_for_prefix(
-               Map.get(state, :compound_member_index_name),
-               prefix,
-               state.apply_context.compound_member_apply_budget
-             ) do
-          {:ok, compound_keys} ->
-            do_compound_batch_delete(state, redis_key, compound_keys)
+        index = Map.get(state, :compound_member_index_name)
+        budget = state.apply_context.compound_member_apply_budget
 
-          {:error, :limit_exceeded} ->
-            {:error, :compound_delete_budget_exceeded}
+        if feature_level_11?(state) do
+          compound_member_prefix_delete_pages(state, redis_key, index, prefix, :start, budget)
+        else
+          case CompoundMemberIndex.keys_for_prefix(index, prefix, budget) do
+            {:ok, compound_keys} ->
+              do_compound_batch_delete(state, redis_key, compound_keys)
+
+            {:error, :limit_exceeded} ->
+              {:error, :compound_delete_budget_exceeded}
+
+            :unavailable ->
+              {:error, :compound_member_index_unavailable}
+          end
+        end
+      end
+
+      # From feature level 11 a collection delete (DEL, UNLINK, a SET over the
+      # collection) removes every member, a page of the member budget at a
+      # time, whatever the collection's size, as Redis's DEL does.
+      defp compound_member_prefix_delete_pages(state, redis_key, index, prefix, cursor, budget) do
+        case CompoundMemberIndex.keys_for_prefix_page(index, prefix, cursor, budget) do
+          {:ok, compound_keys, next} ->
+            with :ok <- do_compound_batch_delete(state, redis_key, compound_keys) do
+              case next do
+                :done ->
+                  :ok
+
+                {:next, cursor} ->
+                  compound_member_prefix_delete_pages(
+                    state,
+                    redis_key,
+                    index,
+                    prefix,
+                    cursor,
+                    budget
+                  )
+              end
+            end
 
           :unavailable ->
             {:error, :compound_member_index_unavailable}

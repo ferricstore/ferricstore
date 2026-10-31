@@ -502,6 +502,35 @@ defmodule Ferricstore.Raft.ApplyContext do
   def valid?(%__MODULE__{} = context), do: decode(encode(context)) == {:ok, context}
   def valid?(_other), do: false
 
+  # Commands whose member work comes from stored data rather than from the
+  # request: how many members RENAME moves or a STORE form writes depends on
+  # the collections, not on what the client sent.
+  @bulk_commands ~w(
+    RENAME RENAMENX COPY
+    SUNIONSTORE SINTERSTORE SDIFFSTORE
+    ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZRANGESTORE GEOSEARCHSTORE
+    ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX
+    EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
+  )
+
+  @doc false
+  @spec bulk_command?(term()) :: boolean()
+  def bulk_command?(command), do: command in @bulk_commands
+
+  @doc false
+  # From feature level 11 an entry holding one bulk command applies with the
+  # largest member and byte bounds a context may hold. The configured bounds
+  # keep limiting what one request may send; a collection's size is not the
+  # client's to choose, and Redis applies these commands whatever the size.
+  @spec bulk(t()) :: t()
+  def bulk(%__MODULE__{} = context) do
+    %{
+      context
+      | compound_member_apply_budget: @max_compound_member_apply_budget,
+        transaction_result_byte_budget: @max_transaction_result_byte_budget
+    }
+  end
+
   @doc false
   @spec barrier_command(t()) :: {:ferricstore_apply_context_barrier, encoded()}
   def barrier_command(%__MODULE__{} = context) do

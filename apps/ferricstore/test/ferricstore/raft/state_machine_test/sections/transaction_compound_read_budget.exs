@@ -1345,6 +1345,124 @@ defmodule Ferricstore.Raft.StateMachineTest.Sections.TransactionCompoundReadBudg
         assert {_state, [["field", "value"], 1]} =
                  StateMachine.apply(%{}, {:tx_execute, entries, nil}, limited_state)
       end
+
+      # A two-field hash under a member budget of one, with feature level 11
+      # active or not.
+      defp bulk_budget_state(state, ets, redis_key, level_11?) do
+        index = state.compound_member_index_name
+        context = ApplyContext.new(compound_member_apply_budget: 1)
+
+        CompoundMemberIndex.ensure_table!(index)
+        CompoundMemberIndex.reset(index)
+        on_exit(fn -> safe_delete_ets(index) end)
+
+        :ets.insert(ets, {CompoundKey.type_key(redis_key), "hash", 0, LFU.initial(), 0, 0, 4})
+
+        for field <- ["a", "b"] do
+          compound_key = CompoundKey.hash_field(redis_key, field)
+          :ets.insert(ets, {compound_key, "v" <> field, 0, LFU.initial(), 0, 0, 2})
+          CompoundMemberIndex.put(index, compound_key)
+        end
+
+        if level_11? do
+          marker = Ferricstore.Cluster.FeatureLevel.marker()
+          level_key = Ferricstore.Cluster.FeatureLevel.key(11)
+          :ets.insert(ets, {level_key, marker, 0, LFU.initial(), 0, 0, byte_size(marker)})
+        end
+
+        %{state | apply_context: context, apply_context_encoded: ApplyContext.encode(context)}
+      end
+
+      defp tx_entries(commands) do
+        Enum.map(commands, fn {command, args} ->
+          {:ok, prepared} = Ferricstore.Commands.PreparedCommand.prepare(command, args)
+          {:ok, entry} = Ferricstore.Transaction.ExecutionEntry.from_prepared(prepared)
+          entry
+        end)
+      end
+
+      test "a one-command bulk transaction past the member budget applies from level 11", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "tx-bulk-expire"
+        entries = tx_entries([{"EXPIRE", [redis_key, "1000"]}])
+
+        below = bulk_budget_state(state, ets, redis_key, false)
+
+        assert {_state, {:error, _budget}} =
+                 StateMachine.apply(%{}, {:tx_execute, entries, nil}, below)
+
+        at_11 = bulk_budget_state(state, ets, redis_key, true)
+
+        assert {new_state, [1]} = StateMachine.apply(%{}, {:tx_execute, entries, nil}, at_11)
+        # The replicated context is kept; only that entry applied with the bulk bounds.
+        assert new_state.apply_context == at_11.apply_context
+
+        for field <- ["a", "b"] do
+          assert [{_key, _value, expire_at_ms, _, _, _, _}] =
+                   :ets.lookup(ets, CompoundKey.hash_field(redis_key, field))
+
+          assert expire_at_ms > 0
+        end
+      end
+
+      test "a command that is not bulk keeps the member budget at level 11", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "tx-bulk-not-hgetall"
+        at_11 = bulk_budget_state(state, ets, redis_key, true)
+        entries = tx_entries([{"HGETALL", [redis_key]}])
+
+        assert {_state, {:error, :transaction_compound_read_budget_exceeded}} =
+                 StateMachine.apply(%{}, {:tx_execute, entries, nil}, at_11)
+      end
+
+      test "a collection delete past the member budget removes every member from level 11", %{
+        state: state,
+        ets: ets
+      } do
+        redis_key = "bulk-delete-prefix"
+        prefix = CompoundKey.hash_prefix(redis_key)
+
+        below = bulk_budget_state(state, ets, redis_key, false)
+
+        assert {_state, {:error, :compound_delete_budget_exceeded}} =
+                 StateMachine.apply(%{}, {:compound_delete_prefix, prefix}, below)
+
+        assert [_row] = :ets.lookup(ets, CompoundKey.hash_field(redis_key, "a"))
+
+        at_11 = bulk_budget_state(state, ets, redis_key, true)
+        assert {_state, :ok} = StateMachine.apply(%{}, {:compound_delete_prefix, prefix}, at_11)
+        assert [] = :ets.lookup(ets, CompoundKey.hash_field(redis_key, "a"))
+        assert [] = :ets.lookup(ets, CompoundKey.hash_field(redis_key, "b"))
+      end
+
+      test "RENAME past the member budget applies from level 11", %{state: state, ets: ets} do
+        source = "bulk-rename-source"
+        destination = "bulk-rename-destination"
+
+        below = bulk_budget_state(state, ets, source, false)
+
+        assert {_state, {:error, _budget}} =
+                 StateMachine.apply(%{}, {:key_lifecycle, {:rename, source, destination}}, below)
+
+        assert [_row] = :ets.lookup(ets, CompoundKey.hash_field(source, "a"))
+
+        at_11 = bulk_budget_state(state, ets, source, true)
+
+        assert {_state, :ok} =
+                 StateMachine.apply(%{}, {:key_lifecycle, {:rename, source, destination}}, at_11)
+
+        assert [] = :ets.lookup(ets, CompoundKey.hash_field(source, "a"))
+
+        assert [{_key, "va", _, _, _, _, _}] =
+                 :ets.lookup(ets, CompoundKey.hash_field(destination, "a"))
+
+        assert [{_key, "vb", _, _, _, _, _}] =
+                 :ets.lookup(ets, CompoundKey.hash_field(destination, "b"))
+      end
     end
   end
 end
