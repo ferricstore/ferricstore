@@ -31,10 +31,15 @@ defmodule Ferricstore.Commands.LargeCollectionCommandsTest do
 
   defp fill(ctx, k) do
     for chunk <- Enum.chunk_every(1..@size, 2_000) do
-      d(ctx, "HSET", [k.("h") | Enum.flat_map(chunk, &["f#{&1}", "v#{&1}"])])
-      d(ctx, "RPUSH", [k.("l") | Enum.map(chunk, &"e#{&1}")])
-      d(ctx, "SADD", [k.("s") | Enum.map(chunk, &"m#{&1}")])
-      d(ctx, "ZADD", [k.("z") | Enum.flat_map(chunk, &["#{&1}", "m#{&1}"])])
+      for {command, args} <- [
+            {"HSET", [k.("h") | Enum.flat_map(chunk, &["f#{&1}", "v#{&1}"])]},
+            {"RPUSH", [k.("l") | Enum.map(chunk, &"e#{&1}")]},
+            {"SADD", [k.("s") | Enum.map(chunk, &"m#{&1}")]},
+            {"ZADD", [k.("z") | Enum.flat_map(chunk, &["#{&1}", "m#{&1}"])]}
+          ] do
+        reply = d(ctx, command, args)
+        assert is_integer(reply), "#{command}: #{inspect(reply)}"
+      end
     end
 
     :ok
