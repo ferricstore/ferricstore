@@ -48,7 +48,7 @@ defmodule Ferricstore.Transaction.Ast do
       do: ast
 
   def namespace_ast_keys({tag, keys}, ns)
-      when tag in [:del, :unlink, :exists, :mget, :sinter, :sunion, :sdiff, :pfcount] and
+      when tag in [:del, :unlink, :exists, :touch, :mget, :sinter, :sunion, :sdiff, :pfcount] and
              is_list(keys),
       do: {tag, namespace_keys(keys, ns)}
 
@@ -135,7 +135,7 @@ defmodule Ferricstore.Transaction.Ast do
 
   @spec compound_member_work_up_to(term(), non_neg_integer() | :unlimited) ::
           {:ok, non_neg_integer()} | :limit_exceeded | :invalid
-  def compound_member_work_up_to({:hset, [_key | pairs]}, limit),
+  def compound_member_work_up_to({tag, [_key | pairs]}, limit) when tag in [:hset, :hmset],
     do: count_pairs_up_to(pairs, limit, 0)
 
   def compound_member_work_up_to({tag, [_key | members]}, limit)

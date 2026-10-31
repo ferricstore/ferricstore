@@ -165,6 +165,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     "SINTERSTORE" => "sinterstore",
     "SUNIONSTORE" => "sunionstore",
     "HSET" => "hset",
+    "HMSET" => "hset",
     "HSETNX" => "hset",
     "HDEL" => "hdel",
     "HINCRBY" => "hincrby",

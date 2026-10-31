@@ -4,6 +4,10 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: HMSET (HSET answering `OK`, for older clients), TOUCH and
+  TIME. Inside MULTI, HMSET and TOUCH need cluster feature level 12, as older
+  releases do not have them; TIME is not taken there.
+
 - EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a hash, list, set,
   sorted set or stream, and EXPIRE with NX, XX, GT or LT on any key, ran as
   one-command transactions, whose journal cost 20-40 ms on macOS even for a

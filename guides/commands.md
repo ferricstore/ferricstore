@@ -23,7 +23,7 @@ mode and the embedded API:
 
 GET, SET (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
 APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
-HSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
+HSET, HMSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
 HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HGETDEL, HGETEX, HSETEX,
 LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
 SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
@@ -39,7 +39,7 @@ EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIM
 SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP,
 PFADD, PFCOUNT, PFMERGE,
 GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH, GEOSEARCHSTORE,
-PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
+PING, ECHO, TIME, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
 OBJECT HELP/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
 SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND DOCS/COMMAND GETKEYS,
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
@@ -538,6 +538,18 @@ Sets one or more field-value pairs. Returns the number of NEW fields added (not 
 | **Embedded API** | `FerricStore.hset(key, map)` |
 | **Return** | Integer -- count of new fields added |
 | **Elixir return** | `:ok` |
+| **Status** | Supported |
+
+### HMSET
+
+Sets one or more field-value pairs, as HSET does, and answers `OK`. Redis
+deprecates it in favor of HSET; FerricStore serves it for older clients.
+Inside MULTI it needs cluster feature level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `HMSET key field value [field value ...]` |
+| **Return** | Simple string `OK` |
 | **Status** | Supported |
 
 ### HGET
@@ -1086,6 +1098,18 @@ Returns the type of a key as a simple string.
 | **Return** | Simple string: `string`, `hash`, `list`, `set`, `zset`, `stream`, or `none` |
 | **Status** | Supported |
 
+### TOUCH
+
+Counts the given keys that exist, as EXISTS does (a key given twice counts
+twice). A key's access time is tracked per node as it is read. Inside MULTI it
+needs cluster feature level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `TOUCH key [key ...]` |
+| **Return** | Integer |
+| **Status** | Supported |
+
 ### RENAME / RENAMENX / COPY
 
 | Command | Syntax | Return | Notes |
@@ -1410,6 +1434,17 @@ Repair notes:
 ---
 
 ## Server Commands
+
+### TIME
+
+The answering node's clock: Unix seconds and the microseconds into that
+second, as two bulk strings. Not taken inside MULTI.
+
+| | |
+|---|---|
+| **Protocol command** | `TIME` |
+| **Return** | Array of two bulk strings |
+| **Status** | Supported |
 
 ### PING / ECHO
 

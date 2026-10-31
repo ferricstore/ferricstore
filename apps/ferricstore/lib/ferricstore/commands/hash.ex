@@ -193,6 +193,22 @@ defmodule Ferricstore.Commands.Hash do
   end
 
   # ---------------------------------------------------------------------------
+  # HMSET key field value [field value ...] -- HSET answering OK (deprecated in
+  # Redis, still served)
+  # ---------------------------------------------------------------------------
+
+  def handle("HMSET", [_key | [_ | _] = pairs] = args, store)
+      when rem(length(pairs), 2) == 0 do
+    case handle("HSET", args, store) do
+      count when is_integer(count) -> :ok
+      other -> other
+    end
+  end
+
+  def handle("HMSET", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'hmset' command"}
+
+  # ---------------------------------------------------------------------------
   # HSETNX key field value
   # ---------------------------------------------------------------------------
 
