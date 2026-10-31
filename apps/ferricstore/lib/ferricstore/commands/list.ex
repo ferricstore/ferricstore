@@ -553,6 +553,7 @@ defmodule Ferricstore.Commands.List do
                  TypeRegistry.command_check_or_set_status(destination, :list, store) do
             case ListOps.execute_lmove(source, destination, store, from_dir, to_dir) do
               result when is_binary(result) ->
+                Ops.on_push(store, destination)
                 with :ok <- maybe_cleanup_empty_list(source, store), do: result
 
               {:error, _} = error ->
