@@ -15,7 +15,7 @@ defmodule Ferricstore.Commands.Set do
   holds a different type returns WRONGTYPE.
   """
 
-  alias Ferricstore.Commands.CollectionScan
+  alias Ferricstore.Commands.{CollectionScan, RandomPick}
   alias Ferricstore.Commands.Set.{Destination, Intersection, Random, Scan}
   alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Store.Ops
@@ -229,9 +229,7 @@ defmodule Ferricstore.Commands.Set do
           []
 
         {count, ""} ->
-          with {:ok, members} <- get_members_list(key, store) do
-            Random.select_random_members(members, count)
-          end
+          srandmember_count(key, count, store)
 
         _ ->
           {:error, "ERR value is not an integer or out of range"}
@@ -406,9 +404,7 @@ defmodule Ferricstore.Commands.Set do
       if count == 0 do
         []
       else
-        with {:ok, members} <- get_members_list(key, store) do
-          Random.select_random_members(members, count)
-        end
+        srandmember_count(key, count, store)
       end
     end
   end
@@ -748,12 +744,31 @@ defmodule Ferricstore.Commands.Set do
   end
 
   defp srandmember_one(key, store) do
-    with :ok <- TypeRegistry.command_check_type(key, :set, store),
-         {:ok, members} <- get_members_list(key, store) do
-      case members do
-        [] -> nil
-        members -> Enum.random(members)
+    with :ok <- TypeRegistry.command_check_type(key, :set, store) do
+      case RandomPick.pairs(store, key, CompoundKey.set_prefix(key), nil) do
+        {:ok, []} ->
+          nil
+
+        {:ok, [{member, _value}]} ->
+          member
+
+        :scan ->
+          with {:ok, members} <- get_members_list(key, store) do
+            if members == [], do: nil, else: Enum.random(members)
+          end
       end
+    end
+  end
+
+  defp srandmember_count(key, count, store) do
+    case RandomPick.pairs(store, key, CompoundKey.set_prefix(key), count) do
+      {:ok, pairs} ->
+        Enum.map(pairs, fn {member, _value} -> member end)
+
+      :scan ->
+        with {:ok, members} <- get_members_list(key, store) do
+          Random.select_random_members(members, count)
+        end
     end
   end
 
