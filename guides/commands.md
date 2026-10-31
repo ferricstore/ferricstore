@@ -1070,7 +1070,7 @@ Returns stream metadata as a map.
 | `XGROUP SETID` | `XGROUP SETID key group id\|$ [ENTRIESREAD n]` | `ENTRIESREAD` is accepted and not tracked |
 | `XSETID` | `XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]` | Never below the stream's last entry; the options are accepted and not tracked |
 
-A group's last-delivered ID, consumers and pending entries are stored with the stream and replicated with it; a node keeps a cache of them. XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other than CREATE are replicated stream operations older releases do not have, so they run from feature level 11 (below it they answer `ERR ... needs cluster feature level 11`) and are not taken inside MULTI. XAUTOCLAIM's COUNT is bounded by one entry's member bound (`:compound_member_apply_budget`, 4,096 by default) over 10. Replies give entries in FerricStore's flat form, `[id, field, value, ...]`, as XRANGE does.
+A group's last-delivered ID, consumers and pending entries are stored with the stream and replicated with it; a node keeps a cache of them. XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other than CREATE are replicated stream operations older releases do not have, so they run from feature level 11 (below it they answer `ERR ... needs cluster feature level 11`). Like every stream command, XPENDING, XCLAIM, XAUTOCLAIM and XSETID are refused inside MULTI. XAUTOCLAIM's COUNT is bounded by one entry's member bound (`:compound_member_apply_budget`, 4,096 by default) over 10. Replies give entries in FerricStore's flat form, `[id, field, value, ...]`, as XRANGE does.
 
 ---
 
