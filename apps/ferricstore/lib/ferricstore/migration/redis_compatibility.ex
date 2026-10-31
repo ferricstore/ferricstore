@@ -342,7 +342,10 @@ defmodule Ferricstore.Migration.RedisCompatibility do
       ) ->
         ["readonly"]
 
-      command in ~w(subscribe unsubscribe psubscribe punsubscribe publish pubsub) ->
+      command in ~w(
+        subscribe unsubscribe psubscribe punsubscribe ssubscribe sunsubscribe publish spublish
+        pubsub
+      ) ->
         ["pubsub"]
 
       command in ~w(ping echo hello quit reset auth command info dbsize keys) ->

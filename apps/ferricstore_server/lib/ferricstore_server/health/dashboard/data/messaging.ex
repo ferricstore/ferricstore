@@ -47,6 +47,9 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
     channels = Access.filter_pubsub_channels_for_acl(snapshot.channels, acl_username)
     patterns = Access.filter_pubsub_channels_for_acl(snapshot.patterns, acl_username)
 
+    shard_channels =
+      Access.filter_pubsub_channels_for_acl(Map.get(snapshot, :shard_channels, []), acl_username)
+
     activity =
       128
       |> PubSubActivityLog.get()
@@ -59,11 +62,13 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
             snapshot
             | channels: channels,
               patterns: patterns
-          },
+          }
+          |> Map.put(:shard_channels, shard_channels),
           acl_username
         ),
       channels: channels,
       patterns: patterns,
+      shard_channels: shard_channels,
       activity: activity,
       filters: %{acl_username: dashboard_param(opts, "acl_username")}
     }
@@ -95,6 +100,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
       patterns: length(Map.get(snapshot, :patterns, [])),
       exact_subscriptions: Map.get(snapshot, :exact_subscriptions, 0),
       pattern_subscriptions: Map.get(snapshot, :pattern_subscriptions, 0),
+      shard_subscriptions: Map.get(snapshot, :shard_subscriptions, 0),
       active_subscribers: Map.get(snapshot, :active_subscribers, 0)
     }
   end
@@ -108,6 +114,7 @@ defmodule FerricstoreServer.Health.Dashboard.Data.Messaging do
       patterns: length(patterns),
       exact_subscriptions: visible_subscription_count(channels),
       pattern_subscriptions: visible_subscription_count(patterns),
+      shard_subscriptions: visible_subscription_count(Map.get(snapshot, :shard_channels, [])),
       active_subscribers: nil
     }
   end

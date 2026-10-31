@@ -355,6 +355,20 @@ defmodule FerricstoreServer.Native.Connection.Responses do
     {:ok, pubsub_event_value(payload, at_ms)}
   end
 
+  defp pubsub_value_iodata({:smessage, channel, message}, at_ms)
+       when is_binary(channel) and is_binary(message) do
+    payload = [
+      <<6, 3::unsigned-32, 7::unsigned-32, "channel">>,
+      encoded_binary(channel),
+      <<4::unsigned-32, "kind">>,
+      encoded_binary("smessage"),
+      <<7::unsigned-32, "message">>,
+      encoded_binary(message)
+    ]
+
+    {:ok, pubsub_event_value(payload, at_ms)}
+  end
+
   defp pubsub_value_iodata(_event, _at_ms), do: :error
 
   defp pubsub_event_value(payload, at_ms) do
@@ -384,6 +398,10 @@ defmodule FerricstoreServer.Native.Connection.Responses do
 
   defp pubsub_payload({:message, channel, message}) do
     %{"kind" => "message", "channel" => channel, "message" => message}
+  end
+
+  defp pubsub_payload({:smessage, channel, message}) do
+    %{"kind" => "smessage", "channel" => channel, "message" => message}
   end
 
   defp pubsub_payload({:pmessage, pattern, channel, message}) do

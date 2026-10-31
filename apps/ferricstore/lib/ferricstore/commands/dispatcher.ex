@@ -798,6 +798,7 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   def dispatch_ast({:publish, args}, _store), do: PubSub.handle_ast({:publish, args})
   def dispatch_ast({:pubsub, args}, _store), do: PubSub.handle_ast({:pubsub, args})
+  def dispatch_ast({:spublish, args}, _store), do: PubSub.handle_ast({:spublish, args})
 
   def dispatch_ast({:extension_command, module, cmd, args, access}, store)
       when is_atom(module) and is_binary(cmd) and is_list(args) and
@@ -957,7 +958,7 @@ defmodule Ferricstore.Commands.Dispatcher do
       cmd in @prob_raw_commands -> dispatch_prob_raw(cmd, args, store)
       cmd == "FERRICSTORE.CONFIG" -> Namespace.handle(cmd, args, store)
       cmd == "MEMORY" -> dispatch_memory_raw(args, store)
-      cmd == "PUBLISH" or cmd == "PUBSUB" -> PubSub.handle(cmd, args)
+      cmd in ~w(PUBLISH SPUBLISH PUBSUB) -> PubSub.handle(cmd, args)
       true -> dispatch_extension_raw(cmd, args, store)
     end
   end

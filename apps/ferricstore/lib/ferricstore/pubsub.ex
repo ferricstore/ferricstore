@@ -13,6 +13,9 @@ defmodule Ferricstore.PubSub do
     * `:ferricstore_pubsub` — `{channel, pid}` entries for exact channel
       subscriptions. Uses a `:bag` so multiple pids can subscribe to the same
       channel while duplicate subscriptions from the same pid remain collapsed.
+      Shard channel subscriptions (SSUBSCRIBE) share this table and the three
+      after it under a `{:shard, channel}` key, so they are their own
+      namespace: PUBLISH, pattern matching and `channels/1` never see them.
 
     * `:ferricstore_pubsub_channel_cache` —
       `{channel, [delivery], subscriber_count}` entries
@@ -65,6 +68,7 @@ defmodule Ferricstore.PubSub do
 
     * `{:pubsub_message, channel, message}` — for exact channel subscriptions
     * `{:pubsub_pmessage, pattern, channel, message}` — for pattern subscriptions
+    * `{:pubsub_smessage, channel, message}` — for shard channel subscriptions
     * `{:pubsub_messages, channel, messages, lease}` — an internal guarded exact
       batch consumed by protocol connection processes
     * `{:pubsub_messages, channel, messages, prepared, lease}` — the same guarded
@@ -289,6 +293,52 @@ defmodule Ferricstore.PubSub do
   end
 
   @doc """
+  Subscribes `pid` to the given shard channels (SSUBSCRIBE).
+
+  Shard channels are a namespace of their own, as in Redis: only `spublish/2`
+  reaches them, and glob patterns never match them. The subscriber receives
+  `{:pubsub_smessage, channel, message}`.
+  """
+  @spec ssubscribe_many([channel()], pid()) :: :ok
+  def ssubscribe_many([], pid) when is_pid(pid), do: :ok
+
+  def ssubscribe_many(channels, pid) when is_list(channels) and is_pid(pid) do
+    channels = unique_channels(channels)
+    ssubscribe_unique_many(channels, pid)
+  end
+
+  @doc false
+  @spec ssubscribe_unique_many([channel()], pid()) :: :ok
+  def ssubscribe_unique_many([], pid) when is_pid(pid), do: :ok
+
+  def ssubscribe_unique_many(channels, pid) when is_list(channels) and is_pid(pid) do
+    exact_subscription_changed(shard_keys(channels), pid)
+    ActivityLog.record_subscription("SSUBSCRIBE", :channel, channels)
+    :ok
+  end
+
+  @doc """
+  Unsubscribes `pid` from the given shard channels (SUNSUBSCRIBE).
+  """
+  @spec sunsubscribe_many([channel()], pid()) :: :ok
+  def sunsubscribe_many([], pid) when is_pid(pid), do: :ok
+
+  def sunsubscribe_many(channels, pid) when is_list(channels) and is_pid(pid) do
+    channels = unique_channels(channels)
+    sunsubscribe_unique_many(channels, pid)
+  end
+
+  @doc false
+  @spec sunsubscribe_unique_many([channel()], pid()) :: :ok
+  def sunsubscribe_unique_many([], pid) when is_pid(pid), do: :ok
+
+  def sunsubscribe_unique_many(channels, pid) when is_list(channels) and is_pid(pid) do
+    exact_unsubscription_changed(shard_keys(channels), pid)
+    ActivityLog.record_subscription("SUNSUBSCRIBE", :channel, channels)
+    :ok
+  end
+
+  @doc """
   Publishes `message` to all subscribers of `channel`.
 
   Looks up exact channel subscribers and pattern subscribers whose glob pattern
@@ -339,6 +389,39 @@ defmodule Ferricstore.PubSub do
     total = channel_count + pattern_count
     ActivityLog.record_publish(channel, byte_size(message), total)
     total
+  end
+
+  @doc """
+  Publishes `message` to the subscribers of shard channel `channel` (SPUBLISH).
+
+  Every member of the cluster delivers it to its own shard subscribers, as
+  PUBLISH does, and the count is this node's, as for PUBLISH.
+  """
+  @spec spublish(channel(), binary()) :: non_neg_integer()
+  def spublish(channel, message) when is_binary(channel) and is_binary(message) do
+    count = spublish_local(channel, message)
+    Ferricstore.Cluster.Relay.forward_shard_publishes([{channel, message}])
+    count
+  end
+
+  @doc false
+  # Delivers to this node's shard subscribers only (`spublish/2` also relays).
+  @spec spublish_local(channel(), binary()) :: non_neg_integer()
+  def spublish_local(channel, message) when is_binary(channel) and is_binary(message) do
+    key = {:shard, channel}
+
+    count =
+      case :ets.lookup(@channel_cache_table, key) do
+        [{^key, deliveries, _subscriber_count}] ->
+          bytes = byte_size(channel) + byte_size(message) + @delivery_overhead_bytes
+          publish_shard_deliveries(deliveries, channel, message, bytes, 0)
+
+        [] ->
+          0
+      end
+
+    ActivityLog.record_shard_publish(channel, byte_size(message), count)
+    count
   end
 
   @doc """
@@ -394,14 +477,17 @@ defmodule Ferricstore.PubSub do
     limit = max(limit, 0)
     channels = channel_snapshot(limit, visible?)
     patterns = pattern_snapshot(limit, visible?)
-    exact_subscriptions = safe_ets_size(@channels_table)
+    {shard_channels, shard_subscriptions} = shard_channel_snapshot(limit, visible?)
+    exact_subscriptions = max(safe_ets_size(@channels_table) - shard_subscriptions, 0)
     pattern_subscriptions = safe_ets_size(@patterns_table)
 
     %{
       channels: channels,
       patterns: patterns,
+      shard_channels: shard_channels,
       exact_subscriptions: exact_subscriptions,
       pattern_subscriptions: pattern_subscriptions,
+      shard_subscriptions: shard_subscriptions,
       active_subscribers: active_subscriber_count()
     }
   end
@@ -428,11 +514,11 @@ defmodule Ferricstore.PubSub do
 
   defp collect_channels(:"$end_of_table", _pattern, acc), do: Enum.reverse(acc)
 
-  defp collect_channels(channel, nil, acc) do
+  defp collect_channels(channel, nil, acc) when is_binary(channel) do
     collect_channels(:ets.next(@channels_table, channel), nil, [channel | acc])
   end
 
-  defp collect_channels(channel, matcher, acc) do
+  defp collect_channels(channel, matcher, acc) when is_binary(channel) do
     next = :ets.next(@channels_table, channel)
 
     if pattern_matches?(channel, matcher) do
@@ -440,6 +526,50 @@ defmodule Ferricstore.PubSub do
     else
       collect_channels(next, matcher, acc)
     end
+  end
+
+  # A shard channel's `{:shard, channel}` key.
+  defp collect_channels(key, matcher, acc),
+    do: collect_channels(:ets.next(@channels_table, key), matcher, acc)
+
+  @doc """
+  Lists the shard channels with at least one subscriber (PUBSUB
+  SHARDCHANNELS), optionally only those matching the glob `pattern`.
+  """
+  @spec shard_channels(pattern() | nil) :: [channel()]
+  def shard_channels(pattern \\ nil) do
+    matcher = if is_binary(pattern), do: pattern_matcher(pattern), else: nil
+    collect_shard_channels(:ets.first(@channels_table), matcher, [])
+  end
+
+  defp collect_shard_channels(:"$end_of_table", _matcher, acc), do: Enum.reverse(acc)
+
+  defp collect_shard_channels(key, matcher, acc) do
+    next = :ets.next(@channels_table, key)
+
+    case key do
+      {:shard, channel} when matcher == nil ->
+        collect_shard_channels(next, matcher, [channel | acc])
+
+      {:shard, channel} ->
+        if pattern_matches?(channel, matcher),
+          do: collect_shard_channels(next, matcher, [channel | acc]),
+          else: collect_shard_channels(next, matcher, acc)
+
+      _channel ->
+        collect_shard_channels(next, matcher, acc)
+    end
+  end
+
+  @doc """
+  Returns `[channel, count, ...]` subscriber counts for the given shard
+  channels (PUBSUB SHARDNUMSUB).
+  """
+  @spec shard_numsub([channel()]) :: [channel() | non_neg_integer()]
+  def shard_numsub(channel_list) when is_list(channel_list) do
+    Enum.flat_map(channel_list, fn channel ->
+      [channel, :ets.lookup_element(@channel_cache_table, {:shard, channel}, 3, 0)]
+    end)
   end
 
   @doc """
@@ -724,9 +854,12 @@ defmodule Ferricstore.PubSub do
 
   defp subscription_entries([], _pid, acc), do: Enum.reverse(acc)
 
-  defp subscription_entries([channel | rest], pid, acc) when is_binary(channel) do
+  defp subscription_entries([channel | rest], pid, acc)
+       when is_binary(channel) or (is_tuple(channel) and elem(channel, 0) == :shard) do
     subscription_entries(rest, pid, [{channel, pid} | acc])
   end
+
+  defp shard_keys(channels), do: Enum.map(channels, &{:shard, &1})
 
   defp pattern_subscription_entries([], _pid, acc), do: Enum.reverse(acc)
 
@@ -780,8 +913,41 @@ defmodule Ferricstore.PubSub do
     :exit, _ -> []
   end
 
-  defp channel_snapshot_entry({channel, _deliveries, subscriber_count}) do
-    {channel, subscriber_count}
+  defp channel_snapshot_entry({channel, _deliveries, subscriber_count})
+       when is_binary(channel),
+       do: {channel, subscriber_count}
+
+  defp channel_snapshot_entry(_shard_channel_row), do: :skip
+
+  # The shard channel rows of the channel cache, and their subscription total.
+  defp shard_channel_snapshot(limit, visible?) do
+    if :ets.whereis(@channel_cache_table) == :undefined do
+      {[], 0}
+    else
+      {entries, total} =
+        Ferricstore.ObservabilitySnapshot.fold(
+          fn
+            {{:shard, channel}, _deliveries, subscribers}, {entries, total} ->
+              entries =
+                if limit > 0 and visible?.(%{channel: channel, subscribers: subscribers}),
+                  do: insert_snapshot_entry(channel, subscribers, entries, limit),
+                  else: entries
+
+              {entries, total + subscribers}
+
+            _channel_row, acc ->
+              acc
+          end,
+          {:gb_sets.empty(), 0},
+          @channel_cache_table
+        )
+
+      {snapshot_entries(entries, :channel), total}
+    end
+  rescue
+    _ -> {[], 0}
+  catch
+    :exit, _ -> {[], 0}
   end
 
   defp pattern_snapshot(limit, visible?) do
@@ -806,20 +972,29 @@ defmodule Ferricstore.PubSub do
     else
       Ferricstore.ObservabilitySnapshot.fold(
         fn row, entries ->
-          {name, subscribers} = mapper.(row)
+          case mapper.(row) do
+            {name, subscribers} ->
+              if visible?.(%{name_key => name, subscribers: subscribers}),
+                do: insert_snapshot_entry(name, subscribers, entries, limit),
+                else: entries
 
-          if visible?.(%{name_key => name, subscribers: subscribers}),
-            do: insert_snapshot_entry(name, subscribers, entries, limit),
-            else: entries
+            :skip ->
+              entries
+          end
         end,
         :gb_sets.empty(),
         table
       )
-      |> :gb_sets.to_list()
-      |> Enum.map(fn {_rank, name, subscribers} ->
-        %{name_key => name, subscribers: subscribers}
-      end)
+      |> snapshot_entries(name_key)
     end
+  end
+
+  defp snapshot_entries(entries, name_key) do
+    entries
+    |> :gb_sets.to_list()
+    |> Enum.map(fn {_rank, name, subscribers} ->
+      %{name_key => name, subscribers: subscribers}
+    end)
   end
 
   defp insert_snapshot_entry(name, subscribers, entries, limit) do
@@ -1982,6 +2157,41 @@ defmodule Ferricstore.PubSub do
 
   defp deliver_exact({pid, guard, :prepared_batches}, channel, message, bytes),
     do: deliver_exact({pid, guard}, channel, message, bytes)
+
+  defp publish_shard_deliveries([delivery | rest], channel, message, bytes, count) do
+    next_count =
+      case deliver_shard(delivery, channel, message, bytes) do
+        :sent -> count + 1
+        :rejected -> count
+      end
+
+    publish_shard_deliveries(rest, channel, message, bytes, next_count)
+  end
+
+  defp publish_shard_deliveries([], _channel, _message, _bytes, count), do: count
+
+  defp deliver_shard(pid, channel, message, _bytes) when is_pid(pid) do
+    send(pid, {:pubsub_smessage, channel, message})
+    :sent
+  end
+
+  defp deliver_shard({pid, guard}, channel, message, bytes) do
+    case reserve_guarded_delivery(guard, bytes) do
+      {:ok, nil} ->
+        send(pid, {:pubsub_smessage, channel, message})
+        :sent
+
+      {:ok, lease} ->
+        send(pid, {:pubsub_smessage, channel, message, lease})
+        :sent
+
+      :rejected ->
+        reject_slow_subscriber(pid)
+    end
+  end
+
+  defp deliver_shard({pid, guard, :prepared_batches}, channel, message, bytes),
+    do: deliver_shard({pid, guard}, channel, message, bytes)
 
   defp publish_pattern_deliveries(
          [delivery | rest],

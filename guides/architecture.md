@@ -810,7 +810,7 @@ malicious or malformed input:
 | Value size | `max_value_size` | Native body validation and embedded API |
 | INCR/DECRBY values | i64 range (-2^63 to 2^63-1) | Command handler |
 | SETRANGE offset | 512 MB | Command handler |
-| SUBSCRIBE/PSUBSCRIBE per connection | 100,000 | Native session state |
+| SUBSCRIBE/PSUBSCRIBE/SSUBSCRIBE per connection | 100,000 in all | Native session state |
 | SETBIT offset | 2^32 - 1 | Command handler |
 | Glob patterns (KEYS, SCAN) | 1,024 bytes | Command handler |
 

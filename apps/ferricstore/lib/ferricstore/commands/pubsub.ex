@@ -1,11 +1,13 @@
 defmodule Ferricstore.Commands.PubSub do
   @moduledoc """
   Handles Redis pub/sub commands that go through the normal dispatcher:
-  PUBLISH, and PUBSUB (with subcommands CHANNELS, NUMSUB, NUMPAT).
+  PUBLISH, SPUBLISH, and PUBSUB (with subcommands CHANNELS, NUMSUB, NUMPAT,
+  SHARDCHANNELS, SHARDNUMSUB).
 
-  The SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, and PUNSUBSCRIBE commands are
-  handled directly in `Ferricstore.Server.Connection` because they require
-  per-connection state management (pub/sub mode tracking, subscription counts).
+  The SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, SSUBSCRIBE and
+  SUNSUBSCRIBE commands are handled by the native protocol session
+  (`FerricstoreServer.Native.Session`) because they need per-connection
+  state.
   """
 
   alias Ferricstore.PubSub
@@ -32,6 +34,16 @@ defmodule Ferricstore.Commands.PubSub do
 
   Returns the total number of active pattern subscriptions (from PSUBSCRIBE).
 
+  ## SPUBLISH shardchannel message
+
+  Publishes `message` to the subscribers of a shard channel (SSUBSCRIBE).
+  Shard channels are their own namespace, as in Redis: PUBLISH and pattern
+  subscriptions never meet them.
+
+  ## PUBSUB SHARDCHANNELS [pattern] / PUBSUB SHARDNUMSUB [shardchannel ...]
+
+  CHANNELS and NUMSUB for shard channels.
+
   ## Parameters
 
     - `cmd`  - Uppercased command name (`"PUBLISH"` or `"PUBSUB"`)
@@ -51,6 +63,12 @@ defmodule Ferricstore.Commands.PubSub do
     {:error, "ERR wrong number of arguments for 'publish' command"}
   end
 
+  def handle("SPUBLISH", [channel, message]), do: PubSub.spublish(channel, message)
+
+  def handle("SPUBLISH", _args) do
+    {:error, "ERR wrong number of arguments for 'spublish' command"}
+  end
+
   # PUBSUB subcommand dispatch
   def handle("PUBSUB", args) when is_list(args), do: handle_pubsub(args)
 
@@ -59,6 +77,11 @@ defmodule Ferricstore.Commands.PubSub do
 
   def handle_ast({:publish, _args}),
     do: {:error, "ERR wrong number of arguments for 'publish' command"}
+
+  def handle_ast({:spublish, [channel, message]}), do: PubSub.spublish(channel, message)
+
+  def handle_ast({:spublish, _args}),
+    do: {:error, "ERR wrong number of arguments for 'spublish' command"}
 
   def handle_ast({:pubsub, args}) when is_list(args), do: handle_pubsub(args)
 
@@ -71,6 +94,8 @@ defmodule Ferricstore.Commands.PubSub do
       "CHANNELS" -> handle_channels(args)
       "NUMSUB" -> handle_numsub(args)
       "NUMPAT" -> handle_numpat(args)
+      "SHARDCHANNELS" -> handle_shard_channels(args)
+      "SHARDNUMSUB" -> PubSub.shard_numsub(args)
       other -> {:error, "ERR unknown subcommand '#{String.downcase(other)}'. Try PUBSUB HELP."}
     end
   end
@@ -89,6 +114,13 @@ defmodule Ferricstore.Commands.PubSub do
   end
 
   defp handle_numsub(channels), do: PubSub.numsub(channels)
+
+  defp handle_shard_channels([]), do: PubSub.shard_channels()
+  defp handle_shard_channels([pattern]), do: PubSub.shard_channels(pattern)
+
+  defp handle_shard_channels(_args) do
+    {:error, "ERR wrong number of arguments for 'pubsub|shardchannels' command"}
+  end
 
   defp handle_numpat([]), do: PubSub.numpat()
 

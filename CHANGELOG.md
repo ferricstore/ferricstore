@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New commands: SSUBSCRIBE, SUNSUBSCRIBE, SPUBLISH, PUBSUB SHARDCHANNELS and
+  PUBSUB SHARDNUMSUB. Shard channels are their own namespace, as in Redis 7:
+  PUBLISH, PSUBSCRIBE patterns, PUBSUB CHANNELS and NUMSUB never meet them,
+  and SSUBSCRIBE acknowledgements count shard channels only. A shard message
+  is pushed as a `PUBSUB_MESSAGE` event of kind `smessage`. Every node
+  delivers it, as for PUBLISH, since FerricStore clients may subscribe on any
+  node; a member on an older release drops relayed shard messages, and has
+  no shard subscribers to give them to.
+
 - A Bloom, Cuckoo, Count-Min or Top-K key whose file one node lost (a disk
   fault, a file removed by hand) stopped that node's apply for the whole
   shard at the key's next write, and the node then refused to start the

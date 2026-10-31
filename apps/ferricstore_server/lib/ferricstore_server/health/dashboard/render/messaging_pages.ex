@@ -184,8 +184,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
     channels = Map.get(summary, :channels, 0)
     patterns = Map.get(summary, :patterns, 0)
 
-    subscriptions =
-      Map.get(summary, :exact_subscriptions, 0) + Map.get(summary, :pattern_subscriptions, 0)
+    subscriptions = subscription_total(summary)
 
     status =
       if subscriptions == 0 do
@@ -216,11 +215,7 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
           %{label: "Patterns", value: format_number(Map.get(summary, :patterns, 0))},
           %{
             label: "Subscriptions",
-            value:
-              format_number(
-                Map.get(summary, :exact_subscriptions, 0) +
-                  Map.get(summary, :pattern_subscriptions, 0)
-              )
+            value: format_number(subscription_total(summary))
           },
           %{
             label: "Subscribers",
@@ -229,6 +224,11 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
         ],
         heading: :hidden
       ) <> snapshot_scope_note(:pubsub)
+  end
+
+  defp subscription_total(summary) do
+    Map.get(summary, :exact_subscriptions, 0) + Map.get(summary, :pattern_subscriptions, 0) +
+      Map.get(summary, :shard_subscriptions, 0)
   end
 
   defp format_optional_number(nil), do: "-"
@@ -261,6 +261,30 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
       <tbody>#{body}</tbody>
     </table>
     """, "No visible exact channel subscriptions in this bounded snapshot.")}
+    """
+  end
+
+  def render_pubsub_shard_channels(data) do
+    rows = Map.get(data, :shard_channels, [])
+
+    body =
+      Enum.map_join(rows, "\n", fn row ->
+        """
+        <tr>
+          <td class="mono">#{escape(row.channel)}</td>
+          <td>#{format_number(row.subscribers)}</td>
+        </tr>
+        """
+      end)
+
+    """
+    <h2 class="section-title">Shard channels <span class="badge badge-idle">SSUBSCRIBE</span></h2>
+    #{filtered_table(rows, "pubsub-shard-channels-table", "Filter loaded shard channels", "Pub/Sub shard channels", """
+    <table id="pubsub-shard-channels-table">
+      <thead><tr><th>Shard channel</th><th>Subscribers</th></tr></thead>
+      <tbody>#{body}</tbody>
+    </table>
+    """, "No visible shard channel subscriptions in this bounded snapshot.")}
     """
   end
 
@@ -385,16 +409,17 @@ defmodule FerricstoreServer.Health.Dashboard.Render.MessagingPages do
   defp pubsub_target_badge(:pattern), do: ~s(<span class="badge badge-merging">pattern</span>)
   defp pubsub_target_badge(_type), do: ~s(<span class="badge badge-idle">channel</span>)
 
-  defp pubsub_activity_shape(%{command: "PUBLISH", message_bytes: bytes}) when is_integer(bytes),
-    do: "#{format_bytes(bytes)} message"
+  defp pubsub_activity_shape(%{command: command, message_bytes: bytes})
+       when command in ["PUBLISH", "SPUBLISH"] and is_integer(bytes),
+       do: "#{format_bytes(bytes)} message"
 
   defp pubsub_activity_shape(%{targets: targets}) when is_integer(targets),
     do: "#{format_number(targets)} target(s)"
 
   defp pubsub_activity_shape(_entry), do: "-"
 
-  defp pubsub_publish_delivery(%{command: "PUBLISH", subscribers: subscribers})
-       when is_integer(subscribers),
+  defp pubsub_publish_delivery(%{command: command, subscribers: subscribers})
+       when command in ["PUBLISH", "SPUBLISH"] and is_integer(subscribers),
        do: "#{format_number(subscribers)} receiver(s)"
 
   defp pubsub_publish_delivery(_entry), do: "-"

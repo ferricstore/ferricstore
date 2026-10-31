@@ -100,7 +100,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   @list_arg_tags ~w(
     del exists mget mset msetnx lpush rpush lpushx rpushx lpos hset hdel hmget
     sadd srem smismember sinter sunion sdiff sdiffstore sinterstore sunionstore
-    zrem zmscore pfadd pfcount pfmerge publish pubsub
+    zrem zmscore pfadd pfcount pfmerge publish spublish pubsub
   )a
 
   @flow_option_specs %{
@@ -424,6 +424,12 @@ defmodule Ferricstore.Commands.NativeAstParser do
 
   defp make_ast("PSUBSCRIBE", :psubscribe, patterns), do: {:psubscribe, patterns}
   defp make_ast("PUNSUBSCRIBE", :punsubscribe, patterns), do: {:punsubscribe, patterns}
+
+  defp make_ast("SSUBSCRIBE", :ssubscribe, []),
+    do: {:ssubscribe, {:error, "ERR wrong number of arguments for 'ssubscribe' command"}}
+
+  defp make_ast("SSUBSCRIBE", :ssubscribe, channels), do: {:ssubscribe, channels}
+  defp make_ast("SUNSUBSCRIBE", :sunsubscribe, channels), do: {:sunsubscribe, channels}
 
   defp make_ast("BLPOP", :blpop, args), do: parse_blocking_pop(:blpop, args)
   defp make_ast("BRPOP", :brpop, args), do: parse_blocking_pop(:brpop, args)
@@ -1307,13 +1313,14 @@ defmodule Ferricstore.Commands.NativeAstParser do
   defp extra_command_keys("BITOP", [_operation, destination | sources]),
     do: [destination | sources]
 
-  defp extra_command_keys("PUBLISH", [channel | _]), do: [channel]
+  defp extra_command_keys(cmd, [channel | _]) when cmd in ~w(PUBLISH SPUBLISH), do: [channel]
 
   defp extra_command_keys(cmd, channels)
-       when cmd in ~w(SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE), do: channels
+       when cmd in ~w(SUBSCRIBE UNSUBSCRIBE PSUBSCRIBE PUNSUBSCRIBE SSUBSCRIBE SUNSUBSCRIBE),
+       do: channels
 
   defp extra_command_keys("PUBSUB", [subcmd | channels]) when is_binary(subcmd) do
-    if String.upcase(subcmd) == "NUMSUB", do: channels, else: []
+    if String.upcase(subcmd) in ["NUMSUB", "SHARDNUMSUB"], do: channels, else: []
   end
 
   defp extra_command_keys("FLOW.ATTRIBUTES", args), do: flow_partition_keys_or_global(args, 1)
