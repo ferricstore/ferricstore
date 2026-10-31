@@ -551,13 +551,16 @@ it they walk the set from its start); at level 10 MULTI takes ZUNION, ZINTER,
 ZDIFF, their STORE forms, ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX,
 ZLEXCOUNT, the ZREMRANGEBY* commands and ZMPOP; at level 11 DEL, UNLINK, SET,
 RENAME, COPY, EXPIRE, PERSIST and the STORE forms work on collections past the
-per-command member bound (below it they are refused there). After the first
+per-command member bound (below it they are refused there); at level 12
+EXPIRE on a collection, PERSIST and EXPIRE with a flag change the TTL in one
+compound entry (below it they run as one-command transactions, 20-40 ms
+each on macOS). After the first
 start of a new cluster, once every node is up, raise it to the level the
 release supports:
 
 ```bash
 bin/ferricstore rpc 'IO.inspect(FerricStore.cluster_feature_level())'
-# {:ok, %{supported: 11, active: 0, shards: [0, 0, 0, 0]}}
+# {:ok, %{supported: 12, active: 0, shards: [0, 0, 0, 0]}}
 
 bin/ferricstore rpc 'IO.inspect(FerricStore.raise_cluster_feature_level(11))'
 ```
@@ -708,6 +711,12 @@ shard_0: 2
     XSETID and XGROUP DESTROY, CREATECONSUMER, DELCONSUMER and SETID are
     replicated stream operations older releases do not have: they run from
     level 11 and answer `ERR ... needs cluster feature level 11` below it.
+  - 12: EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a collection,
+    and each of them with NX, XX, GT or LT on any key, run as one compound
+    command entry instead of a one-command transaction, whose journal costs
+    two synced appends: on macOS EXPIRE on a hash fell from 20 to 0.3 ms.
+    The entry keeps level 11's bounds, 100,000 members and 64 MiB, checked
+    before a member's value is read. Older releases refuse the entry.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

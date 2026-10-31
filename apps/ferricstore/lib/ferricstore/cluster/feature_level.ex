@@ -113,7 +113,11 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #     members. XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other
   #     than CREATE are stream operations (`Stream.GroupWrites`) older
   #     releases do not apply.
-  @supported 11
+  # 12: `:compound_command` runs PEXPIREAT (with or without EXPIRE's flags)
+  #     and PERSIST, with the bulk bounds, so EXPIRE on a collection and
+  #     EXPIRE with a flag change the TTL without a one-command transaction
+  #     (`Ferricstore.Commands.Expiry`). Older releases refuse the entry.
+  @supported 12
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000

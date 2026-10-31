@@ -911,7 +911,7 @@ defmodule Ferricstore.Store.Router.Part09 do
       """
       @spec compound_command(FerricStore.Instance.t(), binary(), tuple(), 4 | 5 | 6) :: term()
       def compound_command(ctx, key, ast, level \\ 4)
-          when is_binary(key) and is_tuple(ast) and level in [4, 5, 6] do
+          when is_binary(key) and is_tuple(ast) and level in [4, 5, 6, 12] do
         idx = shard_for(ctx, key)
 
         if durable_raft_ctx?(ctx) and

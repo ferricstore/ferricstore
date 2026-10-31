@@ -280,10 +280,19 @@ defmodule Ferricstore.Commands.Expiry do
   # With a flag the expiry depends on the TTL read first. The key latch keeps
   # that read and the write together only against clients on this node: from
   # every node of a cluster, EXPIRE NX had a winner per node, each replacing
-  # the TTL the last one set. Where it can, the decision runs as a one-command
-  # transaction, made where the write applies (from feature level 5, below
-  # which a transaction rewrites a probabilistic key as a string).
+  # the TTL the last one set. Where it can, the decision is made where the
+  # write applies: from feature level 12 in one compound command entry, and
+  # below it as a one-command transaction (from feature level 5, below which
+  # a transaction rewrites a probabilistic key as a string), whose journal
+  # costs 20-40 ms a write.
   defp apply_expiry(key, expire_at_ms, flag, store) do
+    case Ops.compound_command(store, key, {:pexpireat, key, expire_at_ms, flag}, 12) do
+      :unsupported -> apply_expiry_in_transaction(key, expire_at_ms, flag, store)
+      result -> result
+    end
+  end
+
+  defp apply_expiry_in_transaction(key, expire_at_ms, flag, store) do
     args = [key, Integer.to_string(expire_at_ms) | flag_args(flag)]
 
     case SingleCommand.run(store, "PEXPIREAT", args, level: 5) do
@@ -524,7 +533,19 @@ defmodule Ferricstore.Commands.Expiry do
   # lost elements. Where it can, it runs instead as a one-command transaction,
   # which the shard's state machine applies with nothing in between (inside
   # MULTI the handler already runs there).
+  # A collection's TTL is on every member, so the members are rewritten in
+  # one entry: from feature level 12 a compound command entry, below it a
+  # one-command transaction.
   defp set_collection_expiry(key, type, expire_at_ms, store) do
+    ast = if expire_at_ms == 0, do: {:persist, key}, else: {:pexpireat, key, expire_at_ms}
+
+    case Ops.compound_command(store, key, ast, 12) do
+      :unsupported -> set_collection_expiry_in_transaction(key, type, expire_at_ms, store)
+      result -> result
+    end
+  end
+
+  defp set_collection_expiry_in_transaction(key, type, expire_at_ms, store) do
     {command, args} =
       if expire_at_ms == 0,
         do: {"PERSIST", [key]},

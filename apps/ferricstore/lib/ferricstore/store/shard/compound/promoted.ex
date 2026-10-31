@@ -46,7 +46,10 @@ defmodule Ferricstore.Store.Shard.Compound.Promoted do
         nil
 
       type ->
-        path = Promotion.dedicated_path(state.data_dir, state.index, type, redis_key)
+        # The shard's state names its index `index`, the state machine's
+        # `shard_index`; apply resolves promoted collections too.
+        index = Map.get_lazy(state, :index, fn -> Map.fetch!(state, :shard_index) end)
+        path = Promotion.dedicated_path(state.data_dir, index, type, redis_key)
         if Ferricstore.FS.dir?(path), do: path, else: nil
     end
   end
