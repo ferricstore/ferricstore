@@ -98,6 +98,12 @@ defmodule Ferricstore.KeyspaceNotifications do
     "xadd" => "t",
     "xdel" => "t",
     "xtrim" => "t",
+    "xsetid" => "t",
+    "xgroup-create" => "t",
+    "xgroup-destroy" => "t",
+    "xgroup-createconsumer" => "t",
+    "xgroup-delconsumer" => "t",
+    "xgroup-setid" => "t",
     "expired" => "x"
   }
 
@@ -186,7 +192,9 @@ defmodule Ferricstore.KeyspaceNotifications do
     "ZREMRANGEBYLEX" => "zremrangebylex",
     "XADD" => "xadd",
     "XDEL" => "xdel",
-    "XTRIM" => "xtrim"
+    "XTRIM" => "xtrim",
+    "XSETID" => "xsetid",
+    "XGROUP" => "xgroup"
   }
 
   # Results that mean the command changed nothing. Kept narrow: some commands
@@ -274,6 +282,18 @@ defmodule Ferricstore.KeyspaceNotifications do
 
   defp notify_event("BITOP", event, [_operation, destination | _rest], _result),
     do: notify_key(destination, event)
+
+  # "xgroup-create", "xgroup-destroy", ... on the stream, as Redis names them;
+  # none when DESTROY, CREATECONSUMER or DELCONSUMER changed nothing (0).
+  defp notify_event("XGROUP", _event, [subcommand, key | _rest], result) do
+    name = String.downcase(subcommand)
+
+    unless result == 0 and name in ~w(destroy createconsumer delconsumer) do
+      notify_key(key, "xgroup-" <> name)
+    end
+
+    :ok
+  end
 
   # A blocking pop names the key it served in its reply.
   defp notify_event(command, event, _args, [key, _popped]) when command in ~w(BLPOP BRPOP),

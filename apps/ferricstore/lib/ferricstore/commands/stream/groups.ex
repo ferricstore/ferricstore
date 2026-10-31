@@ -119,6 +119,30 @@ defmodule Ferricstore.Commands.Stream.Groups do
   end
 
   @doc false
+  # A pending entry delivered `count` times, last at `delivered_at_ms` (XCLAIM,
+  # XAUTOCLAIM). XREADGROUP's first delivery writes the version-1 form, which
+  # reads as one delivery.
+  @spec serialized_pending_entry(
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          pos_integer()
+        ) :: {binary(), binary(), 0}
+  def serialized_pending_entry(key, group, id, consumer, delivered_at_ms, count) do
+    {CompoundKey.stream_pending(key, group, id), encode_pending(consumer, delivered_at_ms, count),
+     0}
+  end
+
+  @doc false
+  @spec serialized_consumer_entry(binary(), binary(), binary(), non_neg_integer()) ::
+          {binary(), binary(), 0}
+  def serialized_consumer_entry(key, group, consumer, seen_at_ms) do
+    {CompoundKey.stream_consumer(key, group, consumer), encode_consumer(seen_at_ms), 0}
+  end
+
+  @doc false
   @spec pending_keys(binary(), binary(), [binary()]) :: [binary()]
   def pending_keys(key, group, ids) do
     Enum.map(ids, &CompoundKey.stream_pending(key, group, &1))
@@ -358,6 +382,12 @@ defmodule Ferricstore.Commands.Stream.Groups do
     TermCodec.encode({:stream_pending, 1, consumer, delivered_at_ms})
   end
 
+  defp encode_pending(consumer, delivered_at_ms, 1), do: encode_pending(consumer, delivered_at_ms)
+
+  defp encode_pending(consumer, delivered_at_ms, count) do
+    TermCodec.encode({:stream_pending, 2, consumer, delivered_at_ms, count})
+  end
+
   defp encode_consumer(seen_at_ms) do
     TermCodec.encode({:stream_consumer, 1, seen_at_ms})
   end
@@ -400,8 +430,13 @@ defmodule Ferricstore.Commands.Stream.Groups do
         id = suffix_after_prefix(member, group_prefix)
 
         case {ID.parse_full_id(id), decode_pending(raw)} do
-          {{:ok, _parsed}, {:ok, consumer, delivered_at_ms}} ->
+          # {consumer, delivered_at_ms}; an entry delivered more than once
+          # (XCLAIM, XAUTOCLAIM) also carries its count.
+          {{:ok, _parsed}, {:ok, consumer, delivered_at_ms, 1}} ->
             {:cont, {:ok, Map.put(pending, id, {consumer, delivered_at_ms})}}
+
+          {{:ok, _parsed}, {:ok, consumer, delivered_at_ms, count}} ->
+            {:cont, {:ok, Map.put(pending, id, {consumer, delivered_at_ms, count})}}
 
           _invalid ->
             {:halt, ReadResult.failure(:invalid_stream_group_state)}
@@ -503,7 +538,7 @@ defmodule Ferricstore.Commands.Stream.Groups do
 
   defp validate_pending_values([id | ids], [raw | values], acc) do
     case decode_pending(raw) do
-      {:ok, _consumer, _delivered_at_ms} ->
+      {:ok, _consumer, _delivered_at_ms, _count} ->
         validate_pending_values(ids, values, [id | acc])
 
       :error ->
@@ -518,7 +553,12 @@ defmodule Ferricstore.Commands.Stream.Groups do
     case TermCodec.decode(raw) do
       {:ok, {:stream_pending, 1, consumer, delivered_at_ms}}
       when is_binary(consumer) and is_integer(delivered_at_ms) and delivered_at_ms >= 0 ->
-        {:ok, consumer, delivered_at_ms}
+        {:ok, consumer, delivered_at_ms, 1}
+
+      {:ok, {:stream_pending, 2, consumer, delivered_at_ms, count}}
+      when is_binary(consumer) and is_integer(delivered_at_ms) and delivered_at_ms >= 0 and
+             is_integer(count) and count >= 1 ->
+        {:ok, consumer, delivered_at_ms, count}
 
       _invalid ->
         :error
@@ -575,6 +615,11 @@ defmodule Ferricstore.Commands.Stream.Groups do
       {id, {consumer, delivered_at_ms}}
       when is_binary(id) and is_binary(consumer) and is_integer(delivered_at_ms) and
              delivered_at_ms >= 0 ->
+        valid_stream_id?(id)
+
+      {id, {consumer, delivered_at_ms, count}}
+      when is_binary(id) and is_binary(consumer) and is_integer(delivered_at_ms) and
+             delivered_at_ms >= 0 and is_integer(count) and count >= 1 ->
         valid_stream_id?(id)
 
       _invalid ->

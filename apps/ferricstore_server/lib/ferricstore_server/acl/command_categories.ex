@@ -51,7 +51,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   @geo_write ~w(GEOADD GEOSEARCHSTORE)
 
   @stream_read ~w(XLEN XRANGE XREVRANGE XREAD XINFO XPENDING)
-  @stream_write ~w(XADD XTRIM XDEL XGROUP XREADGROUP XACK)
+  @stream_write ~w(XADD XTRIM XDEL XGROUP XREADGROUP XACK XCLAIM XAUTOCLAIM XSETID)
 
   @probabilistic_read ~w(
     BF.EXISTS BF.MEXISTS BF.CARD BF.INFO

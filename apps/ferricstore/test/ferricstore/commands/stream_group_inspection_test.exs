@@ -82,5 +82,11 @@ defmodule Ferricstore.Commands.StreamGroupInspectionTest do
              d.("XINFO", ["CONSUMERS", k.("s"), "nope"])
 
     assert {:error, "ERR no such key"} == d.("XINFO", ["GROUPS", k.("missing")])
+
+    assert {:error, "ERR unknown subcommand 'FOO'. Try XINFO HELP."} ==
+             d.("XINFO", ["FOO", k.("s")])
+
+    assert {:error, "ERR wrong number of arguments for 'xinfo|consumers' command"} ==
+             d.("XINFO", ["CONSUMERS", k.("s")])
   end
 end
