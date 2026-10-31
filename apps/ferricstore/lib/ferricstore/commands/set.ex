@@ -719,15 +719,16 @@ defmodule Ferricstore.Commands.Set do
   # A destination that is also a source is read and then written back, which
   # undid a write to it in between (SADD racing SUNIONSTORE k k other lost
   # members). Then, where it can, the command runs as a one-command
-  # transaction, applied by the shard with nothing in between.
+  # transaction, applied by the shard with nothing in between. From feature
+  # level 11 every STORE runs that way: the shard computes the result from
+  # what it has applied, not the client's node from what it may not have yet,
+  # and writes a result of any size (`ApplyContext.bulk/1`).
   defp store_result_at(command, destination, keys, store, result_fun) do
-    if destination in keys do
-      case SingleCommand.run(store, command, [destination | keys]) do
-        :fallback -> store_result_here(destination, keys, store, result_fun)
-        result -> result
-      end
-    else
-      store_result_here(destination, keys, store, result_fun)
+    opts = if destination in keys, do: [], else: [level: 11]
+
+    case SingleCommand.run(store, command, [destination | keys], opts) do
+      :fallback -> store_result_here(destination, keys, store, result_fun)
+      result -> result
     end
   end
 

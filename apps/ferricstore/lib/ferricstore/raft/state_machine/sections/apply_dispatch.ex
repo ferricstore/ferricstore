@@ -2752,7 +2752,15 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       catch
         {:transaction_store_failure, reason} ->
-          {:error, "ERR command exceeded the apply budget: #{inspect(reason)}"}
+          limits = %{
+            apply_context:
+              Map.take(store, [:compound_member_apply_budget, :transaction_result_byte_budget])
+          }
+
+          case Ferricstore.ErrorReasons.client_message(reason, limits) do
+            nil -> {:error, "ERR command exceeded the apply budget: #{inspect(reason)}"}
+            message -> {:error, message}
+          end
       end
 
       defp apply_key_lifecycle(meta, state, command) do
@@ -2762,8 +2770,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
 
             write_result =
               with :ok <- admit_apply_command_work(state, {:key_lifecycle, command}) do
-                with_cross_shard_pending_writes(state, fn ->
-                  dispatch_key_lifecycle(command, build_local_raft_tx_store(state))
+                with_bulk_apply_context(state, true, fn state ->
+                  with_cross_shard_pending_writes(state, fn ->
+                    dispatch_key_lifecycle(command, build_local_raft_tx_store(state))
+                  end)
                 end)
               end
 

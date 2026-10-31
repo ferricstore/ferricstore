@@ -101,7 +101,13 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #     have; and the ones that write run as one-command transactions, so the
   #     shard decides what to write where it writes it
   #     (`Ferricstore.Commands.SortedSet.Algebra`, `SortedSet.RangeCommands`).
-  @supported 10
+  # 11: an entry holding one command whose members come from stored data
+  #     (RENAME, RENAMENX, COPY, the STORE forms, ZREMRANGEBY*, EXPIRE and
+  #     PERSIST) applies with the largest member and byte bounds
+  #     (`Ferricstore.Raft.ApplyContext.bulk/1`) instead of the configured
+  #     ones, so it works on collections past them. Older releases refuse
+  #     the same entry.
+  @supported 11
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"
   @probe_timeout_ms 5_000
