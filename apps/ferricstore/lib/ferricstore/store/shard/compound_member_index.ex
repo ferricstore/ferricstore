@@ -862,6 +862,61 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
     do: {:error, :invalid_member_slice}
 
   @doc false
+  @spec member_count(table_ref(), binary()) :: {:ok, non_neg_integer()} | :unavailable
+  def member_count(table, prefix) when is_binary(prefix) do
+    case ready_table_ref(table) do
+      :undefined -> :unavailable
+      tid -> {:ok, prefix_count(tid, prefix)}
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def member_count(_table, _prefix), do: :unavailable
+
+  @doc false
+  # The members at `ranks` (sorted, distinct positions in term order under
+  # `prefix`, as `member_count/2` counts them). A rank whose member is not
+  # live takes the next live one, and a walk that runs out wraps once, so the
+  # result holds as many distinct live members as there are ranks while the
+  # collection has that many. Walks to the last rank: O(that rank).
+  @spec members_at_ranks(
+          table_ref(),
+          map(),
+          binary(),
+          [non_neg_integer()],
+          tuple(),
+          map() | MapSet.t()
+        ) :: {:ok, [binary()]} | {:error, term()} | :unavailable
+  def members_at_ranks(table, state, prefix, ranks, expiry_context, pending_values)
+      when is_binary(prefix) and is_list(ranks) and is_tuple(expiry_context) do
+    case ready_table_ref(table) do
+      :undefined ->
+        :unavailable
+
+      tid ->
+        walk = %{
+          table: tid,
+          state: state,
+          prefix: prefix,
+          expiry_context: ExpiryContext.normalize(expiry_context),
+          pending_values: pending_values
+        }
+
+        with {:ok, picked, deficit} <- walk_ranks(walk, first_key(tid, prefix), 0, ranks, 0, []),
+             {:ok, picked} <-
+               wrap_ranks(walk, first_key(tid, prefix), deficit, MapSet.new(picked), picked) do
+          {:ok, Enum.reverse(picked)}
+        end
+    end
+  rescue
+    ArgumentError -> :unavailable
+  end
+
+  def members_at_ranks(_table, _state, _prefix, _ranks, _expiry_context, _pending_values),
+    do: {:error, :invalid_member_ranks}
+
+  @doc false
   @spec row_slice(
           table_ref(),
           map(),
@@ -2402,6 +2457,87 @@ defmodule Ferricstore.Store.Shard.CompoundMemberIndex do
 
   defp do_scan_keys_bounded(_table, _prefix, _other_key, _remaining, acc),
     do: {:ok, Enum.reverse(acc)}
+
+  # `deficit` counts ranks reached whose member was not live: the next live
+  # member stands in for each.
+  defp walk_ranks(walk, {prefix, _member} = index_key, position, ranks, deficit, acc)
+       when prefix == walk.prefix and (ranks != [] or deficit > 0) do
+    {ranks, deficit} =
+      case ranks do
+        [^position | rest] -> {rest, deficit + 1}
+        _other -> {ranks, deficit}
+      end
+
+    next_key = :ets.next(walk.table, index_key)
+
+    if deficit > 0 do
+      case live_member_at(walk, index_key) do
+        {:ok, member} ->
+          walk_ranks(walk, next_key, position + 1, ranks, deficit - 1, [member | acc])
+
+        :not_live ->
+          walk_ranks(walk, next_key, position + 1, ranks, deficit, acc)
+
+        {:error, _reason} = error ->
+          error
+      end
+    else
+      walk_ranks(walk, next_key, position + 1, ranks, deficit, acc)
+    end
+  end
+
+  defp walk_ranks(_walk, _end_or_other_key, _position, ranks, deficit, acc),
+    do: {:ok, acc, deficit + length(ranks)}
+
+  defp wrap_ranks(walk, {prefix, _member} = index_key, deficit, picked, acc)
+       when prefix == walk.prefix and deficit > 0 do
+    next_key = :ets.next(walk.table, index_key)
+
+    case live_member_at(walk, index_key) do
+      {:ok, member} ->
+        if MapSet.member?(picked, member) do
+          wrap_ranks(walk, next_key, deficit, picked, acc)
+        else
+          wrap_ranks(walk, next_key, deficit - 1, MapSet.put(picked, member), [member | acc])
+        end
+
+      :not_live ->
+        wrap_ranks(walk, next_key, deficit, picked, acc)
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp wrap_ranks(_walk, _end_or_other_key, _deficit, _picked, acc), do: {:ok, acc}
+
+  defp live_member_at(walk, index_key) do
+    case :ets.lookup(walk.table, index_key) do
+      [{^index_key, compound_key}] ->
+        case indexed_member_status(
+               walk.state,
+               compound_key,
+               walk.expiry_context,
+               walk.pending_values
+             ) do
+          :live ->
+            {:ok, member_from_key(compound_key, walk.prefix)}
+
+          :pending_skip ->
+            :not_live
+
+          :stale ->
+            delete_stale_member(walk.table, walk.state, compound_key, walk.expiry_context)
+            :not_live
+
+          {:error, _reason} = error ->
+            error
+        end
+
+      _missing ->
+        :not_live
+    end
+  end
 
   defp scan_keys_page(_table, prefix, {prefix, _member}, 0, last, acc),
     do: {:ok, Enum.reverse(acc), {:next, last}}

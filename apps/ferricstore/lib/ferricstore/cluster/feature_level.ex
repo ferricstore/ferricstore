@@ -107,7 +107,10 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #     (`Ferricstore.Raft.ApplyContext.bulk/1`) instead of the configured
   #     ones, so it works on collections past them; and a collection delete
   #     (DEL, UNLINK, SET over it) removes every member a page of the member
-  #     bound at a time. Older releases refuse the same entries.
+  #     bound at a time. Older releases refuse the same entries. SPOP draws
+  #     distinct ranks from the entry's Raft index (`spop_select/5`), where
+  #     older releases read a hash of it as a member name and pop different
+  #     members.
   @supported 11
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

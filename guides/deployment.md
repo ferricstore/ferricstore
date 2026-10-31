@@ -701,7 +701,10 @@ shard_0: 2
     transactions, as the sorted-set STORE forms do from level 10. Below
     level 11 these commands are refused for a collection past the configured
     bound. Applying one entry holds the shard's writes for its duration:
-    about 0.7 s for a RENAME of 20,000 members on macOS.
+    about 0.7 s for a RENAME of 20,000 members on macOS. SPOP picks its
+    members evenly from the set's members (below level 11 a set whose
+    members share a prefix, such as `m1`..`m200`, gave up its first members
+    in order); every replica still picks the same.
 - Raising is safe to repeat, including after a partial failure.
 - Levels never go down. Do not downgrade a node below the active level.
 - Once a level is active, a node whose release does not support it cannot join.

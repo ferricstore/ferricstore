@@ -83,10 +83,16 @@ defmodule Ferricstore.Raft.StateMachineCompoundBatchGuardTest do
     [zpop, _after_zpop] =
       String.split(zpop_and_after, "defp deterministic_member_cursor", parts: 2)
 
+    # From feature level 11 SPOP walks the index to drawn ranks; below it, from
+    # a cursor. `random_ranks` sorts the ranks it draws (as many as the pop
+    # takes), never the set's members.
+    [spop, ranks] = String.split(spop, "defp random_ranks(", parts: 2)
     assert spop =~ "CompoundMemberIndex.member_slice("
+    assert spop =~ "CompoundMemberIndex.members_at_ranks("
     refute spop =~ "prefix_scan_entries("
     refute spop =~ "Enum.sort"
     refute spop =~ "right ++ left"
+    refute ranks =~ "prefix_scan_entries("
 
     assert zpop =~ "ZSetIndex.rank_range("
     assert zpop =~ "ensure_zpop_score_index(state, redis_key, prefix)"
