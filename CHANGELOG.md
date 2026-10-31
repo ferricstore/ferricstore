@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A transaction's writes woke no blocked client. An LPUSH, RPUSH, LPUSHX,
+  RPUSHX or LMOVE inside MULTI left a BLPOP, BRPOP, BLMOVE or BLMPOP waiting
+  for that list, and from feature level 10, where ZUNIONSTORE, ZINTERSTORE,
+  ZDIFFSTORE and ZRANGESTORE run as one-command transactions, they no longer
+  woke BZPOPMIN, BZPOPMAX or BZMPOP (0.12.16). A transaction now wakes the
+  waiters of what it pushed or added once it is published, on every node, as
+  a single write does.
 - Upgrading: raise the cluster to feature level 11 once every node runs this
   release. One replicated entry applies at most 4,096 members by default
   (`:compound_member_apply_budget`) and reads at most 8 MiB, and commands

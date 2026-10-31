@@ -2751,6 +2751,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardDispatch do
           end,
           shard_index: default_ctx.index,
           data_dir: data_dir,
+          # A push inside a transaction wakes the shard's BLPOP waiters once
+          # the entry is published, as a single push's apply does.
+          on_push: fn key, count -> queue_list_push_notification(key, count) end,
           compound_member_apply_budget: anchor_state.apply_context.compound_member_apply_budget,
           transaction_command_budget: anchor_state.apply_context.transaction_command_budget,
           transaction_key_apply_budget: anchor_state.apply_context.transaction_key_apply_budget,
