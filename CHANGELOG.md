@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.16 - 2026-10-31
+
 - ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and
   ZRANGESTORE, as Redis answers them (WEIGHTS, AGGREGATE, WITHSCORES, LIMIT;
   sets count as sorted sets of score 1), with `FerricStore.zunion/2`,
