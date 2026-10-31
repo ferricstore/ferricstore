@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- LINDEX, LSET and LRANGE in the middle of a list stepped through the
+  member catalog one search at a time to reach the position. They now read
+  it in chunks: on 20,000 elements LINDEX fell from 8.3 to 2.3 ms, LSET from
+  9.3 to 3.5 ms and LRANGE from 8.3 to 2.5 ms. SRANDMEMBER and HRANDFIELD
+  read their picked position the same way. Like Redis, a middle position
+  still costs one step per element before it.
+
 - Stream consumer groups had no way to inspect or recover pending entries:
   a consumer that stopped held its entries for good. XPENDING (summary and
   range forms, IDLE), XINFO GROUPS and XINFO CONSUMERS now read a group's
