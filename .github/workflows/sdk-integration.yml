@@ -58,7 +58,7 @@ jobs:
           - sdk: TypeScript
             id: typescript
             repository: ferricstore/ferricstore-typescript
-            ref: a164cf5bac71a007e6d48c3c2de150948b3710dc
+            ref: 706069545d39449b3789905c1fa5bb4107692702
           - sdk: Elixir
             id: elixir
             repository: ferricstore/ferricstore-elixir
