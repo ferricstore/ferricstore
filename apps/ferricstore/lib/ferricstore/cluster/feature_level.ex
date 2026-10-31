@@ -110,7 +110,9 @@ defmodule Ferricstore.Cluster.FeatureLevel do
   #     bound at a time. Older releases refuse the same entries. SPOP draws
   #     distinct ranks from the entry's Raft index (`spop_select/5`), where
   #     older releases read a hash of it as a member name and pop different
-  #     members.
+  #     members. XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other
+  #     than CREATE are stream operations (`Stream.GroupWrites`) older
+  #     releases do not apply.
   @supported 11
   @prefix ServerCatalog.root_prefix() <> "feature-level:"
   @marker "1"

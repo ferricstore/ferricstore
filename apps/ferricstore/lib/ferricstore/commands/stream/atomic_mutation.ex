@@ -1,10 +1,13 @@
 defmodule Ferricstore.Commands.Stream.AtomicMutation do
   @moduledoc false
 
-  alias Ferricstore.Commands.Stream.{CacheKey, Entries, ID, Index, Meta}
+  alias Ferricstore.Commands.Stream.{CacheKey, Entries, GroupWrites, ID, Index, Meta}
   alias Ferricstore.Store.{CompoundKey, Ops, ReadResult, TypeRegistry}
 
   @invalid_stream_id "ERR Invalid stream ID specified as stream command argument"
+
+  # Consumer-group writes from feature level 11 (`GroupWrites`).
+  @group_writes [:claim, :autoclaim, :destroy, :create_consumer, :delete_consumer, :set_group_id]
 
   @spec run(binary(), {:trim, term()} | {:delete, [binary()]}, map()) :: term()
   def run(key, {operation, _arg1, _arg2, _arg3} = group_operation, store)
@@ -14,6 +17,34 @@ defmodule Ferricstore.Commands.Stream.AtomicMutation do
 
   def run(key, {:ack, _group, _ids} = group_operation, store) do
     Ferricstore.Commands.Stream.AtomicGroup.run(key, group_operation, store)
+  end
+
+  def run(key, operation, store)
+      when is_tuple(operation) and tuple_size(operation) > 1 and
+             elem(operation, 0) in @group_writes,
+      do: GroupWrites.run(key, operation, store)
+
+  # XSETID (feature level 11): the stream's last generated ID, never below
+  # its last entry.
+  def run(key, {:set_last_id, ms, seq}, store) when is_integer(ms) and is_integer(seq) do
+    with {:ok, true} <-
+           TypeRegistry.check_type_status(key, :stream, CompoundKey.type_key(key), store),
+         {len, first, last, _generated_ms, _generated_seq} <- Meta.serialized_entry(key, store) do
+      if len > 0 and ID.compare({ms, seq}, ID.parse_id!(last)) == :lt do
+        {:error, "ERR The ID specified in XSETID is smaller than the target stream top item"}
+      else
+        with :ok <-
+               Ops.compound_batch_put(store, key, [
+                 Meta.serialized_put_entry(key, len, first, last, ms, seq)
+               ]),
+             :ok <- defer_cache_update(key, {:mutate, len, first, last, ms, seq, []}, store),
+             do: :ok
+      end
+    else
+      {:ok, false} -> {:error, "ERR no such key"}
+      {:error, {:storage_read_failed, _reason}} = failure -> ReadResult.command_error(failure)
+      {:error, _reason} = error -> error
+    end
   end
 
   def run(key, operation, store) do

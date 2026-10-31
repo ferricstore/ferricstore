@@ -40,6 +40,8 @@ defmodule Ferricstore.Commands.Stream do
   alias Ferricstore.Commands.Stream.AtomicAppend
   alias Ferricstore.Commands.Stream.AtomicMutation
   alias Ferricstore.Commands.Stream.Entries
+  alias Ferricstore.Commands.Stream.GroupArgs
+  alias Ferricstore.Commands.Stream.GroupInspect
   alias Ferricstore.Commands.Stream.Groups
   alias Ferricstore.Commands.Stream.ID
   alias Ferricstore.Commands.Stream.Info
@@ -204,19 +206,16 @@ defmodule Ferricstore.Commands.Stream do
   # XINFO STREAM key [FULL [COUNT count]]
   # -------------------------------------------------------------------------
 
-  def handle("XINFO", [subcommand, key], store) when is_binary(subcommand) do
-    if String.upcase(subcommand) == "STREAM" do
-      Info.stream(key, store)
-    else
-      {:error, "ERR wrong number of arguments for 'xinfo' command"}
-    end
-  end
-
-  def handle("XINFO", [subcommand, _key | _rest], _store) when is_binary(subcommand) do
-    if String.upcase(subcommand) == "STREAM" do
-      {:error, "ERR syntax error"}
-    else
-      {:error, "ERR wrong number of arguments for 'xinfo' command"}
+  def handle("XINFO", [subcommand | args], store) when is_binary(subcommand) do
+    case {String.upcase(subcommand), args} do
+      {"STREAM", [key]} -> Info.stream(key, store)
+      {"STREAM", [_key | _rest]} -> {:error, "ERR syntax error"}
+      {"GROUPS", [key]} -> GroupInspect.groups(key, store)
+      {"CONSUMERS", [key, group]} -> GroupInspect.consumers(key, group, store)
+      {"STREAM", []} -> {:error, "ERR wrong number of arguments for 'xinfo|stream' command"}
+      {"GROUPS", _} -> {:error, "ERR wrong number of arguments for 'xinfo|groups' command"}
+      {"CONSUMERS", _} -> {:error, "ERR wrong number of arguments for 'xinfo|consumers' command"}
+      _other -> {:error, "ERR unknown subcommand '#{subcommand}'. Try XINFO HELP."}
     end
   end
 
@@ -225,23 +224,78 @@ defmodule Ferricstore.Commands.Stream do
   end
 
   # -------------------------------------------------------------------------
+  # XPENDING key group [[IDLE min-idle-time] start end count [consumer]]
+  # -------------------------------------------------------------------------
+
+  def handle("XPENDING", [key, group | args], store),
+    do: GroupInspect.pending(key, group, args, store)
+
+  def handle("XPENDING", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'xpending' command"}
+
+  # -------------------------------------------------------------------------
   # XGROUP CREATE key groupname id [MKSTREAM]
   # -------------------------------------------------------------------------
 
-  def handle("XGROUP", [subcommand, key, group, id_str | rest], store)
-      when is_binary(subcommand) do
-    if String.upcase(subcommand) == "CREATE" do
-      with {:ok, mkstream} <- parse_xgroup_create_options(rest) do
-        do_xgroup_create(key, group, id_str, mkstream, store)
-      end
-    else
-      {:error, "ERR syntax error"}
+  def handle("XGROUP", [subcommand | args], store) when is_binary(subcommand) do
+    case {String.upcase(subcommand), args} do
+      {"CREATE", [key, group, id_str | rest]} ->
+        with {:ok, mkstream} <- parse_xgroup_create_options(rest) do
+          do_xgroup_create(key, group, id_str, mkstream, store)
+        end
+
+      {"DESTROY", [key, group]} ->
+        group_write("xgroup", key, {:destroy, group}, store)
+
+      {"CREATECONSUMER", [key, group, consumer]} ->
+        group_write("xgroup", key, {:create_consumer, group, consumer}, store)
+
+      {"DELCONSUMER", [key, group, consumer]} ->
+        group_write("xgroup", key, {:delete_consumer, group, consumer}, store)
+
+      {"SETID", [key, group, id_str | options]} ->
+        with :ok <- GroupArgs.setid_options(options),
+             do: group_write("xgroup", key, {:set_group_id, group, id_str}, store)
+
+      {name, _args} when name in ~w(CREATE DESTROY CREATECONSUMER DELCONSUMER SETID) ->
+        {:error, "ERR wrong number of arguments for 'xgroup|#{String.downcase(name)}' command"}
+
+      _other ->
+        {:error, "ERR unknown subcommand '#{subcommand}'. Try XGROUP HELP."}
     end
   end
 
   def handle("XGROUP", _args, _store) do
     {:error, "ERR wrong number of arguments for 'xgroup' command"}
   end
+
+  # -------------------------------------------------------------------------
+  # XCLAIM, XAUTOCLAIM, XSETID (feature level 11)
+  # -------------------------------------------------------------------------
+
+  def handle("XCLAIM", [key, group, consumer, min_idle | [_ | _] = args], store) do
+    with {:ok, operation} <- GroupArgs.xclaim(group, consumer, min_idle, args),
+         do: group_write("xclaim", key, operation, store)
+  end
+
+  def handle("XCLAIM", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'xclaim' command"}
+
+  def handle("XAUTOCLAIM", [key, group, consumer, min_idle, start | args], store) do
+    with {:ok, operation} <- GroupArgs.xautoclaim(group, consumer, min_idle, start, args),
+         do: group_write("xautoclaim", key, operation, store)
+  end
+
+  def handle("XAUTOCLAIM", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'xautoclaim' command"}
+
+  def handle("XSETID", [key, id_str | options], store) do
+    with {:ok, operation} <- GroupArgs.xsetid(id_str, options),
+         do: group_write("xsetid", key, operation, store)
+  end
+
+  def handle("XSETID", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'xsetid' command"}
 
   # -------------------------------------------------------------------------
   # XREADGROUP GROUP group consumer [COUNT count] STREAMS key [key ...] id [id ...]
@@ -547,6 +601,26 @@ defmodule Ferricstore.Commands.Stream do
       end
 
     record_xadd_result(result, key, fields, trim_opts, nomkstream, store)
+  end
+
+  # XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other than CREATE
+  # are replicated stream operations older releases do not have: on the
+  # instance they run once feature level 11 is active on the key's shard.
+  defp group_write(command, key, operation, %FerricStore.Instance{} = ctx) do
+    if Ferricstore.Transaction.ReplicaCompat.level_active?(ctx, [key], 11) do
+      Ops.stream_mutate(ctx, key, operation)
+    else
+      {:error,
+       "ERR #{command} needs cluster feature level 11 " <>
+         "(CLUSTER.FEATURES.RAISE 11 once every node runs this release)"}
+    end
+  end
+
+  defp group_write(_command, key, operation, store) do
+    case Ops.stream_mutate(store, key, operation) do
+      :unsupported -> AtomicMutation.run(key, operation, store)
+      result -> result
+    end
   end
 
   defp serialized_stream_store?(%{defer_stream_cleanup: defer}) when is_function(defer, 1),
@@ -1355,18 +1429,17 @@ defmodule Ferricstore.Commands.Stream do
 
   defp xreadgroup_pending_ids(pending, consumer, pending_start, count) do
     pending
-    |> Enum.reduce([], fn
-      {id, {^consumer, _ts}}, acc ->
-        parsed_id = parse_id!(id)
+    |> Enum.reduce([], fn {id, entry}, acc ->
+      parsed_id = parse_id!(id)
 
-        if pending_start == :min or ID.compare(parsed_id, pending_start) != :lt do
-          [{parsed_id, id} | acc]
-        else
-          acc
-        end
-
-      _other, acc ->
+      # {consumer, delivered_at_ms} or, delivered more than once,
+      # {consumer, delivered_at_ms, count}.
+      if elem(entry, 0) == consumer and
+           (pending_start == :min or ID.compare(parsed_id, pending_start) != :lt) do
+        [{parsed_id, id} | acc]
+      else
         acc
+      end
     end)
     |> Enum.sort_by(fn {parsed_id, _id} -> parsed_id end)
     |> maybe_take_tuples(count)

@@ -702,6 +702,12 @@ defmodule Ferricstore.Raft.ApplyWork do
   defp consume_command_work({:stream_mutate, _key, {:create, _group, _id, _mkstream}}, remaining),
     do: consume_unit(remaining)
 
+  defp consume_command_work(
+         {:stream_mutate, _key, {:claim, _group, _consumer, _min_idle, ids, _opts}},
+         remaining
+       ),
+       do: consume_items(ids, remaining)
+
   defp consume_command_work({:pfmerge, _key, sketches}, remaining),
     do: consume_items(sketches, remaining)
 
@@ -863,6 +869,21 @@ defmodule Ferricstore.Raft.ApplyWork do
          remaining
        ),
        do: consume_compound_units(remaining, 3)
+
+  # A pending row per claimed ID, and the consumer's and group's rows.
+  defp consume_compound_work(
+         {:stream_mutate, _key, {:claim, _group, _consumer, _min_idle, ids, _opts}},
+         remaining
+       ),
+       do: consume_compound_units(remaining, length(ids) + 2)
+
+  defp consume_compound_work(
+         {:stream_mutate, _key,
+          {:autoclaim, _group, _consumer, _min_idle, _start, count, _justid}},
+         remaining
+       )
+       when is_integer(count) and count > 0,
+       do: consume_compound_units(remaining, count * 10 + 2)
 
   defp consume_compound_work({:list_op, _key, {tag, elements}}, remaining)
        when tag in @list_push_tags,

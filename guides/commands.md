@@ -32,8 +32,9 @@ ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, Z
 ZCOUNT, ZPOPMIN, ZPOPMAX, ZRANDMEMBER, ZMSCORE, ZRANGEBYSCORE, ZREVRANGEBYSCORE, ZSCAN,
 ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD, ZRANGESTORE,
 ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT, ZREMRANGEBYRANK, ZREMRANGEBYSCORE, ZREMRANGEBYLEX, ZMPOP,
-XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XINFO STREAM,
-XGROUP CREATE, XREADGROUP, XACK,
+XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XSETID, XINFO STREAM,
+XINFO GROUPS, XINFO CONSUMERS, XGROUP CREATE, XGROUP DESTROY, XGROUP CREATECONSUMER,
+XGROUP DELCONSUMER, XGROUP SETID, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM,
 EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIME,
 SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP,
 PFADD, PFCOUNT, PFMERGE,
@@ -1051,17 +1052,25 @@ Returns stream metadata as a map.
 | **Return** | Map with `length`, `first-entry`, `last-entry`, `last-generated-id`, `groups` |
 | **Status** | Subset of FerricStore XINFO. FULL option not yet supported. |
 
-### XGROUP CREATE / XREADGROUP / XACK
-
-Consumer group support:
+### Consumer groups
 
 | Command | Syntax | Notes |
 |---------|--------|-------|
 | `XGROUP CREATE` | `XGROUP CREATE key group id [MKSTREAM]` | `$` for new-only, `0` for all |
 | `XREADGROUP` | `XREADGROUP GROUP group consumer [COUNT count] STREAMS key [key ...] id [id ...]` | `>` for new messages, `0` for pending |
 | `XACK` | `XACK key group id [id ...]` | Returns count acknowledged |
+| `XPENDING` | `XPENDING key group [[IDLE min-idle-time] start end count [consumer]]` | Summary `[count, first, last, [[consumer, "count"], ...]]`, or `[id, consumer, idle ms, deliveries]` per entry |
+| `XINFO GROUPS` | `XINFO GROUPS key` | A map per group: `name`, `consumers`, `pending`, `last-delivered-id`; `entries-read` and `lag` are nil (not tracked) |
+| `XINFO CONSUMERS` | `XINFO CONSUMERS key group` | A map per consumer: `name`, `pending`, `idle`, `inactive` (both since its last delivery) |
+| `XCLAIM` | `XCLAIM key group consumer min-idle-time id [id ...] [IDLE ms] [TIME unix-ms] [RETRYCOUNT count] [FORCE] [JUSTID] [LASTID id]` | Claimed entries, or IDs with JUSTID (which counts no delivery). An entry the stream no longer holds leaves the pending list instead |
+| `XAUTOCLAIM` | `XAUTOCLAIM key group consumer min-idle-time start [COUNT count] [JUSTID]` | `[next start, claimed, deleted IDs]`; looks at up to 10 entries per one it claims |
+| `XGROUP DESTROY` | `XGROUP DESTROY key group` | 1, or 0 for no such group |
+| `XGROUP CREATECONSUMER` | `XGROUP CREATECONSUMER key group consumer` | 1, or 0 when it exists |
+| `XGROUP DELCONSUMER` | `XGROUP DELCONSUMER key group consumer` | The consumer's pending entries, which leave the pending list |
+| `XGROUP SETID` | `XGROUP SETID key group id\|$ [ENTRIESREAD n]` | `ENTRIESREAD` is accepted and not tracked |
+| `XSETID` | `XSETID key last-id [ENTRIESADDED n] [MAXDELETEDID id]` | Never below the stream's last entry; the options are accepted and not tracked |
 
-Consumer group state (pending entries, consumers, last-delivered-id) is tracked in ETS. XGROUP DESTROY, DELCONSUMER, and SETID are not yet implemented.
+A group's last-delivered ID, consumers and pending entries are stored with the stream and replicated with it; a node keeps a cache of them. XCLAIM, XAUTOCLAIM, XSETID and the XGROUP subcommands other than CREATE are replicated stream operations older releases do not have, so they run from feature level 11 (below it they answer `ERR ... needs cluster feature level 11`) and are not taken inside MULTI. XAUTOCLAIM's COUNT is bounded by one entry's member bound (`:compound_member_apply_budget`, 4,096 by default) over 10. Replies give entries in FerricStore's flat form, `[id, field, value, ...]`, as XRANGE does.
 
 ---
 

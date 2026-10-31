@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Stream consumer groups had no way to inspect or recover pending entries:
+  a consumer that stopped held its entries for good. XPENDING (summary and
+  range forms, IDLE), XINFO GROUPS and XINFO CONSUMERS now read a group's
+  pending entries and consumers, and XCLAIM (IDLE, TIME, RETRYCOUNT, FORCE,
+  JUSTID, LASTID), XAUTOCLAIM, XGROUP DESTROY, CREATECONSUMER, DELCONSUMER
+  and SETID, and XSETID change them, as Redis 7 answers them. The writes
+  are replicated stream operations older releases do not have, so they run
+  from feature level 11. A pending entry claimed again keeps its delivery
+  count. XGROUP and XSETID fire Redis's keyspace events (XGROUP CREATE fired
+  none), and unknown XGROUP and XINFO subcommands answer as Redis does.
+
 - SRANDMEMBER, HRANDFIELD and ZRANDMEMBER read every member to pick one.
   On the instance they now take the collection's count and read the picked
   position: on 20,000 members SRANDMEMBER fell from 25.9 to 4.9 ms,
