@@ -40,7 +40,7 @@ EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIM
 SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP, BITFIELD, BITFIELD_RO,
 PFADD, PFCOUNT, PFMERGE,
 GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH, GEOSEARCHSTORE,
-PING, ECHO, TIME, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, SORT, SORT_RO, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
+PING, ECHO, TIME, LATENCY, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, SORT, SORT_RO, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
 OBJECT HELP/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
 SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND DOCS/COMMAND GETKEYS,
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
@@ -1517,6 +1517,26 @@ second, as two bulk strings. Not taken inside MULTI.
 | **Protocol command** | `TIME` |
 | **Return** | Array of two bulk strings |
 | **Status** | Supported |
+
+### LATENCY
+
+The latency monitor and latency histograms, as Redis keeps them, for the
+node that answers. With `CONFIG SET latency-monitor-threshold <ms>` above 0
+(0, off, is the default), a command that ran at least that long adds a
+sample to the `command` event (one per second, its worst; the latest 160
+kept). With `CONFIG SET latency-tracking yes` every command counts into its
+histogram of power-of-two microsecond buckets; FerricStore keeps it off by
+default (Redis keeps it on), so commands do not pay for it.
+
+| Subcommand | Return |
+|------------|--------|
+| `LATENCY LATEST` | `[[event, unix-seconds, latest-ms, max-ms], ...]` |
+| `LATENCY HISTORY event` | `[[unix-seconds, ms], ...]`, oldest first |
+| `LATENCY RESET [event ...]` | Integer: events reset (all without arguments) |
+| `LATENCY GRAPH event` | A text graph of the event's samples |
+| `LATENCY DOCTOR` | A text report |
+| `LATENCY HISTOGRAM [command ...]` | `{command => {"calls" => n, "histogram_usec" => {bucket => cumulative count}}}` |
+| `LATENCY HELP` | Help lines |
 
 ### PING / ECHO
 

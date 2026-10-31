@@ -26,6 +26,9 @@ defmodule Ferricstore.Config do
     * `"notify-keyspace-events"` -- keyspace notification flag string
     * `"slowlog-log-slower-than"` -- slowlog threshold in microseconds
     * `"slowlog-max-len"` -- maximum slowlog entries
+    * `"latency-monitor-threshold"` -- LATENCY monitor threshold in
+      milliseconds (0 = off)
+    * `"latency-tracking"` -- per-command LATENCY HISTOGRAM (`yes` / `no`)
     * `"hz"` -- server tick frequency (stub, always reports 10)
 
   Plus compatibility parameters: `timeout`, `tcp-keepalive`, `databases`,
@@ -82,6 +85,8 @@ defmodule Ferricstore.Config do
                        "notify-keyspace-events",
                        "slowlog-log-slower-than",
                        "slowlog-max-len",
+                       "latency-monitor-threshold",
+                       "latency-tracking",
                        "hz",
                        "keydir-max-ram",
                        "hot-cache-max-ram",
@@ -587,6 +592,8 @@ defmodule Ferricstore.Config do
       "notify-keyspace-events" => "",
       "slowlog-log-slower-than" => read_slowlog_threshold(),
       "slowlog-max-len" => read_slowlog_max_len(),
+      "latency-monitor-threshold" => Integer.to_string(Ferricstore.LatencyMonitor.threshold_ms()),
+      "latency-tracking" => if(Ferricstore.LatencyMonitor.tracking?(), do: "yes", else: "no"),
       "hz" => "10",
       "keydir-max-ram" =>
         Integer.to_string(Application.get_env(:ferricstore, :keydir_max_ram, 256 * 1024 * 1024)),
@@ -721,6 +728,19 @@ defmodule Ferricstore.Config do
     end
   end
 
+  defp validate_param("latency-monitor-threshold", value) do
+    case Integer.parse(value) do
+      {n, ""} when n >= 0 -> :ok
+      _ -> {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'latency-monitor-threshold'"}
+    end
+  end
+
+  defp validate_param("latency-tracking", value) do
+    if String.downcase(value) in ["yes", "no"],
+      do: :ok,
+      else: {:error, "ERR Invalid argument '#{value}' for CONFIG SET 'latency-tracking'"}
+  end
+
   defp validate_param("slowlog-max-len", value) do
     case Integer.parse(value) do
       {n, ""} when n >= 0 -> :ok
@@ -806,6 +826,14 @@ defmodule Ferricstore.Config do
     {n, ""} = Integer.parse(value)
     Ferricstore.SlowLog.set_threshold(n)
   end
+
+  defp apply_side_effect("latency-monitor-threshold", value) do
+    {n, ""} = Integer.parse(value)
+    Ferricstore.LatencyMonitor.set_threshold_ms(n)
+  end
+
+  defp apply_side_effect("latency-tracking", value),
+    do: Ferricstore.LatencyMonitor.set_tracking(String.downcase(value) == "yes")
 
   defp apply_side_effect("slowlog-max-len", value) do
     {n, ""} = Integer.parse(value)

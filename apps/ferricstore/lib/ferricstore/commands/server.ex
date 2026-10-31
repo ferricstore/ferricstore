@@ -463,6 +463,8 @@ defmodule Ferricstore.Commands.Server do
   def handle("TIME", _args, _store),
     do: {:error, "ERR wrong number of arguments for 'time' command"}
 
+  def handle("LATENCY", args, _store), do: Ferricstore.LatencyMonitor.command(args)
+
   def handle("LASTSAVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'lastsave' command"}
   end

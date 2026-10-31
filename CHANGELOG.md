@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New command: LATENCY (LATEST, HISTORY, RESET, GRAPH, DOCTOR, HISTOGRAM,
+  HELP), with the `latency-monitor-threshold` (milliseconds, 0 = off) and
+  `latency-tracking` (default `no`, unlike Redis, so commands do not pay for
+  it) CONFIG parameters.
+
 - New ACL subcommands: ACL CAT, GENPASS, LOG and DRYRUN, as Redis answers
   them. ACL LOG keeps this node's latest 128 ACL denials and failed AUTHs
   (always on, unlike the audit log), counting repeats within 60 seconds on
