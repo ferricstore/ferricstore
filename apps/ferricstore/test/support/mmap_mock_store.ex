@@ -120,14 +120,9 @@ defmodule Ferricstore.Test.ProbMockStore do
   end
 
   defp make_tmp_dir(prefix) do
-    dir =
-      Path.join(
-        System.tmp_dir!(),
-        "ferricstore_test_#{prefix}_#{:os.getpid()}_#{:erlang.unique_integer([:positive])}"
-      )
-
-    File.mkdir_p!(dir)
-    dir
+    Ferricstore.Test.OwnedTmpDir.create(
+      "ferricstore_test_#{prefix}_#{:os.getpid()}_#{:erlang.unique_integer([:positive])}"
+    )
   end
 end
 
