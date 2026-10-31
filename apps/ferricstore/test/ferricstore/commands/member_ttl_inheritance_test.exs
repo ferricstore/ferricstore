@@ -30,12 +30,18 @@ defmodule Ferricstore.Commands.MemberTtlInheritanceTest do
 
   defp cmd(ctx, name, args), do: Dispatcher.dispatch(name, args, ctx)
 
+  # Long enough that a stalled CI runner still adds the late member before the
+  # key runs out; a 300 ms TTL let the key expire first, so the add made a
+  # fresh key without one.
+  @ttl_ms 1_000
+  @past_ttl_ms @ttl_ms + 200
+
   # Sets a short TTL, runs `add`, then checks the late member left with the key.
   defp assert_late_member_expires(ctx, key, add, read, empty) do
-    assert 1 == cmd(ctx, "PEXPIRE", [key, "300"])
+    assert 1 == cmd(ctx, "PEXPIRE", [key, "#{@ttl_ms}"])
     add.()
     assert cmd(ctx, "PTTL", [key]) > 0
-    Process.sleep(450)
+    Process.sleep(@past_ttl_ms)
 
     assert 0 == cmd(ctx, "EXISTS", [key])
     assert empty == read.()
@@ -202,7 +208,7 @@ defmodule Ferricstore.Commands.MemberTtlInheritanceTest do
     assert 1 == cmd(ctx, "ZADD", [z, "1", "a"])
     assert 1 == cmd(ctx, "SADD", [s, "a"])
     assert 1 == cmd(ctx, "RPUSH", [l, "a"])
-    for k <- keys, do: assert(1 == cmd(ctx, "PEXPIRE", [k, "300"]))
+    for k <- keys, do: assert(1 == cmd(ctx, "PEXPIRE", [k, "#{@ttl_ms}"]))
 
     assert {:ok, _results} =
              FerricStore.multi(fn tx ->
@@ -213,7 +219,7 @@ defmodule Ferricstore.Commands.MemberTtlInheritanceTest do
                |> FerricStore.Tx.rpush(l, ["b"])
              end)
 
-    Process.sleep(450)
+    Process.sleep(@past_ttl_ms)
 
     assert [] == cmd(ctx, "HGETALL", [h])
     assert [] == cmd(ctx, "ZRANGE", [z, "0", "-1"])
