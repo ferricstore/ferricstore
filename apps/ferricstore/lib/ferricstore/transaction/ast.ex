@@ -48,7 +48,7 @@ defmodule Ferricstore.Transaction.Ast do
       do: ast
 
   def namespace_ast_keys({tag, keys}, ns)
-      when tag in [:del, :unlink, :exists, :mget, :sinter, :sunion, :sdiff, :pfcount] and
+      when tag in [:del, :unlink, :exists, :touch, :mget, :sinter, :sunion, :sdiff, :pfcount] and
              is_list(keys),
       do: {tag, namespace_keys(keys, ns)}
 
@@ -103,8 +103,16 @@ defmodule Ferricstore.Transaction.Ast do
       do: {tag, [namespace_key(destination, ns) | namespace_counted_keys(numkeys, rest, ns)]}
 
   def namespace_ast_keys({tag, [numkeys | rest]}, ns)
-      when tag in [:zunion, :zinter, :zdiff, :zintercard, :zmpop],
+      when tag in [:zunion, :zinter, :zdiff, :zintercard, :zmpop, :lmpop],
       do: {tag, namespace_counted_keys(numkeys, rest, ns)}
+
+  # SORT's patterns name keys too: a namespace prefixes them, so a sandbox's
+  # SORT reads only its own keys (`#` is the element itself).
+  def namespace_ast_keys({tag, [key | options]}, ns) when tag in [:sort, :sort_ro],
+    do: {tag, [namespace_key(key, ns) | namespace_sort_options(options, ns)]}
+
+  def namespace_ast_keys({:lcs, [key_a, key_b | options]}, ns),
+    do: {:lcs, [namespace_key(key_a, ns), namespace_key(key_b, ns) | options]}
 
   def namespace_ast_keys({:zrangestore, [destination, source | rest]}, ns),
     do: {:zrangestore, [namespace_key(destination, ns), namespace_key(source, ns) | rest]}
@@ -135,7 +143,7 @@ defmodule Ferricstore.Transaction.Ast do
 
   @spec compound_member_work_up_to(term(), non_neg_integer() | :unlimited) ::
           {:ok, non_neg_integer()} | :limit_exceeded | :invalid
-  def compound_member_work_up_to({:hset, [_key | pairs]}, limit),
+  def compound_member_work_up_to({tag, [_key | pairs]}, limit) when tag in [:hset, :hmset],
     do: count_pairs_up_to(pairs, limit, 0)
 
   def compound_member_work_up_to({tag, [_key | members]}, limit)
@@ -147,16 +155,16 @@ defmodule Ferricstore.Transaction.Ast do
       do: count_pairs_up_to(pairs, limit, 0)
 
   def compound_member_work_up_to({tag, _key, fields}, limit)
-      when tag in [:hexpiretime, :hgetdel, :hpersist, :hpttl, :httl] and
+      when tag in [:hexpiretime, :hpexpiretime, :hgetdel, :hpersist, :hpttl, :httl] and
              is_list(fields),
       do: count_items_up_to(fields, limit, 0)
 
   def compound_member_work_up_to({tag, _key, _ttl, fields}, limit)
-      when tag in [:hexpire, :hpexpire] and is_list(fields),
+      when tag in [:hexpire, :hpexpire, :hexpireat, :hpexpireat] and is_list(fields),
       do: count_items_up_to(fields, limit, 0)
 
   def compound_member_work_up_to({tag, _key, _ttl, _condition, fields}, limit)
-      when tag in [:hexpire, :hpexpire] and is_list(fields),
+      when tag in [:hexpire, :hpexpire, :hexpireat, :hpexpireat] and is_list(fields),
       do: count_items_up_to(fields, limit, 0)
 
   def compound_member_work_up_to({:hgetex, _key, _mode, fields}, limit)
@@ -195,6 +203,12 @@ defmodule Ferricstore.Transaction.Ast do
   defp count_pairs_up_to(_improper_tail, _remaining, _count), do: :invalid
 
   @spec derive_command_keys(term()) :: [binary()]
+  def derive_command_keys({tag, [key | _options] = args}) when tag in [:sort, :sort_ro] do
+    if tag == :sort,
+      do: [key | List.wrap(Ferricstore.Commands.Sort.store_destination(args))],
+      else: [key]
+  end
+
   def derive_command_keys(ast) do
     ast
     |> namespace_ast_keys(@derivation_namespace)
@@ -260,4 +274,15 @@ defmodule Ferricstore.Transaction.Ast do
       other -> other
     end)
   end
+
+  defp namespace_sort_options([option, value | rest], ns) do
+    if String.upcase(option) in ["BY", "STORE"] or
+         (String.upcase(option) == "GET" and value != "#") do
+      [option, namespace_key(value, ns) | namespace_sort_options(rest, ns)]
+    else
+      [option | namespace_sort_options([value | rest], ns)]
+    end
+  end
+
+  defp namespace_sort_options(options, _ns), do: options
 end

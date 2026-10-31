@@ -33,21 +33,23 @@ defmodule Ferricstore.Commands.KeyDiscovery do
         }
 
   @read_key_commands MapSet.new(~w(
+    SORT SORT_RO
+    LCS
     GET MGET GETRANGE STRLEN
     HGET HMGET HGETALL HKEYS HVALS HLEN HEXISTS HRANDFIELD HSCAN HSTRLEN HTTL HPTTL
-    HEXPIRETIME
+    HEXPIRETIME HPEXPIRETIME
     LRANGE LLEN LINDEX LPOS
     SMEMBERS SISMEMBER SMISMEMBER SCARD SRANDMEMBER SSCAN SINTER SUNION SDIFF SINTERCARD
     ZSCORE ZRANK ZREVRANK ZRANGE ZREVRANGE ZCARD ZCOUNT ZRANDMEMBER ZMSCORE ZSCAN
     ZRANGEBYSCORE ZREVRANGEBYSCORE ZUNION ZINTER ZDIFF ZINTERCARD ZRANGEBYLEX ZREVRANGEBYLEX
     ZLEXCOUNT
-    GETBIT BITCOUNT BITPOS PFCOUNT GEOHASH GEOPOS GEODIST GEOSEARCH
+    GETBIT BITCOUNT BITPOS BITFIELD_RO PFCOUNT GEOHASH GEOPOS GEODIST GEOSEARCH
     XLEN XRANGE XREVRANGE XREAD XINFO XPENDING
     BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO
     CMS.QUERY CMS.INFO TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO
     TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK
     TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO
-    EXISTS TYPE OBJECT MEMORY TTL PTTL EXPIRETIME PEXPIRETIME
+    EXISTS TOUCH TYPE OBJECT MEMORY TTL PTTL EXPIRETIME PEXPIRETIME
     KEY_INFO ROUTE ROUTE_BATCH CLUSTER.KEYSLOT FERRICSTORE.KEY_INFO FERRICSTORE.CAPABILITIES
     FERRICSTORE.TELEMETRY WATCH
     FLOW.GET FLOW.POLICY.GET FLOW.QUERY FLOW.INFO FLOW.STATS FLOW.ATTRIBUTES
@@ -62,15 +64,16 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   @write_key_commands MapSet.new(~w(
     SET SETNX SETEX PSETEX MSET MSETNX PIPELINE APPEND SETRANGE INCR DECR INCRBY DECRBY
     INCRBYFLOAT GETSET GETDEL GETEX
-    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX HEXPIRE HPEXPIRE HPERSIST HGETDEL HGETEX HSETEX
-    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX RPOPLPUSH
+    HSET HMSET HDEL HINCRBY HINCRBYFLOAT HSETNX HEXPIRE HPEXPIRE HPERSIST HGETDEL HGETEX HSETEX
+    HEXPIREAT HPEXPIREAT
+    LPUSH RPUSH LPOP RPOP LMPOP LSET LINSERT LTRIM LREM LMOVE LPUSHX RPUSHX RPOPLPUSH
     BLPOP BRPOP BLMOVE BLMPOP BZPOPMIN BZPOPMAX BZMPOP
     SADD SREM SPOP SMOVE SDIFFSTORE SINTERSTORE SUNIONSTORE
-    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX SETBIT BITOP PFADD PFMERGE GEOADD GEOSEARCHSTORE
+    ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX SETBIT BITFIELD BITOP PFADD PFMERGE GEOADD GEOSEARCHSTORE
     ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZRANGESTORE ZREMRANGEBYRANK ZREMRANGEBYSCORE
     ZREMRANGEBYLEX ZMPOP
     XADD XTRIM XDEL XGROUP XREADGROUP XACK XCLAIM XAUTOCLAIM XSETID
-    BF.RESERVE BF.ADD BF.MADD CF.RESERVE CF.ADD CF.ADDNX CF.DEL
+    BF.RESERVE BF.ADD BF.MADD BF.INSERT CF.RESERVE CF.ADD CF.ADDNX CF.INSERT CF.INSERTNX CF.DEL
     CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.MERGE
     TOPK.RESERVE TOPK.ADD TOPK.INCRBY
     TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE
@@ -92,15 +95,17 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   @read_write_key_commands MapSet.new(~w(
     SETNX MSETNX APPEND SETRANGE INCR DECR INCRBY DECRBY INCRBYFLOAT GETSET GETDEL GETEX
-    HSET HDEL HINCRBY HINCRBYFLOAT HSETNX HEXPIRE HPEXPIRE HPERSIST HGETDEL HGETEX HSETEX
-    LPUSH RPUSH LPOP RPOP LSET LINSERT LTRIM LREM LPUSHX RPUSHX BLPOP BRPOP BLMPOP
+    HSET HMSET HDEL HINCRBY HINCRBYFLOAT HSETNX HEXPIRE HPEXPIRE HPERSIST HGETDEL HGETEX HSETEX
+    HEXPIREAT HPEXPIREAT
+    LPUSH RPUSH LPOP RPOP LMPOP LSET LINSERT LTRIM LREM LPUSHX RPUSHX BLPOP BRPOP BLMPOP
     BZPOPMIN BZPOPMAX BZMPOP
-    SADD SREM SPOP ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX SETBIT PFADD GEOADD
+    SADD SREM SPOP ZADD ZREM ZINCRBY ZPOPMIN ZPOPMAX SETBIT BITFIELD PFADD GEOADD
     ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZMPOP
     XADD XTRIM XDEL XACK XREADGROUP XCLAIM XAUTOCLAIM XSETID
     EXPIRE PEXPIRE EXPIREAT PEXPIREAT PERSIST
     CAS LOCK UNLOCK EXTEND RATELIMIT.ADD FETCH_OR_COMPUTE FETCH_OR_COMPUTE_RESULT
-    FETCH_OR_COMPUTE_ERROR BF.ADD BF.MADD CF.ADD CF.ADDNX CF.DEL CMS.INCRBY
+    FETCH_OR_COMPUTE_ERROR BF.ADD BF.MADD BF.INSERT CF.ADD CF.ADDNX CF.INSERT CF.INSERTNX CF.DEL
+    CMS.INCRBY
     TOPK.ADD TOPK.INCRBY TDIGEST.ADD TDIGEST.RESET
   ))
 
@@ -225,12 +230,15 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
       discovery_metadata(command, ast, acl_keys)
 
+    pattern_keys = pattern_acl_keys(command, ast)
+    read_keys = read_keys ++ pattern_keys
+
     %{
       command: command,
       args: args,
       ast: ast,
       command_keys: command_keys(command, ast, discovered_keys),
-      acl_keys: acl_keys,
+      acl_keys: acl_keys ++ pattern_keys,
       channel_keys: channel_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
@@ -268,14 +276,23 @@ defmodule Ferricstore.Commands.KeyDiscovery do
       do: {:ok, []}
 
   def extract(command, [count | rest])
-      when command in ["SINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZMPOP"],
+      when command in ["SINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZMPOP", "LMPOP"],
       do: {:ok, counted_keys(count, rest)}
 
   def extract(command, [])
-      when command in ["SINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZMPOP"],
+      when command in ["SINTERCARD", "ZUNION", "ZINTER", "ZDIFF", "ZINTERCARD", "ZMPOP", "LMPOP"],
       do: {:ok, []}
 
   def extract("PFCOUNT", keys), do: {:ok, keys}
+  def extract("TOUCH", keys), do: {:ok, keys}
+  def extract("LCS", [key_a, key_b | _options]), do: {:ok, [key_a, key_b]}
+  def extract("LCS", keys), do: {:ok, keys}
+
+  def extract("SORT", [key | _options] = args),
+    do: {:ok, [key | List.wrap(Ferricstore.Commands.Sort.store_destination(args))]}
+
+  def extract(command, [key | _options]) when command in ["SORT", "SORT_RO"], do: {:ok, [key]}
+  def extract(command, []) when command in ["SORT", "SORT_RO"], do: {:ok, []}
 
   def extract("OBJECT", [subcommand, key | _args]) do
     if String.upcase(subcommand) in ["ENCODING", "FREQ", "IDLETIME", "REFCOUNT"] do
@@ -335,9 +352,12 @@ defmodule Ferricstore.Commands.KeyDiscovery do
     {read_keys, write_keys, routing_scope, routing_keys, transaction_mode} =
       discovery_metadata(command, ast, acl_keys)
 
+    pattern_keys = pattern_acl_keys(command, ast)
+    read_keys = read_keys ++ pattern_keys
+
     %{
       command_keys: command_keys(command, ast, discovered_keys),
-      acl_keys: acl_keys,
+      acl_keys: acl_keys ++ pattern_keys,
       channel_keys: channel_keys,
       routing_scope: routing_scope,
       routing_keys: routing_keys,
@@ -453,6 +473,15 @@ defmodule Ferricstore.Commands.KeyDiscovery do
 
   defp acl_resources(_command, discovered_keys), do: {discovered_keys, []}
 
+  # SORT's BY and GET patterns read keys named by the elements, which no
+  # check can list in advance: as in Redis, "*" asks for read access to every
+  # key. It is not routed or counted among the keys the command names.
+  defp pattern_acl_keys(command, {tag, args})
+       when command in ["SORT", "SORT_RO"] and tag in [:sort, :sort_ro] and is_list(args),
+       do: Ferricstore.Commands.Sort.pattern_acl_keys(args)
+
+  defp pattern_acl_keys(_command, _ast), do: []
+
   defp discovery_metadata(command, ast, acl_keys) do
     {read_keys, write_keys} = footprint(command, ast, acl_keys)
     {routing_scope, routing_keys} = routing(command, ast, acl_keys)
@@ -512,7 +541,7 @@ defmodule Ferricstore.Commands.KeyDiscovery do
   defp footprint(command, _ast, keys), do: footprint(command, keys)
 
   defp footprint(command, [source, destination | _rest])
-       when command == "COPY",
+       when command in ["COPY", "SORT"],
        do: {[source], [destination]}
 
   defp footprint("RENAMENX", [source, destination | _rest]) do

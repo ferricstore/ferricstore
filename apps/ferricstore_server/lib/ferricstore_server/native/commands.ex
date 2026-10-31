@@ -2549,7 +2549,8 @@ defmodule FerricstoreServer.Native.Commands do
       state.username,
       command,
       format_peer(state.peer),
-      state.client_id
+      state.client_id,
+      reason
     )
 
     {:error, :noperm, reason}
@@ -3083,6 +3084,13 @@ defmodule FerricstoreServer.Native.Commands do
   end
 
   defp auth_failure(username, state) do
+    FerricstoreServer.Acl.Log.record(
+      "auth",
+      "AUTH",
+      username,
+      "id=#{state.client_id} addr=#{format_peer(state.peer)}"
+    )
+
     AuditLog.log(:auth_failure, %{username: username, client_ip: format_peer(state.peer)})
   end
 

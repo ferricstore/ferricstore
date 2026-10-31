@@ -69,6 +69,29 @@ defmodule Ferricstore.Commands.Cuckoo do
 
   def handle("CF.ADD", args, store), do: cf_add_args(args, store)
   def handle("CF.ADDNX", args, store), do: cf_addnx_args(args, store)
+
+  # CF.INSERT / CF.INSERTNX key [CAPACITY capacity] [NOCREATE] ITEMS item
+  # [item ...]: CF.ADD (or CF.ADDNX) of each item, the first creating a
+  # missing filter with the capacity; NOCREATE refuses a missing filter
+  # first. Every add carries creation parameters, so a filter it finds
+  # missing is created, never refused (a missing file refused in apply stops
+  # a WARaft shard's apply until it restarts). An item the full filter cannot
+  # take answers -1, as in RedisBloom.
+  def handle(command, [key | args], store) when command in ["CF.INSERT", "CF.INSERTNX"] do
+    op = if command == "CF.INSERT", do: :cuckoo_add, else: :cuckoo_addnx
+
+    with {:ok, opts, items} <- parse_insert(command, args, %{capacity: nil, create: true}),
+         true <- Enum.all?(items, &is_binary/1) || @element_type_error,
+         :ok <- ProbType.check_expected(key, :cuckoo, store),
+         :ok <- insert_allowed(key, opts, store) do
+      params = %{capacity: opts.capacity || @default_capacity, bucket_size: @bucket_size}
+      insert_items(items, key, op, params, store, [])
+    end
+  end
+
+  def handle(command, _args, _store) when command in ["CF.INSERT", "CF.INSERTNX"],
+    do: insert_arity_error(command)
+
   def handle("CF.DEL", args, store), do: cf_del_args(args, store)
   def handle("CF.EXISTS", args, store), do: cf_exists_args(args, store)
   def handle("CF.MEXISTS", args, store), do: cf_mexists_args(args, store)
@@ -321,6 +344,59 @@ defmodule Ferricstore.Commands.Cuckoo do
   defp normalize_add_error(reason) do
     rendered = inspect(reason, limit: 20, printable_limit: 256)
     {:error, "ERR cuckoo add failed: #{rendered}"}
+  end
+
+  defp parse_insert(command, [option | rest], opts) do
+    case {String.upcase(option), rest} do
+      {"ITEMS", [_ | _] = items} ->
+        {:ok, opts, items}
+
+      {"CAPACITY", [raw | rest]} ->
+        with {:ok, capacity} <- parse_pos_integer(raw, "capacity"),
+             :ok <- validate_cuckoo_capacity(capacity),
+             do: parse_insert(command, rest, %{opts | capacity: capacity})
+
+      {"NOCREATE", rest} ->
+        parse_insert(command, rest, %{opts | create: false})
+
+      {name, _rest} when name in ["ITEMS", "CAPACITY"] ->
+        insert_arity_error(command)
+
+      _other ->
+        {:error, "ERR syntax error"}
+    end
+  end
+
+  defp parse_insert(command, [], _opts), do: insert_arity_error(command)
+
+  defp insert_arity_error(command),
+    do: {:error, "ERR wrong number of arguments for '#{String.downcase(command)}' command"}
+
+  defp insert_allowed(key, %{create: false}, store) do
+    if cuckoo_file_exists?(key, store), do: :ok, else: {:error, "ERR not found"}
+  end
+
+  defp insert_allowed(_key, _opts, _store), do: :ok
+
+  defp insert_items([], _key, _op, _params, _store, replies), do: Enum.reverse(replies)
+
+  defp insert_items([item | items], key, op, params, store, replies) do
+    case do_prob_write(store, {op, key, item, params}) do
+      {:ok, added} when added in [0, 1] ->
+        insert_items(items, key, op, params, store, [added | replies])
+
+      :ok ->
+        insert_items(items, key, op, params, store, [1 | replies])
+
+      {:error, "filter is full"} ->
+        insert_items(items, key, op, params, store, [-1 | replies])
+
+      {:error, reason} ->
+        normalize_add_error(reason)
+
+      other ->
+        other
+    end
   end
 
   defp missing_or_wrongtype(key, store, missing_result) do

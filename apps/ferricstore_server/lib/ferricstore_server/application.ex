@@ -37,6 +37,7 @@ defmodule FerricstoreServer.Application do
     Session.initialize_secret!()
     configure_management_adapters()
     FerricstoreServer.Connection.Registry.init_table()
+    FerricstoreServer.Acl.Log.init_table()
     FerricstoreServer.Native.Admission.init_table()
 
     children =

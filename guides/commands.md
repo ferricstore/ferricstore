@@ -22,10 +22,11 @@ FerricStore implements these command names and argument shapes across native TCP
 mode and the embedded API:
 
 GET, SET (EX/PX/EXAT/PXAT/NX/XX/GET/KEEPTTL), DEL, EXISTS, MGET, MSET, MSETNX, INCR, DECR, INCRBY, DECRBY, INCRBYFLOAT,
-APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE,
-HSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
-HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HGETDEL, HGETEX, HSETEX,
-LPUSH, RPUSH, LPOP, RPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
+APPEND, STRLEN, GETSET, GETDEL, GETEX, SETNX, SETEX, PSETEX, GETRANGE, SETRANGE, LCS,
+HSET, HMSET, HGET, HDEL, HMGET, HGETALL, HEXISTS, HKEYS, HVALS, HLEN, HINCRBY, HINCRBYFLOAT,
+HSETNX, HSTRLEN, HRANDFIELD, HSCAN, HEXPIRE, HTTL, HPERSIST, HPEXPIRE, HPTTL, HEXPIRETIME, HEXPIREAT,
+HPEXPIREAT, HPEXPIRETIME, HGETDEL, HGETEX, HSETEX,
+LPUSH, RPUSH, LPOP, RPOP, LMPOP, LRANGE, LLEN, LINDEX, LSET, LREM, LTRIM, LPOS, LINSERT, LMOVE, RPOPLPUSH, LPUSHX, RPUSHX,
 SADD, SREM, SMEMBERS, SISMEMBER, SMISMEMBER, SCARD, SRANDMEMBER, SPOP, SDIFF, SINTER, SUNION,
 SDIFFSTORE, SINTERSTORE, SUNIONSTORE, SINTERCARD, SMOVE, SSCAN,
 ZADD (NX/XX/GT/LT/CH/INCR), ZSCORE, ZRANK, ZREVRANK, ZRANGE, ZREVRANGE, ZCARD, ZREM, ZINCRBY,
@@ -36,10 +37,10 @@ XADD, XLEN, XRANGE, XREVRANGE, XREAD (including BLOCK), XTRIM, XDEL, XSETID, XIN
 XINFO GROUPS, XINFO CONSUMERS, XGROUP CREATE, XGROUP DESTROY, XGROUP CREATECONSUMER,
 XGROUP DELCONSUMER, XGROUP SETID, XREADGROUP, XACK, XPENDING, XCLAIM, XAUTOCLAIM,
 EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT, TTL, PTTL, PERSIST, EXPIRETIME, PEXPIRETIME,
-SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP,
+SETBIT, GETBIT, BITCOUNT, BITPOS, BITOP, BITFIELD, BITFIELD_RO,
 PFADD, PFCOUNT, PFMERGE,
 GEOADD, GEOPOS, GEODIST, GEOHASH, GEOSEARCH, GEOSEARCHSTORE,
-PING, ECHO, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
+PING, ECHO, TIME, LATENCY, DBSIZE, KEYS, FLUSHDB, FLUSHALL, INFO, TYPE, TOUCH, SORT, SORT_RO, UNLINK, RENAME, RENAMENX, COPY, RANDOMKEY,
 OBJECT HELP/REFCOUNT, SCAN, CONFIG GET/SET/RESETSTAT/REWRITE,
 SLOWLOG GET/LEN/RESET, COMMAND/COMMAND COUNT/COMMAND LIST/COMMAND INFO/COMMAND DOCS/COMMAND GETKEYS,
 MULTI, EXEC, DISCARD, WATCH, UNWATCH, SUBSCRIBE, UNSUBSCRIBE, PSUBSCRIBE, PUNSUBSCRIBE, PUBLISH,
@@ -266,8 +267,6 @@ These are FerricStore-native commands:
 ### Command Names Not Yet Supported
 
 `EVAL`, `EVALSHA`, `EVALSHA_RO`, `EVAL_RO` (Lua scripting),
-`LMPOP` (multi-key pop),
-`SORT`, `SORT_RO`,
 `OBJECT` extended subcommands (`OBJECT PERSIST`, `OBJECT COPY`),
 `CLUSTER` (full cluster command family),
 `DUMP`, `RESTORE`, `MIGRATE`, `MOVE`,
@@ -522,6 +521,22 @@ Overwrites part of a string starting at the given byte offset. If the key does n
 | **Elixir return** | `{:ok, integer()}` |
 | **Status** | Supported |
 
+### LCS
+
+The longest common subsequence of two strings (a missing key is an empty
+string). LEN answers its length; IDX answers the matching ranges, from the
+end, as `{"matches" => [[[a_start, a_end], [b_start, b_end]] ...], "len" =>
+length}`, with MINMATCHLEN dropping shorter ranges and WITHMATCHLEN adding
+each range's length. It takes O(len(a) * len(b)); strings whose lengths
+multiply past 16,777,216 are refused. The keys must share a hash slot. Inside
+MULTI it needs cluster feature level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `LCS key1 key2 [LEN] [IDX] [MINMATCHLEN len] [WITHMATCHLEN]` |
+| **Return** | Bulk string, integer (LEN) or map (IDX) |
+| **Status** | Supported |
+
 ---
 
 ## Hash Commands
@@ -538,6 +553,18 @@ Sets one or more field-value pairs. Returns the number of NEW fields added (not 
 | **Embedded API** | `FerricStore.hset(key, map)` |
 | **Return** | Integer -- count of new fields added |
 | **Elixir return** | `:ok` |
+| **Status** | Supported |
+
+### HMSET
+
+Sets one or more field-value pairs, as HSET does, and answers `OK`. Redis
+deprecates it in favor of HSET; FerricStore serves it for older clients.
+Inside MULTI it needs cluster feature level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `HMSET key field value [field value ...]` |
+| **Return** | Simple string `OK` |
 | **Status** | Supported |
 
 ### HGET
@@ -662,10 +689,15 @@ FerricStore supports per-field expiry on hash fields:
 | `HPEXPIRE` | `HPEXPIRE key ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE but milliseconds |
 | `HPTTL` | `HPTTL key FIELDS count field [field ...]` | Same as HTTL but milliseconds |
 | `HEXPIRETIME` | `HEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (seconds) |
+| `HEXPIREAT` | `HEXPIREAT key unix-seconds [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIRE; a time already past deletes the field (`2`) |
+| `HPEXPIREAT` | `HPEXPIREAT key unix-ms [NX\|XX\|GT\|LT] FIELDS count field [field ...]` | Same as HEXPIREAT but milliseconds |
+| `HPEXPIRETIME` | `HPEXPIRETIME key FIELDS count field [field ...]` | Absolute Unix timestamp (milliseconds) |
 | `HGETDEL` | `HGETDEL key FIELDS count field [field ...]` | List of values (nil for missing) |
 | `HGETEX` | `HGETEX key [EX sec\|PX ms\|EXAT ts\|PXAT ms\|PERSIST] FIELDS count field [...]` | List of values; a TTL of 0 or a past time deletes the fields |
 | `HSETEX` | `HSETEX key [FNX\|FXX] [EX sec\|PX ms\|EXAT ts\|PXAT ms\|KEEPTTL] FIELDS count field value [...]` | `1` when set, `0` when FNX/FXX refused; without an expiry option it clears the fields' TTL |
 | `HSETEX` (FerricStore form) | `HSETEX key seconds field value [field value ...]` | Count of new fields |
+
+Inside MULTI, HEXPIREAT, HPEXPIREAT and HPEXPIRETIME need cluster feature level 12.
 
 **Status:** Supported for native TCP and embedded command handlers.
 
@@ -740,6 +772,20 @@ Push only if the list already exists. Returns 0 if the key does not exist.
 | | |
 |---|---|
 | **Protocol command** | `LPUSHX key element [element ...]`, `RPUSHX key element [element ...]` |
+| **Status** | Supported |
+
+### LMPOP
+
+Pops up to `count` elements (one by default) from the first of the keys that
+holds a list with elements, and answers `[key, [element ...]]`, or nil when
+none has. The keys must share a hash slot. Of several keys, which one has
+elements is decided where the pops apply (from cluster feature level 12; one
+key's pop is a single write already). Inside MULTI it needs level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `LMPOP numkeys key [key ...] LEFT\|RIGHT [COUNT count]` |
+| **Return** | Array `[key, [element ...]]` or nil |
 | **Status** | Supported |
 
 ### BLPOP / BRPOP / BLMOVE / BLMPOP
@@ -1086,6 +1132,46 @@ Returns the type of a key as a simple string.
 | **Return** | Simple string: `string`, `hash`, `list`, `set`, `zset`, `stream`, or `none` |
 | **Status** | Supported |
 
+### TOUCH
+
+Counts the given keys that exist, as EXISTS does (a key given twice counts
+twice). A key's access time is tracked per node as it is read. Inside MULTI it
+needs cluster feature level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `TOUCH key [key ...]` |
+| **Return** | Integer |
+| **Status** | Supported |
+
+### SORT / SORT_RO
+
+Sorts the elements of a list, set or sorted set: as numbers (an element that
+is not one answers `ERR One or more scores can't be converted into double`),
+or as strings with ALPHA; DESC reverses, and ties sort by the element. BY
+sorts by weights read from keys named by a pattern (`weight_*`, or
+`hash_*->field` for a hash field; a missing weight counts as 0), and a BY
+pattern without `*` keeps a list's or sorted set's own order. GET answers
+values named by patterns instead of the elements (`#` is the element; a
+missing value is nil). LIMIT offset count takes a range of the result.
+
+As in Redis Cluster, a BY or GET pattern is taken only when the keys it names
+share the sorted key's hash slot (a `{tag}` before any wildcard), else `ERR BY
+option of SORT denied in Cluster mode ...`; and since those keys cannot be
+checked in advance, only a user with read access to every key may use one.
+
+SORT ... STORE replaces the destination (same slot) with the result as a
+list, or deletes it when the result is empty, and answers the count; a
+missing GET value is stored as an empty string. STORE needs cluster feature
+level 12, where the read and the write run as one-command transaction.
+SORT_RO refuses STORE. Inside MULTI both need level 12.
+
+| | |
+|---|---|
+| **Protocol command** | `SORT key [BY pattern] [LIMIT offset count] [GET pattern [GET pattern ...]] [ASC\|DESC] [ALPHA] [STORE destination]` |
+| **Return** | Array, or integer with STORE |
+| **Status** | Supported |
+
 ### RENAME / RENAMENX / COPY
 
 | Command | Syntax | Return | Notes |
@@ -1167,6 +1253,13 @@ Bitmap operations work at the bit level on string values. Bits are numbered MSB-
 | `BITCOUNT` | `BITCOUNT key [start end [BYTE\|BIT]]` | Integer (count of set bits) | Supported including BYTE/BIT mode |
 | `BITPOS` | `BITPOS key bit [start [end [BYTE\|BIT]]]` | Integer (position or -1) | Supported |
 | `BITOP` | `BITOP AND\|OR\|XOR\|NOT destkey key [key ...]` | Integer (dest string length) | Supported |
+| `BITFIELD` | `BITFIELD key [GET type offset] [SET type offset value] [INCRBY type offset increment] [OVERFLOW WRAP\|SAT\|FAIL] ...` | Array: per GET the field, per SET the old value, per INCRBY the new one (nil when OVERFLOW FAIL refused it) | Supported; SET and INCRBY need cluster feature level 12 |
+| `BITFIELD_RO` | `BITFIELD_RO key [GET type offset ...]` | Array of fields | Supported |
+
+BITFIELD types are `i1`..`i64` and `u1`..`u63`; an offset `#N` is N fields of
+the type. Its SET and INCRBY run as one compound entry from cluster feature
+level 12, keeping the key's TTL, and are refused below it; inside MULTI both
+commands need level 12.
 
 ---
 
@@ -1191,6 +1284,7 @@ Backed by mmap NIF resources. Each filter is a memory-mapped file at `data_dir/p
 | `BF.RESERVE` | `BF.RESERVE key error_rate capacity` | `+OK` or error | error_rate: (0,1), capacity: positive int |
 | `BF.ADD` | `BF.ADD key element` | `1` (added) or `0` | Auto-creates with defaults (0.01, 100) |
 | `BF.MADD` | `BF.MADD key element [element ...]` | Array of 1/0 | Auto-creates |
+| `BF.INSERT` | `BF.INSERT key [CAPACITY c] [ERROR e] [EXPANSION x] [NOCREATE] [NONSCALING] ITEMS item [item ...]` | Array of 1/0 | A missing filter is reserved with CAPACITY and ERROR (defaults 100, 0.01), or refused with `ERR not found` under NOCREATE; EXPANSION and NONSCALING are taken and change nothing |
 | `BF.EXISTS` | `BF.EXISTS key element` | `1` (may exist) or `0` | Returns 0 for non-existent keys |
 | `BF.MEXISTS` | `BF.MEXISTS key element [element ...]` | Array of 1/0 | Returns all 0s for non-existent keys |
 | `BF.CARD` | `BF.CARD key` | Integer | Items added count |
@@ -1209,6 +1303,8 @@ Backed by mmap NIF resources at `data_dir/prob/shard_N/KEY.cuckoo`. Supports del
 | `CF.RESERVE` | `CF.RESERVE key capacity` | `+OK` or error | Bucket size: 4 |
 | `CF.ADD` | `CF.ADD key element` | `1` or error (filter full) | Auto-creates with capacity 1024 |
 | `CF.ADDNX` | `CF.ADDNX key element` | `1` (added), `0` (already exists), or error | |
+| `CF.INSERT` | `CF.INSERT key [CAPACITY c] [NOCREATE] ITEMS item [item ...]` | Array: `1` added, `-1` filter full | A missing filter is created with CAPACITY (default 1024), or refused with `ERR not found` under NOCREATE |
+| `CF.INSERTNX` | `CF.INSERTNX key [CAPACITY c] [NOCREATE] ITEMS item [item ...]` | Array: `1` added, `0` may exist, `-1` full | As CF.INSERT, adding with CF.ADDNX |
 | `CF.DEL` | `CF.DEL key element` | `1` (deleted) or `0` (not found) | Deletes one occurrence |
 | `CF.EXISTS` | `CF.EXISTS key element` | `1` or `0` | |
 | `CF.MEXISTS` | `CF.MEXISTS key element [element ...]` | Array of 1/0 | |
@@ -1411,6 +1507,37 @@ Repair notes:
 
 ## Server Commands
 
+### TIME
+
+The answering node's clock: Unix seconds and the microseconds into that
+second, as two bulk strings. Not taken inside MULTI.
+
+| | |
+|---|---|
+| **Protocol command** | `TIME` |
+| **Return** | Array of two bulk strings |
+| **Status** | Supported |
+
+### LATENCY
+
+The latency monitor and latency histograms, as Redis keeps them, for the
+node that answers. With `CONFIG SET latency-monitor-threshold <ms>` above 0
+(0, off, is the default), a command that ran at least that long adds a
+sample to the `command` event (one per second, its worst; the latest 160
+kept). With `CONFIG SET latency-tracking yes` every command counts into its
+histogram of power-of-two microsecond buckets; FerricStore keeps it off by
+default (Redis keeps it on), so commands do not pay for it.
+
+| Subcommand | Return |
+|------------|--------|
+| `LATENCY LATEST` | `[[event, unix-seconds, latest-ms, max-ms], ...]` |
+| `LATENCY HISTORY event` | `[[unix-seconds, ms], ...]`, oldest first |
+| `LATENCY RESET [event ...]` | Integer: events reset (all without arguments) |
+| `LATENCY GRAPH event` | A text graph of the event's samples |
+| `LATENCY DOCTOR` | A text report |
+| `LATENCY HISTOGRAM [command ...]` | `{command => {"calls" => n, "histogram_usec" => {bucket => cumulative count}}}` |
+| `LATENCY HELP` | Help lines |
+
 ### PING / ECHO
 
 | Command | Syntax | Return |
@@ -1533,6 +1660,10 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 | `ACL WHOAMI` | `ACL WHOAMI` | Current user |
 | `ACL SAVE` | `ACL SAVE` | Persist ACL to file |
 | `ACL LOAD` | `ACL LOAD` | Load ACL from file |
+| `ACL CAT` | `ACL CAT [category]` | Category names, or the commands in a category |
+| `ACL GENPASS` | `ACL GENPASS [bits]` | A random password: hex of `bits` (default 256) strong random bits |
+| `ACL LOG` | `ACL LOG [count \| RESET]` | This node's latest ACL denials and failed AUTHs, newest first (count, reason, context, object, username, age-seconds, client-info, entry-id, timestamps); repeats within 60 s count on one entry; keeps 128 |
+| `ACL DRYRUN` | `ACL DRYRUN username command [arg ...]` | `OK`, or why the user may not run the command or touch a key, without running it |
 | `AUTH` | `AUTH [username] password` | Authenticate connection |
 
 ---

@@ -32,8 +32,20 @@ defmodule FerricstoreServer.Acl.Protection do
     end
   end
 
-  @spec log_command_denied(binary(), binary(), binary(), term()) :: :ok
-  def log_command_denied(username, command, client_ip, client_id) do
+  @doc """
+  Logs a denied command to the ACL LOG (always) and the audit log (when it
+  is on). `reason` is the denial's NOPERM text: it tells a key or channel
+  denial from a command one.
+  """
+  @spec log_command_denied(binary(), binary(), binary(), term(), binary() | nil) :: :ok
+  def log_command_denied(username, command, client_ip, client_id, reason \\ nil) do
+    FerricstoreServer.Acl.Log.record(
+      denial_reason(reason),
+      String.downcase(to_string(command)),
+      username,
+      "id=#{client_id} addr=#{client_ip}"
+    )
+
     AuditLog.log(:command_denied, %{
       username: username,
       command: command,
@@ -42,6 +54,16 @@ defmodule FerricstoreServer.Acl.Protection do
       timestamp: System.system_time(:millisecond)
     })
   end
+
+  defp denial_reason(reason) when is_binary(reason) do
+    cond do
+      String.contains?(reason, "one of the keys") -> "key"
+      String.contains?(reason, "one of the channels") -> "channel"
+      true -> "command"
+    end
+  end
+
+  defp denial_reason(_reason), do: "command"
 
   defp requirepass_configured? do
     app_configured?() or runtime_configured?()

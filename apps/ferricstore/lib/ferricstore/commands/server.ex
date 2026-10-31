@@ -454,6 +454,17 @@ defmodule Ferricstore.Commands.Server do
 
   def handle("LASTSAVE", [], _store), do: last_save_time()
 
+  # TIME: the node's clock, as seconds and the microseconds into that second.
+  def handle("TIME", [], _store) do
+    now_us = System.os_time(:microsecond)
+    [Integer.to_string(div(now_us, 1_000_000)), Integer.to_string(rem(now_us, 1_000_000))]
+  end
+
+  def handle("TIME", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'time' command"}
+
+  def handle("LATENCY", args, _store), do: Ferricstore.LatencyMonitor.command(args)
+
   def handle("LASTSAVE", _args, _store) do
     {:error, "ERR wrong number of arguments for 'lastsave' command"}
   end

@@ -97,7 +97,7 @@ defmodule FerricstoreServer.Native.Session do
             :ok
 
           {:error, command, reason} ->
-            log_acl_denial(state, command)
+            log_acl_denial(state, command, reason)
             {:error, :noperm, reason}
         end
     end
@@ -130,14 +130,14 @@ defmodule FerricstoreServer.Native.Session do
               :ok
             else
               {:error, acl_command, reason} ->
-                log_acl_denial(state, acl_command)
+                log_acl_denial(state, acl_command, reason)
                 {:error, :noperm, reason}
 
               {:error, reason} ->
                 audit_command =
                   ConnAuth.acl_command_name(prepared.command, prepared.args, prepared.ast)
 
-                log_acl_denial(state, audit_command)
+                log_acl_denial(state, audit_command, reason)
                 {:error, :noperm, reason}
             end
 
@@ -852,12 +852,13 @@ defmodule FerricstoreServer.Native.Session do
   defp subscription_entry_bytes(value),
     do: byte_size(value) + @subscription_entry_overhead_bytes
 
-  defp log_acl_denial(state, command) do
+  defp log_acl_denial(state, command, reason) do
     Protection.log_command_denied(
       Map.get(state, :username),
       command,
       format_peer(Map.get(state, :peer)),
-      Map.get(state, :client_id)
+      Map.get(state, :client_id),
+      reason
     )
   end
 

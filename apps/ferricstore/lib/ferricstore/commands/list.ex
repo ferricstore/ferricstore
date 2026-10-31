@@ -4,7 +4,9 @@ defmodule Ferricstore.Commands.List do
   """
 
   alias Ferricstore.CrossShardOp
+  alias Ferricstore.Commands.Blocking
   alias Ferricstore.Store.{ListOps, Ops, TypeRegistry}
+  alias Ferricstore.Transaction.SingleCommand
 
   @spec handle(binary(), [binary()], map()) :: term()
   def handle(cmd, args, store)
@@ -178,6 +180,19 @@ defmodule Ferricstore.Commands.List do
   end
 
   def handle("RPUSHX", _, _), do: {:error, "ERR wrong number of arguments for 'rpushx' command"}
+
+  # LMPOP numkeys key [key ...] LEFT|RIGHT [COUNT count]: pops from the first
+  # key with elements. Of several keys, which one has elements is decided
+  # where the pops apply, as one-command transaction from feature level 12
+  # (a node that has not applied the latest push cannot pick an earlier key);
+  # one key's pop is a single write already.
+  def handle("LMPOP", [_numkeys, _key, _direction | _] = args, store) do
+    with {:ok, keys, direction, count} <- Blocking.parse_lmpop_args(args) do
+      lmpop(keys, direction, count, args, store)
+    end
+  end
+
+  def handle("LMPOP", _, _), do: {:error, "ERR wrong number of arguments for 'lmpop' command"}
 
   @doc false
   def handle_ast(ast, store)
@@ -568,5 +583,27 @@ defmodule Ferricstore.Commands.List do
           end
       end
     end
+  end
+
+  defp lmpop([_key] = keys, direction, count, _args, store),
+    do: lmpop_here(keys, direction, count, store)
+
+  defp lmpop(keys, direction, count, args, store) do
+    case SingleCommand.run(store, "LMPOP", args, level: 12) do
+      :fallback -> lmpop_here(keys, direction, count, store)
+      answer -> answer
+    end
+  end
+
+  defp lmpop_here(keys, direction, count, store) do
+    pop = if direction == :left, do: "LPOP", else: "RPOP"
+
+    Enum.reduce_while(keys, nil, fn key, nil ->
+      case handle(pop, [key, Integer.to_string(count)], store) do
+        empty when empty in [nil, []] -> {:cont, nil}
+        [_ | _] = elements -> {:halt, [key, elements]}
+        error -> {:halt, error}
+      end
+    end)
   end
 end

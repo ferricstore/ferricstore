@@ -99,7 +99,9 @@ defmodule Ferricstore.Commands.Hash.Helpers do
 
   @field_expire_units %{
     "hexpire" => :ex,
-    "hpexpire" => :px
+    "hpexpire" => :px,
+    "hexpireat" => :exat,
+    "hpexpireat" => :pxat
   }
   @time_options %{"EX" => :ex, "PX" => :px, "EXAT" => :exat, "PXAT" => :pxat}
 

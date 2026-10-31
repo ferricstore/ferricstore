@@ -104,19 +104,29 @@ defmodule Ferricstore.Commands.Blocking do
           | {:error, binary()}
   def parse_blmpop_args([timeout_str, numkeys_str | rest]) when rest != [] do
     with {:ok, timeout_ms} <- parse_timeout(timeout_str),
-         {:ok, numkeys} <- positive_count(numkeys_str, "numkeys"),
+         {:ok, keys, direction, count} <- parse_lmpop_args([numkeys_str | rest]) do
+      {:ok, keys, direction, count, timeout_ms}
+    end
+  end
+
+  def parse_blmpop_args(_args) do
+    {:error, "ERR wrong number of arguments for 'blmpop' command"}
+  end
+
+  @doc """
+  Parses LMPOP arguments, `numkeys key [key ...] LEFT|RIGHT [COUNT count]`,
+  into `{:ok, keys, direction, count}`.
+  """
+  @spec parse_lmpop_args([binary()]) ::
+          {:ok, [binary()], :left | :right, pos_integer()} | {:error, binary()}
+  def parse_lmpop_args([numkeys_str | rest]) when rest != [] do
+    with {:ok, numkeys} <- positive_count(numkeys_str, "numkeys"),
          true <- length(rest) >= numkeys + 1 do
-      {keys, dir_and_opts} = Enum.split(rest, numkeys)
+      {keys, [dir_str | count_opts]} = Enum.split(rest, numkeys)
 
-      case dir_and_opts do
-        [dir_str | count_opts] ->
-          with {:ok, direction} <- parse_direction(dir_str),
-               {:ok, count} <- parse_blmpop_count(count_opts) do
-            {:ok, keys, direction, count, timeout_ms}
-          end
-
-        _ ->
-          {:error, "ERR syntax error"}
+      with {:ok, direction} <- parse_direction(dir_str),
+           {:ok, count} <- parse_blmpop_count(count_opts) do
+        {:ok, keys, direction, count}
       end
     else
       false -> {:error, "ERR syntax error"}
@@ -124,9 +134,7 @@ defmodule Ferricstore.Commands.Blocking do
     end
   end
 
-  def parse_blmpop_args(_args) do
-    {:error, "ERR wrong number of arguments for 'blmpop' command"}
-  end
+  def parse_lmpop_args(_args), do: {:error, "ERR wrong number of arguments for 'lmpop' command"}
 
   @doc """
   Parses BZPOPMIN/BZPOPMAX arguments, `key [key ...] timeout`, into

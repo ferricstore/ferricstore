@@ -71,6 +71,18 @@ defmodule Ferricstore.Commands.Generic do
   end
 
   # ---------------------------------------------------------------------------
+  # TOUCH -- counts the keys that exist, as EXISTS does (a key's access is
+  # tracked per node, on reads)
+  # ---------------------------------------------------------------------------
+
+  def handle("TOUCH", [], _store) do
+    {:error, "ERR wrong number of arguments for 'touch' command"}
+  end
+
+  def handle("TOUCH", keys, store),
+    do: Ferricstore.Commands.Strings.handle_ast({:exists, keys}, store)
+
+  # ---------------------------------------------------------------------------
   # UNLINK (same semantics as DEL -- async reclaim deferred to merge)
   # ---------------------------------------------------------------------------
 

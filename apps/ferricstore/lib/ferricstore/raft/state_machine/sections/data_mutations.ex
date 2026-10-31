@@ -1270,9 +1270,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
         :exists?
       ]
 
-      # A TDIGEST digest is a plain value: its handler reads and writes the key
-      # itself, as the HyperLogLog handlers do (`build_string_value_store/1`).
-      defp compound_command_store(state, Ferricstore.Commands.TDigest) do
+      # A TDIGEST digest and a BITFIELD string are plain values: their handlers
+      # read and write the key itself, as the HyperLogLog handlers do
+      # (`build_string_value_store/1`).
+      defp compound_command_store(state, handler)
+           when handler in [Ferricstore.Commands.TDigest, Ferricstore.Commands.Bitfield] do
         value_store = build_string_value_store(state)
 
         state
@@ -1538,6 +1540,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
       defp compound_command_handler(key, {:persist, key}) when is_binary(key),
         do: {:ok, Ferricstore.Commands.Expiry}
 
+      defp compound_command_handler(key, {:bitfield, key, args})
+           when is_binary(key) and is_list(args),
+           do: binaries_handler(args, Ferricstore.Commands.Bitfield)
+
       defp compound_command_handler(_key, _ast), do: {:error, "ERR invalid compound command"}
 
       defp expire_flag?(flag) when flag in [:nx, :xx, :gt, :lt], do: true
@@ -1579,9 +1585,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
           else: {:error, "ERR this command requires cluster feature level 6"}
       end
 
-      # PEXPIREAT and PERSIST joined the entry at level 12.
+      # PEXPIREAT, PERSIST and BITFIELD joined the entry at level 12.
       defp require_compound_command_level(state, ast)
-           when elem(ast, 0) in [:pexpireat, :persist] do
+           when elem(ast, 0) in [:pexpireat, :persist, :bitfield] do
         if feature_level_12?(state),
           do: :ok,
           else: {:error, "ERR this command requires cluster feature level 12"}

@@ -233,6 +233,7 @@ defmodule Ferricstore.Application do
             Ferricstore.SharedTables,
             Ferricstore.Stats,
             Ferricstore.SlowLog,
+            Ferricstore.LatencyMonitor,
             Ferricstore.Stream.ActivityLog,
             Ferricstore.PubSub.ActivityLog,
             Ferricstore.AuditLog,

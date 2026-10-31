@@ -153,6 +153,9 @@ defmodule Ferricstore.KeyspaceNotifications do
     "BLPOP" => "lpop",
     "BRPOP" => "rpop",
     "BLMPOP" => "lpop",
+    "LMPOP" => "lpop",
+    "SORT" => "sortstore",
+    "BITFIELD" => "setbit",
     "BZPOPMIN" => "zpopmin",
     "BZPOPMAX" => "zpopmax",
     "BZMPOP" => "zpopmin",
@@ -165,6 +168,7 @@ defmodule Ferricstore.KeyspaceNotifications do
     "SINTERSTORE" => "sinterstore",
     "SUNIONSTORE" => "sunionstore",
     "HSET" => "hset",
+    "HMSET" => "hset",
     "HSETNX" => "hset",
     "HDEL" => "hdel",
     "HINCRBY" => "hincrby",
@@ -173,6 +177,8 @@ defmodule Ferricstore.KeyspaceNotifications do
     "HGETDEL" => "hdel",
     "HEXPIRE" => "hexpire",
     "HPEXPIRE" => "hexpire",
+    "HEXPIREAT" => "hexpire",
+    "HPEXPIREAT" => "hexpire",
     "HPERSIST" => "hpersist",
     "ZADD" => "zadd",
     "ZREM" => "zrem",
@@ -203,7 +209,7 @@ defmodule Ferricstore.KeyspaceNotifications do
   @zero_result_noop ~w(SETNX MSETNX DEL UNLINK EXPIRE PEXPIRE EXPIREAT PEXPIREAT
     PERSIST RENAMENX COPY HSETNX HDEL LPUSHX RPUSHX SADD SREM SMOVE ZREM LREM PFADD
     XDEL XTRIM)
-  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP
+  @nil_result_noop ~w(GETDEL LPOP RPOP SPOP SET LMOVE RPOPLPUSH BLMOVE BLPOP BRPOP BLMPOP LMPOP
     BZPOPMIN BZPOPMAX BZMPOP ZMPOP)
   @empty_list_result_noop ~w(LPOP RPOP SPOP ZPOPMIN ZPOPMAX)
 
@@ -307,8 +313,45 @@ defmodule Ferricstore.KeyspaceNotifications do
     end
   end
 
-  defp notify_event(command, _event, _args, _result) when command in ~w(BLPOP BRPOP BLMPOP),
-    do: :ok
+  # SORT ... STORE fires on its destination when it stored elements.
+  defp notify_event("SORT", event, args, count) when is_integer(count) and count > 0 do
+    case Ferricstore.Commands.Sort.store_destination(args) do
+      destination when is_binary(destination) -> notify_key(destination, event)
+      nil -> :ok
+    end
+  end
+
+  defp notify_event("SORT", _event, _args, _result), do: :ok
+
+  # BITFIELD fires when a SET or INCRBY ran (FAIL overflows answer nil).
+  defp notify_event("BITFIELD", event, [key | args], replies) when is_list(replies) do
+    case Ferricstore.Commands.Bitfield.parse(args, :write) do
+      {:ok, ops} ->
+        wrote? =
+          ops
+          |> Enum.zip(replies)
+          |> Enum.any?(fn {op, reply} -> elem(op, 0) != :get and reply != nil end)
+
+        if wrote?, do: notify_key(key, event), else: :ok
+
+      {:error, _reason} ->
+        :ok
+    end
+  end
+
+  defp notify_event("BITFIELD", _event, _args, _result), do: :ok
+
+  defp notify_event("LMPOP", _event, args, [key, _popped]) do
+    case Ferricstore.Commands.Blocking.parse_lmpop_args(args) do
+      {:ok, _keys, :right, _count} -> notify_key(key, "rpop")
+      {:ok, _keys, :left, _count} -> notify_key(key, "lpop")
+      _invalid -> :ok
+    end
+  end
+
+  defp notify_event(command, _event, _args, _result)
+       when command in ~w(BLPOP BRPOP BLMPOP LMPOP),
+       do: :ok
 
   # The sorted-set pops name the key they served in their reply; ZMPOP and
   # BZMPOP fire the event of the side they popped.
@@ -329,7 +372,7 @@ defmodule Ferricstore.KeyspaceNotifications do
   # The field TTL commands answer one code per field: 1 when they changed
   # its expiry, and for HEXPIRE 2 when a TTL of 0 deleted it.
   defp notify_event(command, event, [key | _rest], codes)
-       when command in ~w(HEXPIRE HPEXPIRE) and is_list(codes) do
+       when command in ~w(HEXPIRE HPEXPIRE HEXPIREAT HPEXPIREAT) and is_list(codes) do
     if 1 in codes, do: notify_key(key, event)
     if 2 in codes, do: notify_key(key, "hdel")
     :ok

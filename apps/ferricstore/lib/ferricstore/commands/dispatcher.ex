@@ -55,17 +55,17 @@ defmodule Ferricstore.Commands.Dispatcher do
 
   @string_raw_commands ~w(GET SET DEL EXISTS MGET MSET INCR DECR INCRBY DECRBY INCRBYFLOAT APPEND STRLEN GETSET GETDEL GETEX SETNX SETEX PSETEX GETRANGE SETRANGE MSETNX)
   @expiry_raw_commands ~w(EXPIRE PEXPIRE EXPIREAT PEXPIREAT TTL PTTL PERSIST)
-  @list_raw_commands ~w(LPUSH RPUSH LPOP RPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE RPOPLPUSH LPUSHX RPUSHX)
-  @hash_raw_commands ~w(HSET HDEL HMGET HGET HGETALL HEXISTS HKEYS HVALS HLEN HSETNX HSTRLEN HSCAN HINCRBY HINCRBYFLOAT HRANDFIELD HEXPIRE HPEXPIRE HGETEX HSETEX HTTL HPTTL HPERSIST HEXPIRETIME HGETDEL)
+  @list_raw_commands ~w(LPUSH RPUSH LPOP RPOP LMPOP LRANGE LLEN LINDEX LSET LREM LTRIM LPOS LINSERT LMOVE RPOPLPUSH LPUSHX RPUSHX)
+  @hash_raw_commands ~w(HSET HMSET HDEL HMGET HGET HGETALL HEXISTS HKEYS HVALS HLEN HSETNX HSTRLEN HSCAN HINCRBY HINCRBYFLOAT HRANDFIELD HEXPIRE HPEXPIRE HGETEX HSETEX HTTL HPTTL HPERSIST HEXPIRETIME HGETDEL HEXPIREAT HPEXPIREAT HPEXPIRETIME)
   @set_raw_commands ~w(SADD SREM SMISMEMBER SINTER SUNION SDIFF SDIFFSTORE SINTERSTORE SUNIONSTORE SMEMBERS SCARD SISMEMBER SRANDMEMBER SPOP SMOVE SSCAN SINTERCARD)
   @zset_raw_commands ~w(ZADD ZREM ZSCORE ZRANK ZREVRANK ZCARD ZINCRBY ZCOUNT ZPOPMIN ZPOPMAX ZRANDMEMBER ZMSCORE ZRANGE ZREVRANGE ZSCAN ZRANGEBYSCORE ZREVRANGEBYSCORE ZUNION ZINTER ZDIFF ZUNIONSTORE ZINTERSTORE ZDIFFSTORE ZINTERCARD ZRANGESTORE ZRANGEBYLEX ZREVRANGEBYLEX ZLEXCOUNT ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREMRANGEBYLEX ZMPOP)
   @bitmap_raw_commands ~w(GETBIT SETBIT BITCOUNT BITPOS BITOP)
-  @generic_raw_commands ~w(TYPE UNLINK RENAME RENAMENX COPY RANDOMKEY SCAN EXPIRETIME PEXPIRETIME OBJECT WAIT)
-  @server_raw_commands ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR)
+  @generic_raw_commands ~w(TYPE TOUCH UNLINK RENAME RENAMENX COPY RANDOMKEY SCAN EXPIRETIME PEXPIRETIME OBJECT WAIT)
+  @server_raw_commands ~w(PING ECHO TIME LATENCY DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR)
   @stream_raw_commands ~w(XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK XPENDING XCLAIM XAUTOCLAIM XSETID)
   @geo_raw_commands ~w(GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE)
   @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
-  @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
+  @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.INSERT CF.INSERT CF.INSERTNX BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
   @tdigest_rmw_commands ~w(TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.MERGE)
   @conditional_zadd_flags ~w(NX XX GT LT)
   @latched_commands ~w(HSETNX ZADD GEOADD HGETDEL SMOVE EXPIRE PEXPIRE EXPIREAT PEXPIREAT)
@@ -97,6 +97,11 @@ defmodule Ferricstore.Commands.Dispatcher do
     "PSETEX" => 4,
     "GETRANGE" => 4,
     "SETRANGE" => 4,
+    "LCS" => -3,
+    "SORT" => -2,
+    "SORT_RO" => -2,
+    "BITFIELD" => -2,
+    "BITFIELD_RO" => -2,
     "EXPIRE" => -3,
     "PEXPIRE" => -3,
     "EXPIREAT" => -3,
@@ -127,7 +132,10 @@ defmodule Ferricstore.Commands.Dispatcher do
     "LINSERT" => 5,
     "LMOVE" => 5,
     "RPOPLPUSH" => 3,
+    "LMPOP" => -4,
     "HSET" => -4,
+    "HMSET" => -4,
+    "TOUCH" => -2,
     "HGET" => 3,
     "HDEL" => -3,
     "HMGET" => -3,
@@ -148,6 +156,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     "HPTTL" => -5,
     "HPERSIST" => -5,
     "HEXPIRETIME" => -5,
+    "HEXPIREAT" => -6,
+    "HPEXPIREAT" => -6,
+    "HPEXPIRETIME" => -5,
     "HGETDEL" => -5,
     "HGETEX" => -5,
     "SADD" => -3,
@@ -227,7 +238,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
   )
-  @raw_fallback_ast_tags ~w(bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending xclaim xautoclaim xsetid geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @raw_fallback_ast_tags ~w(hmset touch time latency lmpop lcs sort sort_ro bitfield bitfield_ro bf_insert cf_insert cf_insertnx bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending xclaim xautoclaim xsetid geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
@@ -252,6 +263,11 @@ defmodule Ferricstore.Commands.Dispatcher do
     psetex: "psetex",
     getrange: "getrange",
     setrange: "setrange",
+    lcs: "lcs",
+    sort: "sort",
+    sort_ro: "sort_ro",
+    bitfield: "bitfield",
+    bitfield_ro: "bitfield_ro",
     msetnx: "msetnx",
     expire: "expire",
     pexpire: "pexpire",
@@ -276,7 +292,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     lpushx: "lpushx",
     rpushx: "rpushx",
     rpoplpush: "rpoplpush",
+    lmpop: "lmpop",
     hset: "hset",
+    hmset: "hmset",
     hget: "hget",
     hdel: "hdel",
     hmget: "hmget",
@@ -297,6 +315,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     hpexpire: "hpexpire",
     hpttl: "hpttl",
     hexpiretime: "hexpiretime",
+    hexpireat: "hexpireat",
+    hpexpireat: "hpexpireat",
+    hpexpiretime: "hpexpiretime",
     hgetdel: "hgetdel",
     hgetex: "hgetex",
     hsetex: "hsetex",
@@ -355,6 +376,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     bitpos: "bitpos",
     bitop: "bitop",
     type: "type",
+    touch: "touch",
+    time: "time",
+    latency: "latency",
     unlink: "unlink",
     rename: "rename",
     renamenx: "renamenx",
@@ -389,6 +413,9 @@ defmodule Ferricstore.Commands.Dispatcher do
     bf_reserve: "bf.reserve",
     bf_add: "bf.add",
     bf_madd: "bf.madd",
+    bf_insert: "bf.insert",
+    cf_insert: "cf.insert",
+    cf_insertnx: "cf.insertnx",
     bf_exists: "bf.exists",
     bf_mexists: "bf.mexists",
     bf_card: "bf.card",
@@ -551,15 +578,16 @@ defmodule Ferricstore.Commands.Dispatcher do
       do: Hash.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _} = ast, store)
-      when tag in ~w(hget hexists hstrlen hrandfield hscan hexpire hpexpire httl hpersist hpttl hexpiretime hgetdel hgetex)a,
+      when tag in ~w(hget hexists hstrlen hrandfield hscan hexpire hpexpire httl hpersist hpttl hexpiretime hpexpiretime hgetdel hgetex)a,
       do: Hash.handle_ast(ast, store)
 
   def dispatch_ast({tag, _, _, _} = ast, store)
-      when tag in ~w(hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hgetex hsetex)a,
+      when tag in ~w(hincrby hincrbyfloat hsetnx hrandfield hscan hexpire hpexpire hexpireat hpexpireat hgetex hsetex)a,
       do: Hash.handle_ast(ast, store)
 
-  def dispatch_ast({tag, _, _, _, _} = ast, store) when tag in ~w(hexpire hpexpire)a,
-    do: Hash.handle_ast(ast, store)
+  def dispatch_ast({tag, _, _, _, _} = ast, store)
+      when tag in ~w(hexpire hpexpire hexpireat hpexpireat)a,
+      do: Hash.handle_ast(ast, store)
 
   def dispatch_ast({tag, _} = ast, store)
       when tag in ~w(sadd srem smembers smismember scard sinter sunion sdiff sdiffstore sinterstore sunionstore sintercard srandmember spop)a,
@@ -907,6 +935,9 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp dispatch_raw_handler(cmd, args, store) do
     cond do
       cmd in @string_raw_commands -> Strings.handle(cmd, args, store)
+      cmd == "LCS" -> Ferricstore.Commands.Lcs.handle(args, store)
+      cmd in ["SORT", "SORT_RO"] -> Ferricstore.Commands.Sort.handle(cmd, args, store)
+      cmd in ["BITFIELD", "BITFIELD_RO"] -> Ferricstore.Commands.Bitfield.handle(cmd, args, store)
       cmd in @expiry_raw_commands -> Expiry.handle(cmd, args, store)
       cmd in @list_raw_commands -> List.handle(cmd, args, store)
       cmd in @hash_raw_commands -> Hash.handle(cmd, args, store)
@@ -1103,6 +1134,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   defp log_raw_dispatch(cmd, args, start) do
     duration = System.monotonic_time(:microsecond) - start
     Ferricstore.SlowLog.maybe_log([cmd | args], duration)
+    Ferricstore.LatencyMonitor.record(cmd, duration)
   end
 
   defp authorize_public_keys(cmd, keys), do: InternalKey.authorize_command(cmd, keys)

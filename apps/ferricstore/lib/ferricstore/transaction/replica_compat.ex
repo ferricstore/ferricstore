@@ -15,7 +15,8 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   HEXPIRE ... NX, or refuse, such as PFMERGE with no source and HEXPIRE with
   a TTL of 0. Level 10 adds ZUNION, ZINTER, ZDIFF, their STORE forms,
   ZINTERCARD, ZRANGESTORE, ZRANGEBYLEX, ZREVRANGEBYLEX, ZLEXCOUNT, the
-  ZREMRANGEBY* commands and ZMPOP, which releases before it do not have.
+  ZREMRANGEBY* commands and ZMPOP, which releases before it do not have, and
+  level 12 the commands added with it (HMSET, TOUCH, ...).
   """
 
   alias Ferricstore.Cluster.FeatureLevel
@@ -40,6 +41,20 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
     :zmpop
   ]
   @field_expiry_tags [:hexpire, :hpexpire]
+  # Level 12: commands older releases do not have.
+  @level_12_tags [
+    :hmset,
+    :touch,
+    :hexpireat,
+    :hpexpireat,
+    :hpexpiretime,
+    :lmpop,
+    :lcs,
+    :sort,
+    :sort_ro,
+    :bitfield,
+    :bitfield_ro
+  ]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
   @spec level_4_form?(term()) :: boolean()
@@ -49,7 +64,11 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   The cluster feature level a parsed command needs inside MULTI, or nil for a
   form every release applies.
   """
-  @spec required_level(term()) :: 4 | 5 | 6 | 10 | nil
+  @spec required_level(term()) :: 4 | 5 | 6 | 10 | 12 | nil
+  def required_level(ast)
+      when is_tuple(ast) and tuple_size(ast) > 1 and elem(ast, 0) in @level_12_tags,
+      do: 12
+
   def required_level({tag, _key, _time, flags}) when tag in @expiry_tags and is_list(flags),
     do: 4
 

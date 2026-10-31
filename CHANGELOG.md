@@ -4,6 +4,49 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New command: LATENCY (LATEST, HISTORY, RESET, GRAPH, DOCTOR, HISTOGRAM,
+  HELP), with the `latency-monitor-threshold` (milliseconds, 0 = off) and
+  `latency-tracking` (default `no`, unlike Redis, so commands do not pay for
+  it) CONFIG parameters.
+
+- New ACL subcommands: ACL CAT, GENPASS, LOG and DRYRUN, as Redis answers
+  them. ACL LOG keeps this node's latest 128 ACL denials and failed AUTHs
+  (always on, unlike the audit log), counting repeats within 60 seconds on
+  one entry.
+
+- New commands: BF.INSERT, CF.INSERT and CF.INSERTNX, as RedisBloom answers
+  them: a missing filter is created with CAPACITY (and ERROR) or, under
+  NOCREATE, refused with `ERR not found`; a full cuckoo filter answers -1 for
+  the items it could not take.
+
+- New commands: BITFIELD and BITFIELD_RO (GET, SET, INCRBY, OVERFLOW
+  WRAP/SAT/FAIL on i1..i64 and u1..u63 fields), as Redis answers them.
+  BITFIELD's writes read and write the string in one compound entry from
+  cluster feature level 12, and are refused below it.
+
+- New commands: SORT and SORT_RO, with BY, LIMIT, GET, ASC/DESC, ALPHA and
+  (SORT) STORE, as Redis in cluster mode answers them: BY and GET patterns
+  must name keys in the sorted key's slot, and need read access to every key.
+  STORE needs cluster feature level 12, where it runs as one-command
+  transaction; inside MULTI both need level 12.
+
+- New command: LCS, the longest common subsequence of two strings, with LEN,
+  IDX, MINMATCHLEN and WITHMATCHLEN as Redis answers them. Strings whose
+  lengths multiply past 16,777,216 are refused. Inside MULTI it needs cluster
+  feature level 12.
+
+- New command: LMPOP, the non-blocking BLMPOP. Of several keys it picks the
+  first with elements where the pops apply (one-command transaction, from
+  cluster feature level 12); inside MULTI it needs level 12.
+
+- New commands: HEXPIREAT and HPEXPIREAT set hash field expiries at a Unix
+  time (with NX, XX, GT or LT, as HEXPIRE), and HPEXPIRETIME answers them in
+  milliseconds. Inside MULTI they need cluster feature level 12.
+
+- New commands: HMSET (HSET answering `OK`, for older clients), TOUCH and
+  TIME. Inside MULTI, HMSET and TOUCH need cluster feature level 12, as older
+  releases do not have them; TIME is not taken there.
+
 - EXPIRE, PEXPIRE, EXPIREAT, PEXPIREAT and PERSIST on a hash, list, set,
   sorted set or stream, and EXPIRE with NX, XX, GT or LT on any key, ran as
   one-command transactions, whose journal cost 20-40 ms on macOS even for a
