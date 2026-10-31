@@ -21,6 +21,7 @@ All notable changes to FerricStore will be documented here.
   from feature level 11. A pending entry claimed again keeps its delivery
   count. XGROUP and XSETID fire Redis's keyspace events (XGROUP CREATE fired
   none), and unknown XGROUP and XINFO subcommands answer as Redis does.
+  Like the other stream commands they are refused inside MULTI.
 
 - SRANDMEMBER, HRANDFIELD and ZRANDMEMBER read every member to pick one.
   On the instance they now take the collection's count and read the picked
