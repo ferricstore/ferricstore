@@ -50,7 +50,7 @@ defmodule FerricstoreServer.Acl.CommandCategories do
   @geo_read ~w(GEOHASH GEOPOS GEODIST GEOSEARCH)
   @geo_write ~w(GEOADD GEOSEARCHSTORE)
 
-  @stream_read ~w(XLEN XRANGE XREVRANGE XREAD XINFO)
+  @stream_read ~w(XLEN XRANGE XREVRANGE XREAD XINFO XPENDING)
   @stream_write ~w(XADD XTRIM XDEL XGROUP XREADGROUP XACK)
 
   @probabilistic_read ~w(

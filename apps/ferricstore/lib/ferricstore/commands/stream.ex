@@ -40,6 +40,7 @@ defmodule Ferricstore.Commands.Stream do
   alias Ferricstore.Commands.Stream.AtomicAppend
   alias Ferricstore.Commands.Stream.AtomicMutation
   alias Ferricstore.Commands.Stream.Entries
+  alias Ferricstore.Commands.Stream.GroupInspect
   alias Ferricstore.Commands.Stream.Groups
   alias Ferricstore.Commands.Stream.ID
   alias Ferricstore.Commands.Stream.Info
@@ -204,25 +205,29 @@ defmodule Ferricstore.Commands.Stream do
   # XINFO STREAM key [FULL [COUNT count]]
   # -------------------------------------------------------------------------
 
-  def handle("XINFO", [subcommand, key], store) when is_binary(subcommand) do
-    if String.upcase(subcommand) == "STREAM" do
-      Info.stream(key, store)
-    else
-      {:error, "ERR wrong number of arguments for 'xinfo' command"}
-    end
-  end
-
-  def handle("XINFO", [subcommand, _key | _rest], _store) when is_binary(subcommand) do
-    if String.upcase(subcommand) == "STREAM" do
-      {:error, "ERR syntax error"}
-    else
-      {:error, "ERR wrong number of arguments for 'xinfo' command"}
+  def handle("XINFO", [subcommand | args], store) when is_binary(subcommand) do
+    case {String.upcase(subcommand), args} do
+      {"STREAM", [key]} -> Info.stream(key, store)
+      {"STREAM", [_key | _rest]} -> {:error, "ERR syntax error"}
+      {"GROUPS", [key]} -> GroupInspect.groups(key, store)
+      {"CONSUMERS", [key, group]} -> GroupInspect.consumers(key, group, store)
+      _other -> {:error, "ERR wrong number of arguments for 'xinfo' command"}
     end
   end
 
   def handle("XINFO", _args, _store) do
     {:error, "ERR wrong number of arguments for 'xinfo' command"}
   end
+
+  # -------------------------------------------------------------------------
+  # XPENDING key group [[IDLE min-idle-time] start end count [consumer]]
+  # -------------------------------------------------------------------------
+
+  def handle("XPENDING", [key, group | args], store),
+    do: GroupInspect.pending(key, group, args, store)
+
+  def handle("XPENDING", _args, _store),
+    do: {:error, "ERR wrong number of arguments for 'xpending' command"}
 
   # -------------------------------------------------------------------------
   # XGROUP CREATE key groupname id [MKSTREAM]

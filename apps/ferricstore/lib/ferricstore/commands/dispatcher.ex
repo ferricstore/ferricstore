@@ -62,7 +62,7 @@ defmodule Ferricstore.Commands.Dispatcher do
   @bitmap_raw_commands ~w(GETBIT SETBIT BITCOUNT BITPOS BITOP)
   @generic_raw_commands ~w(TYPE UNLINK RENAME RENAMENX COPY RANDOMKEY SCAN EXPIRETIME PEXPIRETIME OBJECT WAIT)
   @server_raw_commands ~w(PING ECHO DBSIZE KEYS FLUSHDB FLUSHALL SELECT INFO COMMAND LOLWUT DEBUG SLOWLOG SAVE BGSAVE LASTSAVE CONFIG MODULE WAITAOF FERRICSTORE.BLOBGC FERRICSTORE.DOCTOR)
-  @stream_raw_commands ~w(XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK)
+  @stream_raw_commands ~w(XADD XLEN XRANGE XREVRANGE XREAD XTRIM XDEL XINFO XGROUP XREADGROUP XACK XPENDING)
   @geo_raw_commands ~w(GEOADD GEOPOS GEODIST GEOHASH GEOSEARCH GEOSEARCHSTORE)
   @hll_raw_commands ~w(PFADD PFCOUNT PFMERGE)
   @prob_raw_commands ~w(BF.RESERVE BF.ADD BF.MADD BF.EXISTS BF.MEXISTS BF.CARD BF.INFO CF.RESERVE CF.ADD CF.ADDNX CF.DEL CF.EXISTS CF.MEXISTS CF.COUNT CF.INFO CMS.INITBYDIM CMS.INITBYPROB CMS.INCRBY CMS.QUERY CMS.MERGE CMS.INFO TOPK.RESERVE TOPK.ADD TOPK.INCRBY TOPK.QUERY TOPK.LIST TOPK.COUNT TOPK.INFO TDIGEST.CREATE TDIGEST.ADD TDIGEST.RESET TDIGEST.QUANTILE TDIGEST.CDF TDIGEST.RANK TDIGEST.REVRANK TDIGEST.BYRANK TDIGEST.BYREVRANK TDIGEST.TRIMMED_MEAN TDIGEST.MIN TDIGEST.MAX TDIGEST.INFO TDIGEST.MERGE)
@@ -211,6 +211,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     "XREVRANGE" => -4,
     "XDEL" => -3,
     "XTRIM" => -4,
+    "XPENDING" => -3,
     "GEOADD" => -5,
     "GEOPOS" => -2,
     "GEODIST" => -4,
@@ -223,7 +224,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     INVOCATION.DEFINITION.PUT INVOCATION.DEFINITION.GET INVOCATION.DEFINITION.LIST
     INVOCATION.CREATE INVOCATION.GET INVOCATION.PARTITION.LIST
   )
-  @raw_fallback_ast_tags ~w(bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
+  @raw_fallback_ast_tags ~w(bitcount bitpos xadd xlen xrange xrevrange xread xtrim xdel xinfo xgroup xreadgroup xack xpending geoadd geopos geodist geohash geosearch geosearchstore zunion zinter zdiff zunionstore zinterstore zdiffstore zintercard zrangestore zrangebylex zrevrangebylex zlexcount zremrangebyrank zremrangebyscore zremrangebylex zmpop cas lock unlock extend ratelimit_add ferricstore_key_info fetch_or_compute fetch_or_compute_result fetch_or_compute_error)a
   @wrong_arity_list_ast_tags ~w(get incr decr strlen getdel getex ttl pttl persist lpop rpop llen hgetall hkeys hvals hlen hrandfield smembers scard srandmember spop zcard zpopmin zpopmax zrandmember type expiretime pexpiretime)a
 
   @ast_command_names %{
@@ -372,6 +373,7 @@ defmodule Ferricstore.Commands.Dispatcher do
     xgroup: "xgroup",
     xreadgroup: "xreadgroup",
     xack: "xack",
+    xpending: "xpending",
     geoadd: "geoadd",
     geopos: "geopos",
     geodist: "geodist",
