@@ -174,6 +174,8 @@ defmodule Ferricstore.KeyspaceNotifications do
     "HGETDEL" => "hdel",
     "HEXPIRE" => "hexpire",
     "HPEXPIRE" => "hexpire",
+    "HEXPIREAT" => "hexpire",
+    "HPEXPIREAT" => "hexpire",
     "HPERSIST" => "hpersist",
     "ZADD" => "zadd",
     "ZREM" => "zrem",
@@ -330,7 +332,7 @@ defmodule Ferricstore.KeyspaceNotifications do
   # The field TTL commands answer one code per field: 1 when they changed
   # its expiry, and for HEXPIRE 2 when a TTL of 0 deleted it.
   defp notify_event(command, event, [key | _rest], codes)
-       when command in ~w(HEXPIRE HPEXPIRE) and is_list(codes) do
+       when command in ~w(HEXPIRE HPEXPIRE HEXPIREAT HPEXPIREAT) and is_list(codes) do
     if 1 in codes, do: notify_key(key, event)
     if 2 in codes, do: notify_key(key, "hdel")
     :ok

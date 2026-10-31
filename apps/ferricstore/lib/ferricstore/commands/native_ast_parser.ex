@@ -28,7 +28,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
     LPUSH RPUSH LPUSHX RPUSHX LPOP RPOP LLEN LRANGE LTRIM LINDEX LSET LREM LINSERT LPOS
     HGET HGETALL HKEYS HVALS HLEN HEXISTS HSTRLEN HSET HMSET HSETNX HDEL HMGET
     HINCRBY HINCRBYFLOAT HRANDFIELD HSCAN HEXPIRE HPEXPIRE HTTL HPTTL HPERSIST
-    HEXPIRETIME HGETDEL HGETEX HSETEX
+    HEXPIRETIME HGETDEL HGETEX HSETEX HEXPIREAT HPEXPIREAT HPEXPIRETIME
     SADD SREM SMEMBERS SCARD SISMEMBER SMISMEMBER SRANDMEMBER SPOP SSCAN SINTERCARD
     ZADD ZINCRBY ZSCORE ZRANK ZREVRANK ZPOPMIN ZPOPMAX ZRANDMEMBER ZCOUNT
     ZRANGE ZREVRANGE ZRANGEBYSCORE ZREVRANGEBYSCORE ZSCAN ZREM ZMSCORE ZCARD
@@ -522,7 +522,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   # Without a condition the form older releases parse; NX, XX, GT or LT adds
   # one (cluster feature level 5 inside MULTI, as does a TTL of 0).
   defp make_ast(_cmd, tag, [key, ttl | args])
-       when tag in ~w(hexpire hpexpire)a do
+       when tag in ~w(hexpire hpexpire hexpireat hpexpireat)a do
     case HashHelpers.parse_field_expire(Atom.to_string(tag), ttl, args) do
       {:ok, ttl, nil, fields} -> {tag, key, ttl, fields}
       {:ok, ttl, condition, fields} -> {tag, key, ttl, condition, fields}
@@ -531,7 +531,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
   end
 
   defp make_ast(_cmd, tag, [key | args])
-       when tag in ~w(httl hpttl hpersist hexpiretime hgetdel)a do
+       when tag in ~w(httl hpttl hpersist hexpiretime hpexpiretime hgetdel)a do
     case HashHelpers.parse_field_list(args) do
       {:ok, fields} -> {tag, key, fields}
       {:error, _reason} = error -> {tag, key, error}

@@ -41,7 +41,8 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
     :zmpop
   ]
   @field_expiry_tags [:hexpire, :hpexpire]
-  @level_12_tags [:hmset, :touch]
+  # Level 12: commands older releases do not have.
+  @level_12_tags [:hmset, :touch, :hexpireat, :hpexpireat, :hpexpiretime]
 
   @doc "Whether a parsed command needs cluster feature level 4 inside MULTI."
   @spec level_4_form?(term()) :: boolean()
@@ -52,6 +53,10 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
   form every release applies.
   """
   @spec required_level(term()) :: 4 | 5 | 6 | 10 | 12 | nil
+  def required_level(ast)
+      when is_tuple(ast) and tuple_size(ast) > 1 and elem(ast, 0) in @level_12_tags,
+      do: 12
+
   def required_level({tag, _key, _time, flags}) when tag in @expiry_tags and is_list(flags),
     do: 4
 
@@ -90,9 +95,6 @@ defmodule Ferricstore.Transaction.ReplicaCompat do
 
   # Level 10: sorted-set commands older releases do not have.
   def required_level({tag, args}) when tag in @zset_algebra_tags and is_list(args), do: 10
-
-  # Level 12: commands older releases do not have.
-  def required_level({tag, args}) when tag in @level_12_tags and is_list(args), do: 12
 
   # TDIGEST (in a transaction from level 6: older releases refuse it there; its
   # digest is a plain value the transaction reads and writes like any other).
