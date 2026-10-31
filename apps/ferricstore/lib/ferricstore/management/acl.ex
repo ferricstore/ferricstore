@@ -17,6 +17,11 @@ defmodule FerricStore.Management.ACL do
   @callback list_users(keyword()) :: result()
   @callback save(keyword()) :: result()
   @callback load(keyword()) :: result()
+  @callback categories(keyword()) :: result()
+  @callback category_commands(binary(), keyword()) :: result()
+  @callback log(pos_integer() | :all | :reset, keyword()) :: result()
+  @callback dryrun(username(), binary(), [binary()], keyword()) :: result()
+  @optional_callbacks categories: 1, category_commands: 2, log: 2, dryrun: 4
 
   @spec set_user(username(), [acl_rule()], keyword()) :: result()
   def set_user(username, rules, opts \\ []),
@@ -39,6 +44,33 @@ defmodule FerricStore.Management.ACL do
 
   @spec load(keyword()) :: result()
   def load(opts \\ []), do: implementation(opts).load(opts)
+
+  @doc "ACL CAT without a category: the category names."
+  @spec categories(keyword()) :: result()
+  def categories(opts \\ []), do: optional(opts, :categories, [opts])
+
+  @doc "ACL CAT category: the commands in it."
+  @spec category_commands(binary(), keyword()) :: result()
+  def category_commands(category, opts \\ []),
+    do: optional(opts, :category_commands, [category, opts])
+
+  @doc "ACL LOG: the latest `count` (or all) denials, or `:reset` to clear them."
+  @spec log(pos_integer() | :all | :reset, keyword()) :: result()
+  def log(count, opts \\ []), do: optional(opts, :log, [count, opts])
+
+  @doc "ACL DRYRUN: whether `username` may run `command` with `args`."
+  @spec dryrun(username(), binary(), [binary()], keyword()) :: result()
+  def dryrun(username, command, args, opts \\ []),
+    do: optional(opts, :dryrun, [username, command, args, opts])
+
+  defp optional(opts, function, args) do
+    module = implementation(opts)
+    Code.ensure_loaded(module)
+
+    if function_exported?(module, function, length(args)),
+      do: apply(module, function, args),
+      else: {:error, :unsupported}
+  end
 
   @doc false
   @spec implementation(keyword()) :: module()

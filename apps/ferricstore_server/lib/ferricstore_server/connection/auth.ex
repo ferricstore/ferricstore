@@ -15,7 +15,7 @@ defmodule FerricstoreServer.Connection.Auth do
   @acl_projector_scope :ferricstore_acl_projector_scope
   @acl_projector_group :ferricstore_acl_projectors
   @global_keyspace_enumeration_commands ~w(KEYS SCAN RANDOMKEY DBSIZE)
-  @acl_subcommands ~w(CAT DELUSER GETUSER LIST LOAD LOG SAVE SETUSER WHOAMI)
+  @acl_subcommands ~w(CAT DELUSER DRYRUN GENPASS GETUSER LIST LOAD LOG SAVE SETUSER WHOAMI)
 
   @spec acl_projector_scope() :: atom()
   def acl_projector_scope, do: @acl_projector_scope

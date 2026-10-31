@@ -370,6 +370,66 @@ defmodule FerricstoreServer.Management.ACL do
   end
 
   @impl true
+  def categories(_opts), do: {:ok, CommandCategories.category_names_lower()}
+
+  @impl true
+  def category_commands(category, _opts) do
+    case CommandCategories.category_commands(category) do
+      {:ok, commands} -> {:ok, commands |> Enum.map(&String.downcase/1) |> Enum.sort()}
+      :error -> {:error, "ERR Unknown category '#{category}'"}
+    end
+  end
+
+  @impl true
+  def log(:reset, _opts), do: FerricstoreServer.Acl.Log.reset()
+  def log(count, _opts), do: {:ok, FerricstoreServer.Acl.Log.entries(count)}
+
+  # Checks the command (and its subcommand) and every key it reads or writes
+  # as the user, without running it; a denial answers as Redis's does.
+  @impl true
+  def dryrun(username, command, args, _opts) do
+    if Acl.get_user(username) == nil do
+      {:error, "ERR User '#{username}' not found"}
+    else
+      case Ferricstore.Commands.Dispatcher.prepare_raw(command, args) do
+        {:ok, prepared} ->
+          {:ok, dryrun_answer(username, prepared)}
+
+        {:error, "ERR unknown command" <> _rest} ->
+          {:error, "ERR Command '#{String.downcase(command)}' not found"}
+
+        {:error, _reason} = error ->
+          error
+      end
+    end
+  end
+
+  defp dryrun_answer(username, prepared) do
+    commands =
+      ConnectionAuth.acl_command_names(prepared.command, prepared.args, prepared.ast)
+
+    denied_command = Enum.find(commands, &(Acl.check_command(username, &1) != :ok))
+
+    denied_key =
+      Enum.find_value(
+        Enum.map(prepared.read_keys, &{&1, :read}) ++ Enum.map(prepared.write_keys, &{&1, :write}),
+        fn {key, access} -> if Acl.check_key_access(username, key, access) != :ok, do: key end
+      )
+
+    cond do
+      denied_command ->
+        "User #{username} has no permissions to run the " <>
+          "'#{denied_command |> String.downcase() |> String.replace(".", "|")}' command"
+
+      denied_key ->
+        "User #{username} has no permissions to access the '#{denied_key}' key"
+
+      true ->
+        "OK"
+    end
+  end
+
+  @impl true
   def load(opts) do
     with {:ok, store} <- mutation_store(opts),
          data_dir <-

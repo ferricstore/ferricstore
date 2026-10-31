@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New ACL subcommands: ACL CAT, GENPASS, LOG and DRYRUN, as Redis answers
+  them. ACL LOG keeps this node's latest 128 ACL denials and failed AUTHs
+  (always on, unlike the audit log), counting repeats within 60 seconds on
+  one entry.
+
 - New commands: BF.INSERT, CF.INSERT and CF.INSERTNX, as RedisBloom answers
   them: a missing filter is created with CAPACITY (and ERROR) or, under
   NOCREATE, refused with `ERR not found`; a full cuckoo filter answers -1 for

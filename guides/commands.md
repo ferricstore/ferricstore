@@ -1640,6 +1640,10 @@ Transactions work at the connection level. WATCH implements optimistic locking -
 | `ACL WHOAMI` | `ACL WHOAMI` | Current user |
 | `ACL SAVE` | `ACL SAVE` | Persist ACL to file |
 | `ACL LOAD` | `ACL LOAD` | Load ACL from file |
+| `ACL CAT` | `ACL CAT [category]` | Category names, or the commands in a category |
+| `ACL GENPASS` | `ACL GENPASS [bits]` | A random password: hex of `bits` (default 256) strong random bits |
+| `ACL LOG` | `ACL LOG [count \| RESET]` | This node's latest ACL denials and failed AUTHs, newest first (count, reason, context, object, username, age-seconds, client-info, entry-id, timestamps); repeats within 60 s count on one entry; keeps 128 |
+| `ACL DRYRUN` | `ACL DRYRUN username command [arg ...]` | `OK`, or why the user may not run the command or touch a key, without running it |
 | `AUTH` | `AUTH [username] password` | Authenticate connection |
 
 ---

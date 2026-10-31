@@ -49,8 +49,12 @@ defmodule Ferricstore.Commands.Management do
 
   def handle("ACL", ["LOAD" | _], _store), do: wrong_arity("acl load")
 
-  def handle("ACL", [subcmd | _args], _store),
-    do: {:error, "ERR unknown ACL subcommand '#{String.downcase(subcmd)}'"}
+  def handle("ACL", [subcmd | args], store) do
+    case String.upcase(subcmd) do
+      upper when upper in ["CAT", "GENPASS", "LOG", "DRYRUN"] -> acl(upper, args, store)
+      _other -> {:error, "ERR unknown ACL subcommand '#{String.downcase(subcmd)}'"}
+    end
+  end
 
   def handle("ACL", [], _store), do: wrong_arity("acl")
 
@@ -115,6 +119,72 @@ defmodule Ferricstore.Commands.Management do
     do: {:error, "ERR unknown FERRICSTORE.TELEMETRY subcommand '#{String.downcase(subcmd)}'"}
 
   def handle("FERRICSTORE.TELEMETRY", [], _store), do: wrong_arity("ferricstore.telemetry")
+
+  # ACL CAT [category]
+  defp acl("CAT", [], store), do: result(FerricStore.Management.ACL.categories(store_opts(store)))
+
+  defp acl("CAT", [category], store),
+    do: result(FerricStore.Management.ACL.category_commands(category, store_opts(store)))
+
+  defp acl("CAT", _args, _store), do: wrong_arity("acl|cat")
+
+  # ACL GENPASS [bits]: random hex, four bits a character, from the node's
+  # strong random source.
+  defp acl("GENPASS", [], _store), do: genpass(256)
+
+  defp acl("GENPASS", [raw], _store) do
+    case Integer.parse(raw) do
+      {bits, ""} when bits in 1..4096 -> genpass(bits)
+      _invalid -> genpass_error()
+    end
+  end
+
+  defp acl("GENPASS", _args, _store), do: wrong_arity("acl|genpass")
+
+  # ACL LOG [count | RESET]
+  defp acl("LOG", [], store), do: result(FerricStore.Management.ACL.log(:all, store_opts(store)))
+
+  defp acl("LOG", [raw], store) do
+    cond do
+      String.upcase(raw) == "RESET" ->
+        result(FerricStore.Management.ACL.log(:reset, store_opts(store)))
+
+      match?({_count, ""}, Integer.parse(raw)) ->
+        case Integer.parse(raw) do
+          {count, ""} when count >= 0 ->
+            result(FerricStore.Management.ACL.log(count, store_opts(store)))
+
+          _negative ->
+            {:error, "ERR value is out of range, must be positive"}
+        end
+
+      true ->
+        {:error, "ERR value is not an integer or out of range"}
+    end
+  end
+
+  defp acl("LOG", _args, _store), do: wrong_arity("acl|log")
+
+  # ACL DRYRUN username command [arg ...]
+  defp acl("DRYRUN", [username, command | args], store),
+    do: result(FerricStore.Management.ACL.dryrun(username, command, args, store_opts(store)))
+
+  defp acl("DRYRUN", _args, _store), do: wrong_arity("acl|dryrun")
+
+  defp genpass(bits) do
+    chars = div(bits + 3, 4)
+
+    div(chars + 1, 2)
+    |> :crypto.strong_rand_bytes()
+    |> Base.encode16(case: :lower)
+    |> binary_part(0, chars)
+  end
+
+  defp genpass_error,
+    do:
+      {:error,
+       "ERR ACL GENPASS argument must be the number of bits for the output password, " <>
+         "a positive number up to 4096"}
 
   defp result(:ok), do: :ok
   defp result({:ok, :ok}), do: :ok
