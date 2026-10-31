@@ -49,6 +49,14 @@ All notable changes to FerricStore will be documented here.
   they remove every member, a page of the member bound at a time, in one
   replicated entry, whatever the size.
 
+- SPOP on the instance took a set's first members in order whenever its
+  members shared a prefix (`m1`..`m200`: always `m1`), not random ones. The
+  pick read a hash of the entry's Raft index as a member name, which such
+  members all sort after or before. From feature level 11 it draws distinct
+  ranks from that index, so members are picked evenly and every replica
+  still removes the same ones. Finding a drawn rank steps through the set's
+  member index up to it, so a pop grows with the set's size.
+
 ## 0.12.16 - 2026-10-31
 
 - ZUNION, ZINTER, ZDIFF, ZUNIONSTORE, ZINTERSTORE, ZDIFFSTORE, ZINTERCARD and

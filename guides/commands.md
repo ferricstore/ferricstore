@@ -777,7 +777,7 @@ All native TCP mode. Non-existent keys return empty/0.
 | | |
 |---|---|
 | **Protocol command** | `SRANDMEMBER key [count]`, `SPOP key [count]` |
-| **Status** | Supported. Negative count for `SRANDMEMBER` allows duplicates. `SPOP` removes the selected members. |
+| **Status** | Supported. Negative count for `SRANDMEMBER` allows duplicates. `SPOP` removes the selected members; every replica removes the same ones, chosen from the entry's Raft position. From feature level 11 they are spread evenly over the set (below it, a set whose members share a prefix gave up its first members in order). |
 
 ### SDIFF / SINTER / SUNION
 

@@ -389,17 +389,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             []
           else
             prefix = CompoundKey.set_prefix(redis_key)
-            cursor = deterministic_member_cursor({redis_key, seed})
 
-            case CompoundMemberIndex.member_slice(
-                   Map.get(state, :compound_member_index_name),
-                   shard_ets_state(state),
-                   prefix,
-                   cursor,
-                   pop_count,
-                   ExpiryContext.capture(),
-                   Process.get(:sm_pending_values, %{})
-                 ) do
+            case spop_select(state, redis_key, prefix, pop_count, seed) do
               {:ok, selected} ->
                 selected_delete_keys =
                   Enum.map(selected, &CompoundKey.set_member(redis_key, &1))
@@ -426,6 +417,60 @@ defmodule Ferricstore.Raft.StateMachine.Sections.DataMutations do
             end
           end
         end
+      end
+
+      # Every replica pops the same members: the choice comes from the entry's
+      # Raft index. Below feature level 11 it is a hash of it read as a member
+      # name, which members sharing a prefix ("m1", "m2", ...) all sort after
+      # or before, so the pop took the set's first members. From level 11 it
+      # draws distinct ranks evenly over the set's members.
+      defp spop_select(state, redis_key, prefix, pop_count, seed) do
+        index = Map.get(state, :compound_member_index_name)
+        expiry_context = ExpiryContext.capture()
+        pending_values = Process.get(:sm_pending_values, %{})
+
+        if feature_level_11?(state) do
+          case CompoundMemberIndex.member_count(index, prefix) do
+            {:ok, count} ->
+              CompoundMemberIndex.members_at_ranks(
+                index,
+                shard_ets_state(state),
+                prefix,
+                random_ranks(count, pop_count, {redis_key, seed}),
+                expiry_context,
+                pending_values
+              )
+
+            :unavailable ->
+              :unavailable
+          end
+        else
+          CompoundMemberIndex.member_slice(
+            index,
+            shard_ets_state(state),
+            prefix,
+            deterministic_member_cursor({redis_key, seed}),
+            pop_count,
+            expiry_context,
+            pending_values
+          )
+        end
+      end
+
+      # `wanted` distinct ranks below `count`, sorted (Floyd's sampling), drawn
+      # from `seed` alone so every replica draws the same.
+      defp random_ranks(0, _wanted, _seed), do: []
+
+      defp random_ranks(count, wanted, seed) do
+        wanted = min(wanted, count)
+
+        (count - wanted)..(count - 1)//1
+        |> Enum.reduce(MapSet.new(), fn bound, picked ->
+          <<draw::unsigned-256>> = deterministic_member_cursor({seed, bound})
+          rank = rem(draw, bound + 1)
+          MapSet.put(picked, if(MapSet.member?(picked, rank), do: bound, else: rank))
+        end)
+        |> Enum.sort()
       end
 
       defp do_zpop(_state, _redis_key, count, _direction)
