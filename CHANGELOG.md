@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.17 - 2026-11-01
+
 - A node that lost a Bloom, Cuckoo, Count-Min or Top-K key's file now copies
   it back from a replica that still has it (`Ferricstore.ProbRepair`), when a
   command finds it missing and at startup. The repair is one replicated
