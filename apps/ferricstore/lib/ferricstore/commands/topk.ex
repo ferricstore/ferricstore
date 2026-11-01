@@ -379,9 +379,16 @@ defmodule Ferricstore.Commands.TopK do
 
   defp missing_or_wrongtype(key, store, missing_result) do
     case ProbType.check_create(key, :topk, store) do
-      :ok -> missing_result
-      {:error, :exists} -> missing_result
-      {:error, _} = error -> error
+      :ok ->
+        missing_result
+
+      # The key exists but this node lost its file: ask for a copy from a replica.
+      {:error, :exists} ->
+        Ferricstore.ProbRepair.request_for_store(store, key, :topk)
+        missing_result
+
+      {:error, _} = error ->
+        error
     end
   end
 

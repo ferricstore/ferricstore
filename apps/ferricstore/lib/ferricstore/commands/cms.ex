@@ -230,10 +230,16 @@ defmodule Ferricstore.Commands.CMS do
 
   defp await_nif(submit_fun), do: Async.await(submit_fun, @prob_read_timeout_ms)
 
+  # The key exists but this node lost its file: ask for a copy from a replica.
+  defp lost_file(store, key, result) do
+    Ferricstore.ProbRepair.request_for_store(store, key, :cms)
+    result
+  end
+
   defp missing_or_wrongtype(key, store, missing_result) do
     case ProbType.check_create(key, :cms, store) do
       :ok -> missing_result
-      {:error, :exists} -> {:error, "ERR CMS sketch file is missing"}
+      {:error, :exists} -> lost_file(store, key, {:error, "ERR CMS sketch file is missing"})
       {:error, _} = error -> error
     end
   end

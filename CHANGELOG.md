@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A node that lost a Bloom, Cuckoo, Count-Min or Top-K key's file now copies
+  it back from a replica that still has it (`Ferricstore.ProbRepair`), when a
+  command finds it missing and at startup. The repair is one replicated
+  entry: each replica that has the file copies it aside as of that entry, and
+  the node that lost it installs such a copy as it applies the same entry, so
+  no write is missed or counted twice. Only node-local files change; it needs
+  cluster feature level 12. The write error for such a key now reads `ERR
+  <type> file is missing on this node; it is copied back from a replica that
+  has it`.
+
 - New commands: SSUBSCRIBE, SUNSUBSCRIBE, SPUBLISH, PUBSUB SHARDCHANNELS and
   PUBSUB SHARDNUMSUB. Shard channels are their own namespace, as in Redis 7:
   PUBLISH, PSUBSCRIBE patterns, PUBSUB CHANNELS and NUMSUB never meet them,
