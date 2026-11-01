@@ -2424,6 +2424,10 @@ defmodule Ferricstore.Raft.StateMachine.Sections.ApplyDispatch do
         end)
       end
 
+      def apply(meta, {:prob_file_repair, key, type, id}, state) do
+        apply_prob_with_time(meta, state, fn -> do_prob_file_repair(state, key, type, id) end)
+      end
+
       def apply(meta, {:prob_restore, key, type, metadata, bytes, expire_at_ms}, state) do
         apply_prob_with_time(meta, state, fn ->
           restore_prob(state, key, type, metadata, bytes, expire_at_ms)

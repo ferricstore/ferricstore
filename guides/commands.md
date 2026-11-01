@@ -1296,14 +1296,20 @@ Backed by mmap NIF resources. Each filter is a memory-mapped file at `data_dir/p
 **A lost file.** Each Bloom, Cuckoo, Count-Min and Top-K key keeps its data in
 a file on every replica. If one node loses a key's file (a disk fault, a file
 removed by hand), that key is damaged on that node only: its writes there
-answer `ERR bloom filter file is missing on this node; delete the key and
-create it again` (or the cuckoo, count-min or top-k form), its reads answer
-`ERR ... file is missing`, and RENAME and COPY carry the damage to the new
-key. The rest of the shard keeps applying and the node restarts normally.
-DEL heals the key (create it again afterwards), as does a snapshot install
-from another replica; `FERRICSTORE.DOCTOR CHECK SCOPE PROB_FILES` lists the
-damaged keys. FerricStore never rebuilds the file empty, which would silently
-forget its members.
+answer `ERR bloom filter file is missing on this node; it is copied back from a
+replica that has it` (or the cuckoo, count-min or top-k form), its reads answer
+`ERR ... file is missing`, and RENAME and COPY carry the damage to the new key.
+The rest of the shard keeps applying and the node restarts normally.
+
+The node then copies the file back from a replica that still has it: when a
+command finds it missing, and at startup for every key whose file is gone. The
+copy is the file exactly as of a point in the shard's log, so no write is lost
+or counted twice, and the key answers normally again within seconds. This
+needs cluster feature level 12. If no replica has the file, the key stays
+damaged; DEL heals it (create it again afterwards), as does a snapshot install.
+`FERRICSTORE.DOCTOR CHECK SCOPE PROB_FILES` lists the keys whose file this node
+lacks. FerricStore never rebuilds a file empty, which would silently forget its
+members.
 
 ---
 

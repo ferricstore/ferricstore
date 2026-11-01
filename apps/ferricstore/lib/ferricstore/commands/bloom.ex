@@ -460,7 +460,7 @@ defmodule Ferricstore.Commands.Bloom do
         if Ferricstore.FS.exists?(prob_path(store, key, "bloom")) do
           :ok
         else
-          {:error, "ERR bloom filter file is missing"}
+          lost_file(store, key, {:error, "ERR bloom filter file is missing"})
         end
 
       :ok ->
@@ -488,10 +488,16 @@ defmodule Ferricstore.Commands.Bloom do
   defp production_prob_store?(store) when is_map(store),
     do: is_function(Map.get(store, :prob_write), 1)
 
+  # The key exists but this node lost its file: ask for a copy from a replica.
+  defp lost_file(store, key, result) do
+    Ferricstore.ProbRepair.request_for_store(store, key, :bloom)
+    result
+  end
+
   defp missing_or_wrongtype(key, store, missing_result) do
     case ProbType.check_create(key, :bloom, store) do
       :ok -> missing_result
-      {:error, :exists} -> {:error, "ERR bloom filter file is missing"}
+      {:error, :exists} -> lost_file(store, key, {:error, "ERR bloom filter file is missing"})
       {:error, _} = error -> error
     end
   end

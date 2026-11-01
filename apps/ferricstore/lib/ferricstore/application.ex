@@ -306,6 +306,7 @@ defmodule Ferricstore.Application do
             {Ferricstore.Merge.Supervisor, data_dir: data_dir, shard_count: shard_count},
             Ferricstore.PubSub,
             {Ferricstore.Cluster.Relay, instance_ctx: default_ctx},
+            {Ferricstore.ProbRepair, instance_ctx: default_ctx},
             Ferricstore.FetchOrCompute,
             {Ferricstore.OperationalGuard, instance_ctx: default_ctx},
             {Ferricstore.Flow.Scheduler, ctx: default_ctx},

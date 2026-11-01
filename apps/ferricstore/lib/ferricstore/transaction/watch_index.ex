@@ -42,10 +42,12 @@ defmodule Ferricstore.Transaction.WatchIndex do
                       zadd_many_single)a
 
   # Expiry deletes only keys already expired, which a WATCH sees through the
-  # key's liveness instead; the others write no client key.
+  # key's liveness instead; the others write no client key (`prob_file_repair`
+  # only gives a node back its copy of a file as every replica has it).
   @no_client_key_tags ~w(
     expire_if_batch watch_token watch_tokens cross_shard_tx
     ferricstore_apply_context_barrier server_catalog_mutate server_catalog_replace
+    prob_file_repair
   )a
 
   @every_key_tags ~w(flush_shard delete_prefix clear_key_locks)a

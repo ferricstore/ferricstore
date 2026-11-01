@@ -475,6 +475,14 @@ defmodule Ferricstore.Store.Router.Part09 do
       end
 
       @doc false
+      # Proposes the repair of a probabilistic file this node lost
+      # (`Ferricstore.ProbRepair`).
+      @spec prob_file_repair(FerricStore.Instance.t(), binary(), atom(), binary()) :: term()
+      def prob_file_repair(ctx, key, type, id) when is_binary(key) and is_binary(id) do
+        raft_write(ctx, shard_for(ctx, key), key, {:prob_file_repair, key, type, id})
+      end
+
+      @doc false
       @spec prob_write_route(FerricStore.Instance.t(), tuple()) ::
               {:ok, binary(), non_neg_integer()} | {:error, binary()}
       def prob_write_route(

@@ -1818,6 +1818,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
         case classify_prob_key(state, key, expected_type) do
           {:ok, :existing} ->
             require_prob_file(
+              state,
               prob_path(state, key, prob_extension(expected_type)),
               expected_type,
               key
@@ -1838,19 +1839,53 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       # fault, a file removed by hand) is damaged on this node only: the other
       # replicas still have the file. Its writes answer an error here instead
       # of stopping the shard's apply (which replay could not get past either),
-      # its reads already answer one, and DEL or a snapshot install heals it.
-      # Rebuilding an empty file would silently forget its members.
-      defp require_prob_file(path, type, key) do
+      # its reads already answer one, and this node asks for a copy from a
+      # replica (`Ferricstore.ProbRepair`); DEL or a snapshot install heals it
+      # too. Rebuilding an empty file would silently forget its members.
+      defp require_prob_file(state, path, type, key) do
         if Ferricstore.FS.exists?(path) do
           :ok
         else
           Logger.error(
             "StateMachine: the #{prob_extension(type)} file of #{inspect(key)} is missing " <>
-              "at #{path}; the key answers errors on this node until it is deleted"
+              "at #{path}; the key answers errors on this node until it is restored"
           )
 
+          Ferricstore.ProbRepair.request(Map.get(state, :shard_index), key, type)
           {:error, lost_prob_file_message(type)}
         end
+      end
+
+      # `{:prob_file_repair, key, type, id}` (`Ferricstore.ProbRepair`): every
+      # replica that has the key's file copies it aside as it is before this
+      # entry, and a replica that lost it installs such a copy from a peer.
+      # Only node-local files change, and the answer is `:ok` everywhere.
+      defp do_prob_file_repair(state, key, type, id) do
+        if Ferricstore.ProbRepair.valid_request?(key, type, id) and feature_level_12?(state) do
+          path = prob_path(state, key, prob_extension(type))
+
+          case classify_prob_key(state, key, type) do
+            {:ok, :existing} ->
+              if Ferricstore.FS.exists?(path) do
+                Ferricstore.ProbRepair.stage(state.data_dir, state.shard_index, id, path)
+              else
+                _ =
+                  Ferricstore.ProbRepair.fetch_and_install(
+                    state.data_dir,
+                    state.shard_index,
+                    id,
+                    current_ra_index() || 0,
+                    path,
+                    prob_extension(type)
+                  )
+              end
+
+            _missing_replayed_or_other_type ->
+              Ferricstore.ProbRepair.stage_none(state.data_dir, state.shard_index, id)
+          end
+        end
+
+        :ok
       end
 
       defp lost_prob_file_message(type) do
@@ -1862,7 +1897,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
             :topk -> "top-k"
           end
 
-        "ERR #{name} file is missing on this node; delete the key and create it again"
+        "ERR #{name} file is missing on this node; it is copied back from a replica that has it"
       end
 
       defp require_existing_prob_keys(state, keys, expected_type) do
@@ -1937,14 +1972,14 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       end
 
       defp maybe_create_cms_merge_dst(
-             _state,
+             state,
              dst_path,
              dst_key,
              :existing,
              _width,
              _depth
            ) do
-        with :ok <- require_prob_file(dst_path, :cms, dst_key), do: {:ok, dst_path}
+        with :ok <- require_prob_file(state, dst_path, :cms, dst_key), do: {:ok, dst_path}
       end
 
       defp maybe_create_cms_merge_dst(
@@ -2403,8 +2438,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp validate_bloom_auto_create_params(_invalid),
         do: {:error, :invalid_bloom_dimensions}
 
-      defp auto_create_bloom_if_needed(_state, path, key, :existing, _validated_params) do
-        with :ok <- require_prob_file(path, :bloom, key), do: {:ok, path}
+      defp auto_create_bloom_if_needed(state, path, key, :existing, _validated_params) do
+        with :ok <- require_prob_file(state, path, :bloom, key), do: {:ok, path}
       end
 
       defp auto_create_bloom_if_needed(_state, _path, _key, :missing, nil),
@@ -2476,8 +2511,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CompoundIndexes do
       defp validate_cuckoo_auto_create_params(_invalid),
         do: {:error, :invalid_cuckoo_parameters}
 
-      defp auto_create_cuckoo_if_needed(_state, path, key, :existing, _validated_params) do
-        with :ok <- require_prob_file(path, :cuckoo, key), do: {:ok, path}
+      defp auto_create_cuckoo_if_needed(state, path, key, :existing, _validated_params) do
+        with :ok <- require_prob_file(state, path, :cuckoo, key), do: {:ok, path}
       end
 
       defp auto_create_cuckoo_if_needed(_state, _path, _key, :missing, nil),

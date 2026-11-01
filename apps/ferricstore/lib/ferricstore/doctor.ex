@@ -13,8 +13,6 @@ defmodule Ferricstore.Doctor do
 
   alias Ferricstore.DataDir
   alias Ferricstore.FS
-  alias Ferricstore.ProbFile
-  alias Ferricstore.Store.CompoundKey
   alias Ferricstore.Flow.{LMDB, LMDBRebuilder, LMDBWriter}
 
   @default_scopes [:bitcask, :blob_refs, :flow_lmdb]
@@ -482,42 +480,14 @@ defmodule Ferricstore.Doctor do
   end
 
   defp prob_files_shard_metrics(ctx, shard_index) do
-    keydir = elem(ctx.keydir_refs, shard_index)
-    prob_dir = Path.join(DataDir.shard_data_path(ctx.data_dir, shard_index), "prob")
-    now = System.os_time(:millisecond)
-
-    {count, missing_count, missing} =
-      :ets.foldl(
-        fn
-          {<<"T:", _rest::binary>> = storage_key, value, expire_at_ms, _lfu, _fid, _off, _size},
-          {count, missing_count, missing} = acc
-          when is_binary(value) and is_integer(expire_at_ms) ->
-            type = CompoundKey.type_name(value)
-
-            if type in ~w(bloom cms cuckoo topk) and (expire_at_ms == 0 or expire_at_ms > now) do
-              key = CompoundKey.extract_redis_key(storage_key)
-
-              if FS.exists?(ProbFile.path(prob_dir, key, type)) do
-                {count + 1, missing_count, missing}
-              else
-                {count + 1, missing_count + 1, [key | missing]}
-              end
-            else
-              acc
-            end
-
-          _row, acc ->
-            acc
-        end,
-        {0, 0, []},
-        keydir
-      )
+    {count, missing} = Ferricstore.ProbRepair.missing_files(ctx, shard_index)
+    keys = missing |> Enum.map(&elem(&1, 0)) |> Enum.sort()
 
     %{
       "shard" => shard_index,
       "prob_keys" => count,
-      "missing_files" => missing_count,
-      "missing_keys" => missing |> Enum.sort() |> Enum.take(@max_reported_missing_prob_keys)
+      "missing_files" => length(keys),
+      "missing_keys" => Enum.take(keys, @max_reported_missing_prob_keys)
     }
   rescue
     ArgumentError -> %{"shard" => shard_index, "prob_keys" => nil, "missing_files" => 0}
