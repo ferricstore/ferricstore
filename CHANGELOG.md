@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A burst of Flow writes no longer leaves Flows out of the LMDB projection
+  until the node restarts. When the LMDB writer's queue was full, the Raft
+  apply path marked the shard's mirror degraded and dropped the projection,
+  and nothing repaired it: after 100k FLOW.CREATE_MANY flows in 500-flow
+  batches on one shard, 11-13k flows (whole batches) had no query row,
+  catalog entry or index entries, reads that check the mirror answered `ERR
+  flow LMDB mirror degraded`, and query index builds completed without
+  them. The apply path now also marks the shard's projection dirty, so the
+  writer reconciles it from the keydir once it catches up, which clears the
+  degraded flag. In that run, all 100k flows were projected after the
+  writer drained.
+
 - An index build step now takes pages for up to 50 ms
   (`step_budget_ms`) before it checkpoints and pauses, instead of one page
   per step: each step pays a journal fsync and a 10 ms pause, which were
