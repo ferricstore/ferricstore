@@ -37,6 +37,7 @@ defmodule Ferricstore.Flow.LMDBWriter do
   alias Ferricstore.Flow.LMDBFlushCoordinator
   alias Ferricstore.Flow.LMDBReplaySafeIndex
   alias Ferricstore.Flow.LMDBWriter.Config
+  alias Ferricstore.Raft.WARaftSegmentReader
 
   require Logger
 
@@ -1281,8 +1282,12 @@ defmodule Ferricstore.Flow.LMDBWriter do
          source_wait
        ) do
     with {:ok, ready_state} <- maybe_ensure_lmdb_ready(state, source_ops),
+         # A backlog reads many keys of each spilled apply-projection batch;
+         # decode each batch once per pass instead of once per key.
          {:ok, expanded_ops, projected_state} <-
-           ProjectionOps.expand_ops(ready_state, source_ops, source_wait),
+           WARaftSegmentReader.with_disk_batch_cache(fn ->
+             ProjectionOps.expand_ops(ready_state, source_ops, source_wait)
+           end),
          :ok <-
            Ferricstore.FaultInjection.maybe_pause(:before_flow_lmdb_flush_write, %{
              instance_name: projected_state.instance_name,
