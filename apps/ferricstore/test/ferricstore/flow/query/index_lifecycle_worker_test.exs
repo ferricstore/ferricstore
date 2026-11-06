@@ -862,6 +862,185 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     assert complete.written_entries == 8
   end
 
+  test "asks for pages of hundreds of records by default" do
+    {ctx, registry, worker, data_dir} = test_context("default_pages")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, items, _bytes ->
+          send(parent, {:snapshot_items, items})
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, _cursor, items, _bytes, _opts ->
+          send(parent, {:backfill_items, items})
+          {:ok, %{records: [], cursor: "", done?: true, scanned_entries: 0, hydrated_bytes: 0}}
+        end,
+        project_fun: fn _ctx, 0, [], _definitions ->
+          {:ok, %{projected_records: 0, written_entries: 0, write_ops: 0, written_bytes: 0}}
+        end,
+        validation_fun: fn _ctx, 0, _build_id, definitions, checkpoint, items, _bytes ->
+          send(parent, {:validation_items, items})
+          {:ok, advance_validation(checkpoint, length(definitions))}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert_receive {:snapshot_items, 256}
+    assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
+    assert_receive {:backfill_items, 64}
+    assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_progress} = IndexLifecycleWorker.run_once(worker)
+    assert_receive {:validation_items, 256}
+  end
+
+  test "halves a snapshot page until it fits the byte budget" do
+    {ctx, registry, worker, data_dir} = test_context("adaptive_snapshot_page")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, items, _bytes ->
+          send(parent, {:snapshot_attempt, items})
+
+          if items > 32,
+            do: {:error, :query_backfill_snapshot_page_too_large},
+            else: {:ok, %{done?: false, scanned_keys: items, staged_states: items}}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_progress} = IndexLifecycleWorker.run_once(worker)
+
+    for items <- [256, 128, 64, 32], do: assert_receive({:snapshot_attempt, ^items})
+    refute_receive {:snapshot_attempt, _items}
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert checkpoint.phase == :snapshot
+    assert checkpoint.scanned_records == 32
+  end
+
+  test "reports a snapshot page that does not fit even one record" do
+    {ctx, registry, worker, data_dir} = test_context("oversized_snapshot_record")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, items, _bytes ->
+          send(parent, {:snapshot_attempt, items})
+          {:error, :query_backfill_snapshot_page_too_large}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+
+    assert {:error, :query_backfill_snapshot_page_too_large} =
+             IndexLifecycleWorker.run_once(worker)
+
+    for items <- [256, 128, 64, 32, 16, 8, 4, 2, 1],
+        do: assert_receive({:snapshot_attempt, ^items})
+
+    refute_receive {:snapshot_attempt, _items}
+  end
+
+  test "halves a validation page until its reads fit the byte budget" do
+    {ctx, registry, worker, data_dir} = test_context("adaptive_validation_page")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, _cursor, _items, _bytes, _opts ->
+          {:ok, %{records: [], cursor: "", done?: true, scanned_entries: 0, hydrated_bytes: 0}}
+        end,
+        project_fun: fn _ctx, 0, [], _definitions ->
+          {:ok, %{projected_records: 0, written_entries: 0, write_ops: 0, written_bytes: 0}}
+        end,
+        validation_fun: fn _ctx, 0, _build_id, definitions, checkpoint, items, _bytes ->
+          send(parent, {:validation_attempt, items})
+
+          if items > 64,
+            do: {:error, :query_index_validation_read_budget_exceeded},
+            else: {:ok, advance_validation(checkpoint, length(definitions))}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_progress} = IndexLifecycleWorker.run_once(worker)
+
+    for items <- [256, 128, 64], do: assert_receive({:validation_attempt, ^items})
+    refute_receive {:validation_attempt, _items}
+  end
+
+  test "halves a backfill page whose records do not fit the hydration budget" do
+    {ctx, registry, worker, data_dir} = test_context("adaptive_hydration_page")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, "", items, _bytes, _opts ->
+          send(parent, {:hydration_attempt, items})
+
+          if items > 16 do
+            {:error, :query_backfill_hydration_budget_exceeded}
+          else
+            {:ok,
+             %{
+               records: [%{state_key: "state", record: nil, expire_at_ms: 0}],
+               cursor: "cursor-1",
+               done?: false,
+               scanned_entries: 1,
+               hydrated_bytes: 0
+             }}
+          end
+        end,
+        project_fun: fn _ctx, 0, records, _definitions ->
+          {:ok,
+           %{
+             projected_records: length(records),
+             written_entries: 0,
+             write_ops: 0,
+             written_bytes: 0
+           }}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+
+    for items <- [64, 32, 16], do: assert_receive({:hydration_attempt, ^items})
+    refute_receive {:hydration_attempt, _items}
+  end
+
   test "rejects a snapshot callback that reports no progress" do
     {ctx, registry, worker, data_dir} = test_context("snapshot_stall")
     on_exit(fn -> File.rm_rf!(data_dir) end)

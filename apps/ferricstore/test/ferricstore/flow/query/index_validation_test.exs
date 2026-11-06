@@ -87,6 +87,44 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
     assert {:ok, ^expected_value} = LMDB.get(lmdb_path(ctx), entry.key)
   end
 
+  test "checks a page of small records in one source step", context do
+    %{ctx: ctx, keydir: keydir, definition: definition} = context
+    build_id = "wide-source-page"
+    project_records!(ctx, keydir, build_id, definition, 64)
+
+    # The worst case of 128 entries per record per definition no longer cuts
+    # the page to a few records; the byte and read-key budgets still apply.
+    assert {:ok, source_done} =
+             IndexValidation.step(
+               ctx,
+               0,
+               build_id,
+               [definition],
+               IndexValidation.empty_checkpoint(),
+               64,
+               8 * 1_024 * 1_024
+             )
+
+    assert source_done.phase == :index
+    assert source_done.checked_records == 64
+    assert source_done.checked_entries == 64
+    assert source_done.mismatches == 0
+
+    assert {:ok, index_done} =
+             IndexValidation.step(
+               ctx,
+               0,
+               build_id,
+               [definition],
+               source_done,
+               256,
+               8 * 1_024 * 1_024
+             )
+
+    assert index_done.phase == :counter
+    assert index_done.checked_entries == 128
+  end
+
   test "validates shared composite rows from opaque QueryRow routing scope", context do
     %{ctx: ctx, keydir: keydir, definition: dedicated_definition} = context
 
@@ -934,7 +972,8 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
     refute_receive :unexpected_validation_page_read
   end
 
-  test "caps source pages by worst-case composite read cardinality", context do
+  test "caps source pages so one entry per definition per record fits the read-key budget",
+       context do
     %{ctx: ctx, definition: definition} = context
     parent = self()
 
@@ -967,12 +1006,27 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
                "cardinality-build",
                definitions,
                IndexValidation.empty_checkpoint(),
-               16,
+               256,
                16 * 1_024 * 1_024,
                staging_page_fun: staging_page
              )
 
-    assert_receive {:validation_page_budget, 1, 16_777_216}
+    # 2,048 read keys over 16 definitions.
+    assert_receive {:validation_page_budget, 128, 16_777_216}
+  end
+
+  test "reports a source page whose reads exceed the byte budget so it can be retried smaller",
+       context do
+    %{ctx: ctx, keydir: keydir, definition: definition} = context
+    build_id = "over-budget-source-page"
+    project_records!(ctx, keydir, build_id, definition, 64)
+    checkpoint = IndexValidation.empty_checkpoint()
+
+    assert {:error, :query_index_validation_read_budget_exceeded} =
+             IndexValidation.step(ctx, 0, build_id, [definition], checkpoint, 64, 16 * 1_024)
+
+    assert {:ok, %{phase: :source, checked_records: 8, mismatches: 0}} =
+             IndexValidation.step(ctx, 0, build_id, [definition], checkpoint, 8, 16 * 1_024)
   end
 
   test "rejects validation checkpoint counters outside the durable u64 domain", context do
@@ -1206,6 +1260,24 @@ defmodule Ferricstore.Flow.Query.IndexValidationTest do
 
     assert :ok = LMDB.write_batch(path, [{:put, state_key, state_blob} | ops])
     {state_key, record}
+  end
+
+  defp project_records!(ctx, keydir, build_id, definition, count) do
+    path = lmdb_path(ctx)
+
+    records =
+      for number <- 1..count do
+        record = record("run-#{number}", "tenant-a", number)
+        state_key = Keys.state_key(record.id, record.partition_key)
+        :ets.insert(keydir, {state_key, <<>>, 0, 0, 0, 0, 0})
+        catalog_key = Keys.type_catalog_member_key(record.type, state_key)
+        assert {:ok, source_catalog_op} = SourceCatalog.put_op(catalog_key, state_key)
+        assert :ok = LMDB.write_batch(path, [source_catalog_op])
+        record
+      end
+
+    snapshot_all!(ctx, build_id)
+    Enum.each(records, &put_projected_record!(ctx, definition, &1))
   end
 
   defp snapshot_all!(ctx, build_id) do

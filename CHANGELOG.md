@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Query indexes build over existing Flows about 15 times faster. Each build
+  step paid an LMDB commit, a journaled checkpoint and a 10 ms pause for a
+  page of 8 records (3 in the first validation pass), because pages were
+  sized as if every record were 1 MiB with 128 index entries per definition.
+  Pages now hold up to 256 records (64 while projecting) within the same
+  8 MiB budget, counted on the bytes actually read, and a page that does not
+  fit is retried at half the size. Over 20k existing Flows, the five built-in
+  indexes went from building to active in 30 s instead of 470 s. Retiring an
+  index deletes up to 256 rows per step instead of 8.
+
 - The Flow LMDB writer catches up after a burst about three times faster and
   holds less memory while it does. Reading a spilled apply-projection row
   decoded its command's whole batch, and the writer read a backlog key by

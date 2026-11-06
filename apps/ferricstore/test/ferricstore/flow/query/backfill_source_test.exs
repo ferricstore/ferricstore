@@ -92,6 +92,106 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
     assert {:ok, []} = LMDB.prefix_entries(lmdb_path, prefix, 10)
   end
 
+  test "pages small records past the worst-case value size in bounded primary reads", %{
+    ctx: ctx
+  } do
+    # A 1 MiB max_value_size allows eight primaries per 8 MiB read, but a page
+    # of small records is not cut to eight.
+    build_id = "small-records"
+    values = staged_records!(ctx, build_id, 64, "")
+    parent = self()
+
+    read_entries = fn _ctx, 0, keys ->
+      send(parent, {:primary_read, length(keys)})
+      {:ok, Enum.map(keys, &{Map.fetch!(values, &1), 0})}
+    end
+
+    assert {:ok, page} =
+             BackfillSource.page(ctx, 0, build_id, "", 64, 8 * 1_024 * 1_024,
+               read_entries_fun: read_entries
+             )
+
+    assert length(page.records) == 64
+    assert page.scanned_entries == 64
+    assert page.done?
+    assert Enum.sort(Enum.map(page.records, & &1.state_key)) == Enum.sort(Map.keys(values))
+
+    reads = primary_reads()
+    assert Enum.sum(reads) == 64
+    assert Enum.all?(reads, &(&1 <= 8))
+  end
+
+  test "ends a page at the byte budget and resumes after its last hydrated record", %{
+    ctx: ctx
+  } do
+    build_id = "budget-records"
+    values = staged_records!(ctx, build_id, 10, String.duplicate("x", 400))
+    value_size = values |> Map.values() |> Enum.map(&byte_size/1) |> Enum.max()
+    ctx = %{ctx | max_value_size: value_size}
+    max_bytes = 4 * value_size + div(value_size, 2)
+
+    read_entries = fn _ctx, 0, keys ->
+      {:ok, Enum.map(keys, &{Map.fetch!(values, &1), 0})}
+    end
+
+    pages =
+      Stream.unfold({"", false}, fn
+        {_cursor, true} ->
+          nil
+
+        {cursor, false} ->
+          assert {:ok, page} =
+                   BackfillSource.page(ctx, 0, build_id, cursor, 64, max_bytes,
+                     read_entries_fun: read_entries
+                   )
+
+          assert page.hydrated_bytes <= max_bytes
+          assert page.done? or page.cursor > cursor
+          {page, {page.cursor, page.done?}}
+      end)
+      |> Enum.to_list()
+
+    assert Enum.map(pages, &length(&1.records)) == [4, 4, 2]
+    assert Enum.map(pages, & &1.scanned_entries) == [4, 4, 2]
+
+    hydrated = Enum.flat_map(pages, fn page -> Enum.map(page.records, & &1.state_key) end)
+    assert Enum.sort(hydrated) == Enum.sort(Map.keys(values))
+  end
+
+  test "keeps each primary read within the shard reader's key limits", %{ctx: ctx} do
+    # Small values allow large reads, but 64 state keys of 40 KB each are
+    # more key bytes than one shard batch read accepts.
+    build_id = "long-keys"
+    padding = String.duplicate("k", 40_000)
+    ctx = %{ctx | max_value_size: 4_096}
+
+    values =
+      Map.new(1..64, fn number ->
+        id = "run-#{number}-#{padding}"
+        state_key = Keys.state_key(id, "tenant-a")
+        put_catalog_member!(ctx, "invoice", state_key, 0)
+        {state_key, encoded_record(id, "tenant-a", number)}
+      end)
+
+    snapshot_all!(ctx, build_id, 8)
+    parent = self()
+
+    read_entries = fn _ctx, 0, keys ->
+      send(parent, {:primary_read_keys, length(keys), Enum.sum(Enum.map(keys, &byte_size/1))})
+      {:ok, Enum.map(keys, &{Map.fetch!(values, &1), 0})}
+    end
+
+    assert {:ok, page} =
+             BackfillSource.page(ctx, 0, build_id, "", 64, 8 * 1_024 * 1_024,
+               read_entries_fun: read_entries
+             )
+
+    assert length(page.records) == 64
+    reads = primary_read_keys()
+    assert Enum.sum(Enum.map(reads, &elem(&1, 0))) == 64
+    assert Enum.all?(reads, fn {count, key_bytes} -> count <= 512 and key_bytes <= 1_048_576 end)
+  end
+
   test "resumes a durable source-catalog cursor without a live keydir", %{ctx: ctx} do
     first_key = Keys.state_key("one", "tenant-a")
     second_key = Keys.state_key("two", "tenant-a")
@@ -477,6 +577,42 @@ defmodule Ferricstore.Flow.Query.BackfillSourceTest do
     case BackfillSource.snapshot_page(ctx, 0, build_id, page_size, 1_024 * 1_024) do
       {:ok, %{done?: true}} -> :ok
       {:ok, %{done?: false}} -> snapshot_all!(ctx, build_id, page_size)
+    end
+  end
+
+  defp staged_records!(ctx, build_id, count, padding) do
+    values =
+      Map.new(1..count, fn number ->
+        id = "run-#{number}"
+        state_key = Keys.state_key(id, "tenant-a")
+        put_catalog_member!(ctx, "invoice", state_key, 0)
+
+        encoded =
+          encoded_record(id, "tenant-a", number)
+          |> Ferricstore.Flow.decode_record()
+          |> Map.put(:correlation_id, if(padding == "", do: nil, else: padding))
+          |> Ferricstore.Flow.encode_record()
+
+        {state_key, encoded}
+      end)
+
+    snapshot_all!(ctx, build_id, 256)
+    values
+  end
+
+  defp primary_read_keys(acc \\ []) do
+    receive do
+      {:primary_read_keys, count, key_bytes} -> primary_read_keys([{count, key_bytes} | acc])
+    after
+      0 -> Enum.reverse(acc)
+    end
+  end
+
+  defp primary_reads(acc \\ []) do
+    receive do
+      {:primary_read, count} -> primary_reads([count | acc])
+    after
+      0 -> Enum.reverse(acc)
     end
   end
 
