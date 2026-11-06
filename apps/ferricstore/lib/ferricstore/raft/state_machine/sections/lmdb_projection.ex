@@ -747,21 +747,37 @@ defmodule Ferricstore.Raft.StateMachine.Sections.LmdbProjection do
 
       defp observe_pending_lmdb_mirror_enqueue(_state, :ok), do: :ok
 
+      # The refused projection is not retried, so the writer is told to
+      # reconcile the shard from its keydir once it catches up; that repair is
+      # what clears the degraded flag.
       defp observe_pending_lmdb_mirror_enqueue(
              state,
              {:error, {:lmdb_shard, shard_index, reason}}
            )
            when is_integer(shard_index) and shard_index >= 0 do
         mark_flow_lmdb_mirror_degraded(state, shard_index, reason)
-        :ok
+        request_lmdb_projection_reconcile(state, shard_index)
       end
 
       defp observe_pending_lmdb_mirror_enqueue(state, {:error, reason}) do
         mark_flow_lmdb_mirror_degraded(state, reason)
-        :ok
+        request_lmdb_projection_reconcile(state, Map.get(state, :shard_index, 0))
       end
 
       defp observe_pending_lmdb_mirror_enqueue(_state, _other), do: :ok
+
+      # A writer that cannot take the marker either is restarting, and marks
+      # its projection dirty on startup, or is stopped with the mirror left
+      # degraded.
+      defp request_lmdb_projection_reconcile(state, shard_index) do
+        _ =
+          Ferricstore.Flow.LMDBWriter.mark_projection_dirty(
+            Map.get(state, :instance_name, :default),
+            shard_index
+          )
+
+        :ok
+      end
 
       defp mark_flow_lmdb_mirror_degraded(state, reason) do
         mark_flow_lmdb_mirror_degraded(state, Map.get(state, :shard_index, 0), reason)
