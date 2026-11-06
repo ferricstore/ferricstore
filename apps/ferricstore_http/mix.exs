@@ -33,9 +33,22 @@ defmodule FerricstoreHttp.MixProject do
   defp deps do
     [
       {:ferricstore_server, in_umbrella: true},
-      {:cowboy, "~> 2.18.0"},
+      # No Hex release of Cowboy or Cowlib has these fixes yet, so both are
+      # pinned to upstream master, which pairs them ("Temporarily depend on
+      # Cowlib master"):
+      #   Cowboy 3a630c07  EEF-CVE-2026-115701  pipelined HTTP/1.1 data
+      #                    buffered without bound while a request runs
+      #   Cowlib 4401b858  EEF-CVE-2026-43966   response splitting through
+      #                    non-VCHAR bytes in structured headers
+      #   Cowlib a3b15e29  EEF-CVE-2026-113431  HPACK amplification through
+      #                    an unbounded decoded HTTP/2 header list
+      # Return to Hex releases once they include these commits. Cowboy names
+      # ranch 1.8; ranch 2.2 replaces it, as with Hex Cowboy.
+      {:cowboy,
+       github: "ninenines/cowboy", ref: "269595e95cdec10f52236d7026b6bb9031778619", override: true},
       {:cowlib,
-       github: "ninenines/cowlib", ref: "834c19854c2d6b6b0840d7ff90b0775e9f67f631", override: true},
+       github: "ninenines/cowlib", ref: "68e6a981aa26ef366099d76e54b028616aa8e6df", override: true},
+      {:ranch, "~> 2.2.1", override: true},
       {:jason, "~> 1.4"},
       {:mint, "~> 1.10.2"},
       {:msgpax, "~> 2.4.0"},
