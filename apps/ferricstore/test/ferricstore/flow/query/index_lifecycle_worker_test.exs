@@ -1041,6 +1041,270 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     refute_receive {:hydration_attempt, _items}
   end
 
+  test "takes snapshot and backfill pages until the step budget is spent, then checkpoints once" do
+    {ctx, registry, worker, data_dir} = test_context("multi_page_build_step")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+    {:ok, snapshot_pages} = Agent.start_link(fn -> 0 end)
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        step_budget_ms: 60_000,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, items, _bytes ->
+          page = Agent.get_and_update(snapshot_pages, &{&1 + 1, &1 + 1})
+          send(parent, {:snapshot_page, page})
+          {:ok, %{done?: page == 4, scanned_keys: items, staged_states: items}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, cursor, _items, _bytes, _opts ->
+          offset = if cursor == "", do: 0, else: String.to_integer(cursor)
+          send(parent, {:backfill_page, offset})
+
+          {:ok,
+           %{
+             records: [%{state_key: "state-#{offset}", record: nil, expire_at_ms: 0}],
+             cursor: Integer.to_string(offset + 1),
+             done?: offset == 2,
+             scanned_entries: 1,
+             hydrated_bytes: 0
+           }}
+        end,
+        project_fun: fn _ctx, 0, records, _definitions ->
+          {:ok,
+           %{
+             projected_records: length(records),
+             written_entries: 1,
+             write_ops: 1,
+             written_bytes: 10
+           }}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    for page <- 1..4, do: assert_receive({:snapshot_page, ^page})
+    refute_receive {:snapshot_page, _page}
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{checkpoints: %{0 => snapshot_done}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert snapshot_done.phase == :backfill
+    assert snapshot_done.scanned_records == 4 * 256
+
+    assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
+    for offset <- 0..2, do: assert_receive({:backfill_page, ^offset})
+    refute_receive {:backfill_page, _offset}
+
+    assert {:ok, %{checkpoints: %{0 => backfill_done}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert backfill_done.phase == :done
+    assert backfill_done.scanned_records == 4 * 256 + 3
+    assert backfill_done.written_entries == 3
+  end
+
+  test "stops a multi-page step at its budget and resumes from the committed cursor" do
+    {ctx, registry, worker, data_dir} = test_context("budgeted_build_step")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+    {:ok, clock} = Agent.start_link(fn -> 0 end)
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        step_budget_ms: 30,
+        clock_fun: fn -> Agent.get(clock, & &1) end,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, cursor, _items, _bytes, _opts ->
+          offset = if cursor == "", do: 0, else: String.to_integer(cursor)
+          send(parent, {:backfill_page, offset})
+          Agent.update(clock, &(&1 + 20))
+
+          {:ok,
+           %{
+             records: [],
+             cursor: Integer.to_string(offset + 1),
+             done?: offset == 9,
+             scanned_entries: 1,
+             hydrated_bytes: 0
+           }}
+        end,
+        project_fun: fn _ctx, 0, [], _definitions ->
+          {:ok, %{projected_records: 0, written_entries: 0, write_ops: 0, written_bytes: 0}}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+
+    # 20 ms pages against a 30 ms budget: two pages, then a checkpoint.
+    assert_receive {:backfill_page, 0}
+    assert_receive {:backfill_page, 1}
+    refute_receive {:backfill_page, 2}
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert checkpoint.cursor == "2"
+
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+    assert_receive {:backfill_page, 2}
+  end
+
+  test "takes validation pages within one definition, then commits at the next boundary" do
+    {ctx, registry, worker, data_dir} = test_context("multi_page_validation_step")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+    parent = self()
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        step_budget_ms: 60_000,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, _cursor, _items, _bytes, _opts ->
+          {:ok, %{records: [], cursor: "", done?: true, scanned_entries: 0, hydrated_bytes: 0}}
+        end,
+        project_fun: fn _ctx, 0, [], _definitions ->
+          {:ok, %{projected_records: 0, written_entries: 0, write_ops: 0, written_bytes: 0}}
+        end,
+        validation_fun: fn _ctx, 0, _build_id, _definitions, checkpoint, _items, _bytes ->
+          send(parent, {:validate, checkpoint.phase, checkpoint.cursor})
+
+          case checkpoint do
+            %{phase: :source, cursor: cursor} when cursor in ["", "a", "b"] ->
+              next = %{"" => "a", "a" => "b", "b" => "c"} |> Map.fetch!(cursor)
+
+              {:ok, %{checkpoint | cursor: next, checked_records: checkpoint.checked_records + 1}}
+
+            %{phase: :source} ->
+              {:ok, %{checkpoint | phase: :index, cursor: "", definition_position: 0}}
+          end
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_progress} = IndexLifecycleWorker.run_once(worker)
+
+    for cursor <- ["", "a", "b", "c"], do: assert_receive({:validate, :source, ^cursor})
+    refute_receive {:validate, _phase, _cursor}
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{validation_checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert checkpoint.phase == :index
+    assert checkpoint.definition_position == 0
+    assert checkpoint.checked_records == 3
+  end
+
+  test "commits the pages before a failed one and reports the failure on the next step" do
+    {ctx, registry, worker, data_dir} = test_context("failed_page_in_step")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, _registry_pid} = start_registry(ctx, registry)
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        step_budget_ms: 60_000,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, cursor, _items, _bytes, _opts ->
+          offset = if cursor == "", do: 0, else: String.to_integer(cursor)
+
+          if offset == 2 do
+            {:error, :query_backfill_primary_unavailable}
+          else
+            {:ok,
+             %{
+               records: [],
+               cursor: Integer.to_string(offset + 1),
+               done?: false,
+               scanned_entries: 1,
+               hydrated_bytes: 0
+             }}
+          end
+        end,
+        project_fun: fn _ctx, 0, [], _definitions ->
+          {:ok, %{projected_records: 0, written_entries: 0, write_ops: 0, written_bytes: 0}}
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert checkpoint.cursor == "2"
+    assert checkpoint.scanned_records == 3
+
+    assert {:error, :query_backfill_primary_unavailable} =
+             IndexLifecycleWorker.run_once(worker)
+  end
+
+  test "commits the validation pages before a retried one" do
+    {ctx, registry, worker, data_dir} = test_context("retried_validation_page_in_step")
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    {:ok, registry_pid} = start_registry(ctx, registry)
+
+    {:ok, _worker_pid} =
+      start_worker(ctx, registry, worker,
+        step_budget_ms: 60_000,
+        barrier_fun: fn _ctx, _shard -> :ok end,
+        snapshot_page_fun: fn _ctx, 0, _build_id, _items, _bytes ->
+          {:ok, %{done?: true, scanned_keys: 1, staged_states: 1}}
+        end,
+        page_fun: fn _ctx, 0, _build_id, _cursor, _items, _bytes, _opts ->
+          {:ok, %{records: [], cursor: "", done?: true, scanned_entries: 0, hydrated_bytes: 0}}
+        end,
+        project_fun: fn _ctx, 0, [], _definitions ->
+          {:ok, %{projected_records: 0, written_entries: 0, write_ops: 0, written_bytes: 0}}
+        end,
+        validation_fun: fn _ctx, 0, _build_id, _definitions, checkpoint, _items, _bytes ->
+          case checkpoint.cursor do
+            "" -> {:ok, %{checkpoint | cursor: "a", checked_records: 1}}
+            "a" -> {:retry, :query_index_validation_concurrent_change}
+          end
+        end
+      )
+
+    assert {:ok, :build_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
+    assert {:ok, :validation_progress} = IndexLifecycleWorker.run_once(worker)
+
+    assert {:ok, %{indexes: [index | _]}} = IndexRegistry.snapshot(ctx, 0)
+
+    assert {:ok, %{validation_checkpoints: %{0 => checkpoint}}} =
+             IndexRegistry.build_status(registry, index.build_id)
+
+    assert checkpoint.cursor == "a"
+    assert checkpoint.checked_records == 1
+    assert {:ok, :validation_retry} = IndexLifecycleWorker.run_once(worker)
+    assert Process.alive?(registry_pid)
+  end
+
   test "rejects a snapshot callback that reports no progress" do
     {ctx, registry, worker, data_dir} = test_context("snapshot_stall")
     on_exit(fn -> File.rm_rf!(data_dir) end)
@@ -1202,6 +1466,8 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
       instance_ctx: ctx,
       registry: registry,
       auto_run?: false,
+      # One page per step unless a test asks for a step budget.
+      step_budget_ms: 0,
       pressure_fun: fn -> false end,
       ready_fun: fn _ctx, _shard -> true end,
       drain_fun: fn _ctx, _index -> true end

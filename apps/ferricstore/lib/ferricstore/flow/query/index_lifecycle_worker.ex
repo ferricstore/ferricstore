@@ -26,6 +26,8 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   @default_scan_items 256
   @default_max_bytes 8 * 1_024 * 1_024
   @default_shard_concurrency 4
+  @default_step_budget_ms 50
+  @max_step_budget_ms 5_000
   @max_page_items 256
   @max_page_bytes 16 * 1_024 * 1_024
   @max_shard_concurrency 8
@@ -87,6 +89,14 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
           @max_shard_concurrency
         ),
       max_bytes: max_bytes,
+      step_budget_ms:
+        bounded_nonnegative_opt(
+          opts,
+          :step_budget_ms,
+          @default_step_budget_ms,
+          @max_step_budget_ms
+        ),
+      clock_fun: Keyword.get(opts, :clock_fun, fn -> System.monotonic_time(:millisecond) end),
       pressure_fun: Keyword.get(opts, :pressure_fun, &Ferricstore.OperationalGuard.pressure?/0),
       ready_fun: Keyword.get(opts, :ready_fun, &backend_ready?/2),
       snapshot_page_fun: Keyword.get(opts, :snapshot_page_fun, &BackfillSource.snapshot_page/5),
@@ -240,10 +250,68 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   defp run_phase(
          state,
          build_id,
-         _indexes,
+         indexes,
          shard_index,
          %{phase: :snapshot, fenced: true} = checkpoint
+       ),
+       do: advance_build(state, build_id, indexes, shard_index, checkpoint, step_deadline(state))
+
+  defp run_phase(state, build_id, indexes, shard_index, %{phase: :backfill} = checkpoint),
+    do: advance_build(state, build_id, indexes, shard_index, checkpoint, step_deadline(state))
+
+  defp run_phase(_state, _build_id, _indexes, _shard_index, %{phase: :done}),
+    do: {:ok, :idle}
+
+  defp run_phase(_state, _build_id, _indexes, _shard_index, _checkpoint),
+    do: {:error, :invalid_query_index_checkpoint}
+
+  # A step takes pages until step_budget_ms is spent or the phase ends, then
+  # checkpoints once; each checkpoint is a journal fsync. A page that fails
+  # after others succeeded ends the step at the last good page, and the next
+  # step starts with it.
+  defp advance_build(state, build_id, indexes, shard_index, checkpoint, deadline),
+    do:
+      advance_build(
+        state,
+        build_id,
+        indexes,
+        shard_index,
+        checkpoint,
+        checkpoint.phase,
+        deadline,
+        false
+      )
+
+  defp advance_build(
+         state,
+         build_id,
+         indexes,
+         shard_index,
+         checkpoint,
+         start_phase,
+         deadline,
+         advanced?
        ) do
+    case build_page(state, build_id, indexes, shard_index, checkpoint) do
+      {:ok, %{phase: ^start_phase} = next} ->
+        if before_deadline?(state, deadline) do
+          advance_build(state, build_id, indexes, shard_index, next, start_phase, deadline, true)
+        else
+          commit_build_step(state, build_id, shard_index, start_phase, next)
+        end
+
+      {:ok, next} ->
+        commit_build_step(state, build_id, shard_index, start_phase, next)
+
+      _failed when advanced? ->
+        commit_build_step(state, build_id, shard_index, start_phase, checkpoint)
+
+      failed ->
+        failed
+    end
+  end
+
+  defp build_page(state, build_id, _indexes, shard_index, %{phase: :snapshot} = checkpoint) do
     snapshot_page =
       shrink_on_budget(state.snapshot_items, :query_backfill_snapshot_page_too_large, fn items ->
         {items,
@@ -258,22 +326,15 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
     case snapshot_page do
       {items, {:ok, page}} ->
-        with :ok <- validate_snapshot_page(page, items),
-             %{done?: done?, scanned_keys: scanned_keys} <- page do
-          progress =
-            checkpoint_progress(checkpoint,
-              phase: if(done?, do: :backfill, else: :snapshot),
-              cursor: "",
-              fenced: true,
-              scanned_records: checkpoint.scanned_records + scanned_keys
-            )
-
-          with :ok <-
-                 IndexRegistry.checkpoint_build(state.registry, build_id, shard_index, progress) do
-            if done?, do: {:ok, :snapshot_complete}, else: {:ok, :snapshot_progress}
-          end
-        else
-          {:error, _reason} = error -> error
+        with :ok <- validate_snapshot_page(page, items) do
+          {:ok,
+           %{
+             checkpoint
+             | phase: if(page.done?, do: :backfill, else: :snapshot),
+               cursor: "",
+               fenced: true,
+               scanned_records: checkpoint.scanned_records + page.scanned_keys
+           }}
         end
 
       {_items, {:error, _reason} = error} ->
@@ -284,55 +345,57 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
     end
   end
 
-  defp run_phase(state, build_id, indexes, shard_index, %{phase: :backfill} = checkpoint) do
+  defp build_page(state, build_id, indexes, shard_index, %{phase: :backfill} = checkpoint) do
     definitions = Enum.map(indexes, & &1.definition)
 
-    with {:ok, page, metrics} <-
-           read_and_project_backfill_page(
-             state,
-             build_id,
-             shard_index,
-             checkpoint.cursor,
-             state.backfill_items,
-             definitions
-           ) do
-      progress =
-        checkpoint_progress(checkpoint,
-          phase: if(page.done?, do: :done, else: :backfill),
-          cursor: if(page.done?, do: "", else: page.cursor),
-          fenced: true,
-          scanned_records: checkpoint.scanned_records + page.scanned_entries,
-          written_entries: checkpoint.written_entries + metrics.written_entries,
-          written_bytes: checkpoint.written_bytes + metrics.written_bytes
-        )
+    case read_and_project_backfill_page(
+           state,
+           build_id,
+           shard_index,
+           checkpoint.cursor,
+           state.backfill_items,
+           definitions
+         ) do
+      {:ok, page, metrics} ->
+        {:ok,
+         %{
+           checkpoint
+           | phase: if(page.done?, do: :done, else: :backfill),
+             cursor: if(page.done?, do: "", else: page.cursor),
+             fenced: true,
+             scanned_records: checkpoint.scanned_records + page.scanned_entries,
+             written_entries: checkpoint.written_entries + metrics.written_entries,
+             written_bytes: checkpoint.written_bytes + metrics.written_bytes
+         }}
 
-      if page.done? do
-        with :ok <-
-               IndexRegistry.complete_build_shard(
-                 state.registry,
-                 build_id,
-                 shard_index,
-                 progress
-               ) do
-          {:ok, :shard_complete}
-        end
-      else
-        with :ok <-
-               IndexRegistry.checkpoint_build(state.registry, build_id, shard_index, progress) do
-          {:ok, :backfill_progress}
-        end
-      end
-    else
-      {:error, _reason} = error -> error
-      _invalid -> {:error, :invalid_query_backfill_result}
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, :invalid_query_backfill_result}
     end
   end
 
-  defp run_phase(_state, _build_id, _indexes, _shard_index, %{phase: :done}),
-    do: {:ok, :idle}
+  defp commit_build_step(state, build_id, shard_index, _start_phase, %{phase: :done} = next) do
+    progress = checkpoint_progress(next, phase: :done, cursor: "")
 
-  defp run_phase(_state, _build_id, _indexes, _shard_index, _checkpoint),
-    do: {:error, :invalid_query_index_checkpoint}
+    with :ok <-
+           IndexRegistry.complete_build_shard(state.registry, build_id, shard_index, progress) do
+      {:ok, :shard_complete}
+    end
+  end
+
+  defp commit_build_step(state, build_id, shard_index, start_phase, next) do
+    progress = checkpoint_progress(next, phase: next.phase, cursor: next.cursor)
+
+    with :ok <- IndexRegistry.checkpoint_build(state.registry, build_id, shard_index, progress) do
+      {:ok, build_step_result(start_phase, next.phase)}
+    end
+  end
+
+  defp build_step_result(:snapshot, :snapshot), do: :snapshot_progress
+  defp build_step_result(:snapshot, :backfill), do: :snapshot_complete
+  defp build_step_result(:backfill, :backfill), do: :backfill_progress
 
   defp read_and_project_backfill_page(
          state,
@@ -486,33 +549,14 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
        when phase in [:source, :index, :counter] do
     definitions = Enum.map(indexes, & &1.definition)
 
-    {items, result} =
-      shrink_on_budget(
-        state.scan_items,
-        :query_index_validation_read_budget_exceeded,
-        fn items ->
-          {items,
-           state.validation_fun.(
-             state.instance_ctx,
-             shard_index,
-             build_id,
-             definitions,
-             checkpoint,
-             items,
-             state.max_bytes
-           )}
-        end
-      )
-
-    handle_validation_result(
+    advance_validation(
       state,
       build_id,
       shard_index,
       definitions,
       checkpoint,
-      items,
-      result,
-      true
+      step_deadline(state),
+      false
     )
   end
 
@@ -523,7 +567,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
          shard_index,
          %{phase: :cleanup, fenced: true}
        ) do
-    case state.cleanup_fun.(state.instance_ctx, shard_index, build_id) do
+    case clean_up_staging(state, shard_index, build_id, step_deadline(state)) do
       :ok ->
         with :ok <- IndexRegistry.complete_validation_shard(state.registry, build_id, shard_index) do
           {:ok, :validation_shard_complete}
@@ -542,6 +586,88 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
   defp run_validation_phase(_state, _build_id, _indexes, _shard_index, _checkpoint),
     do: {:error, :invalid_query_index_validation_checkpoint}
+
+  # Pages within one phase and definition share a checkpoint, as build pages
+  # do; moving on to the next phase or definition is its own checkpoint.
+  defp advance_validation(
+         state,
+         build_id,
+         shard_index,
+         definitions,
+         checkpoint,
+         deadline,
+         advanced?
+       ) do
+    {items, result} =
+      shrink_on_budget(
+        state.scan_items,
+        :query_index_validation_read_budget_exceeded,
+        fn items ->
+          {items,
+           state.validation_fun.(
+             state.instance_ctx,
+             shard_index,
+             build_id,
+             definitions,
+             checkpoint,
+             items,
+             state.max_bytes
+           )}
+        end
+      )
+
+    cond do
+      same_validation_run?(result, checkpoint) and before_deadline?(state, deadline) ->
+        {:ok, next} = result
+        advance_validation(state, build_id, shard_index, definitions, next, deadline, true)
+
+      advanced? and not match?({:ok, _next}, result) ->
+        # Commit the pages already checked; the next step starts with this one.
+        with :ok <-
+               IndexRegistry.checkpoint_validation(
+                 state.registry,
+                 build_id,
+                 shard_index,
+                 Map.to_list(checkpoint)
+               ) do
+          {:ok, :validation_progress}
+        end
+
+      true ->
+        handle_validation_result(
+          state,
+          build_id,
+          shard_index,
+          definitions,
+          checkpoint,
+          items,
+          result,
+          true
+        )
+    end
+  end
+
+  defp same_validation_run?(
+         {:ok, %{phase: phase, definition_position: position}},
+         %{phase: phase, definition_position: position}
+       )
+       when phase in [:source, :index, :counter],
+       do: true
+
+  defp same_validation_run?(_result, _checkpoint), do: false
+
+  # Each cleanup call deletes one bounded page of staging rows.
+  defp clean_up_staging(state, shard_index, build_id, deadline) do
+    case state.cleanup_fun.(state.instance_ctx, shard_index, build_id) do
+      {:ok, :progress} = progress ->
+        if before_deadline?(state, deadline),
+          do: clean_up_staging(state, shard_index, build_id, deadline),
+          else: progress
+
+      result ->
+        result
+    end
+  end
 
   defp handle_validation_result(
          state,
@@ -717,51 +843,8 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   end
 
   defp run_retirement_phase(state, index, shard_index, %{phase: phase} = checkpoint)
-       when phase in [:index, :counter, :reverse] do
-    case state.retirement_fun.(
-           state.instance_ctx,
-           shard_index,
-           index.definition,
-           checkpoint,
-           state.scan_items,
-           state.max_bytes
-         ) do
-      {:ok, %{phase: next_phase} = next} when next_phase in [:index, :counter, :reverse] ->
-        with :ok <-
-               IndexRegistry.checkpoint_retirement(
-                 state.registry,
-                 index.definition.id,
-                 index.definition.version,
-                 shard_index,
-                 Map.to_list(next)
-               ) do
-          {:ok, :retirement_progress}
-        end
-
-      {:complete, %{phase: :reverse} = next} ->
-        cleanup = %{next | phase: :cleanup, cursor: ""}
-
-        with :ok <-
-               IndexRegistry.checkpoint_retirement(
-                 state.registry,
-                 index.definition.id,
-                 index.definition.version,
-                 shard_index,
-                 Map.to_list(cleanup)
-               ) do
-          {:ok, :retirement_cleanup_pending}
-        end
-
-      {:retry, :query_index_retirement_concurrent_change} ->
-        {:ok, :retirement_retry}
-
-      {:error, _reason} = error ->
-        error
-
-      _invalid ->
-        {:error, :invalid_query_index_retirement_result}
-    end
-  end
+       when phase in [:index, :counter, :reverse],
+       do: advance_retirement(state, index, shard_index, checkpoint, step_deadline(state), false)
 
   defp run_retirement_phase(
          state,
@@ -769,7 +852,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
          shard_index,
          %{phase: :cleanup}
        ) do
-    case state.cleanup_fun.(state.instance_ctx, shard_index, index.build_id) do
+    case clean_up_staging(state, shard_index, index.build_id, step_deadline(state)) do
       :ok ->
         with {:ok, completion} <-
                IndexRegistry.complete_retirement_shard(
@@ -795,6 +878,74 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
   defp run_retirement_phase(_state, _index, _shard_index, _checkpoint),
     do: {:error, :invalid_query_index_retirement_checkpoint}
+
+  defp advance_retirement(state, index, shard_index, checkpoint, deadline, advanced?) do
+    result =
+      state.retirement_fun.(
+        state.instance_ctx,
+        shard_index,
+        index.definition,
+        checkpoint,
+        state.scan_items,
+        state.max_bytes
+      )
+
+    cond do
+      same_retirement_run?(result, checkpoint) and before_deadline?(state, deadline) ->
+        {:ok, next} = result
+        advance_retirement(state, index, shard_index, next, deadline, true)
+
+      advanced? and not match?({:ok, _next}, result) and not match?({:complete, _next}, result) ->
+        # Commit the pages already deleted; the next step starts with this one.
+        with :ok <- checkpoint_retirement(state, index, shard_index, checkpoint) do
+          {:ok, :retirement_progress}
+        end
+
+      true ->
+        handle_retirement_result(state, index, shard_index, result)
+    end
+  end
+
+  defp same_retirement_run?({:ok, %{phase: phase}}, %{phase: phase})
+       when phase in [:index, :counter, :reverse],
+       do: true
+
+  defp same_retirement_run?(_result, _checkpoint), do: false
+
+  defp handle_retirement_result(state, index, shard_index, result) do
+    case result do
+      {:ok, %{phase: next_phase} = next} when next_phase in [:index, :counter, :reverse] ->
+        with :ok <- checkpoint_retirement(state, index, shard_index, next) do
+          {:ok, :retirement_progress}
+        end
+
+      {:complete, %{phase: :reverse} = next} ->
+        cleanup = %{next | phase: :cleanup, cursor: ""}
+
+        with :ok <- checkpoint_retirement(state, index, shard_index, cleanup) do
+          {:ok, :retirement_cleanup_pending}
+        end
+
+      {:retry, :query_index_retirement_concurrent_change} ->
+        {:ok, :retirement_retry}
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, :invalid_query_index_retirement_result}
+    end
+  end
+
+  defp checkpoint_retirement(state, index, shard_index, checkpoint) do
+    IndexRegistry.checkpoint_retirement(
+      state.registry,
+      index.definition.id,
+      index.definition.version,
+      shard_index,
+      Map.to_list(checkpoint)
+    )
+  end
 
   defp empty_retirement_checkpoint do
     %{
@@ -881,6 +1032,9 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
   defp validate_metrics(_metrics, _expected_records, _max_bytes),
     do: {:error, :invalid_query_backfill_metrics}
+
+  defp step_deadline(state), do: state.clock_fun.() + state.step_budget_ms
+  defp before_deadline?(state, deadline), do: state.clock_fun.() < deadline
 
   # Calls fun with smaller pages while it reports budget_error, down to a
   # single item. fun returns {items, result}.
@@ -1089,7 +1243,8 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   defp validate_context(_ctx), do: {:error, :invalid_query_index_lifecycle_context}
 
   defp validate_functions(state) do
-    if is_function(state.pressure_fun, 0) and is_function(state.ready_fun, 2) and
+    if is_function(state.pressure_fun, 0) and is_function(state.clock_fun, 0) and
+         is_function(state.ready_fun, 2) and
          is_function(state.snapshot_page_fun, 5) and
          is_function(state.page_fun, 7) and is_function(state.project_fun, 4) and
          is_function(state.cleanup_fun, 3) and is_function(state.barrier_fun, 2) and
@@ -1148,6 +1303,13 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   defp bounded_positive_opt(opts, key, default, max) do
     case Keyword.get(opts, key, default) do
       value when is_integer(value) and value > 0 and value <= max -> value
+      _invalid -> default
+    end
+  end
+
+  defp bounded_nonnegative_opt(opts, key, default, max) do
+    case Keyword.get(opts, key, default) do
+      value when is_integer(value) and value >= 0 and value <= max -> value
       _invalid -> default
     end
   end
