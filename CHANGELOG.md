@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- An index build step now takes pages for up to 50 ms
+  (`step_budget_ms`) before it checkpoints and pauses, instead of one page
+  per step: each step pays a journal fsync and a 10 ms pause, which were
+  most of a build's time. A step ends early where the registry needs a
+  checkpoint of its own (a new phase or definition), and a page that fails
+  after others succeeded ends the step at the last good page. Retirement and
+  staging cleanup work the same way. Over 100k existing Flows on one shard,
+  the built-in indexes went from building to active in 65 s instead of
+  140 s.
+
 - Query indexes build over existing Flows about 15 times faster. Each build
   step paid an LMDB commit, a journaled checkpoint and a 10 ms pause for a
   page of 8 records (3 in the first validation pass), because pages were
