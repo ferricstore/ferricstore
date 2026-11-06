@@ -4,6 +4,21 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- The Flow LMDB writer catches up after a burst about three times faster and
+  holds less memory while it does. Reading a spilled apply-projection row
+  decoded its command's whole batch, and the writer read a backlog key by
+  key, so a 500-flow FLOW.CREATE_MANY batch was decoded about 1,500 times;
+  each writer pass now decodes a batch once. After 100k flows created in
+  500-flow batches, the backlog drained in 39 s instead of 114 s.
+
+- Apply-projection cache spills write whole Raft indexes in chunks of up to
+  16,384 rows (`:waraft_apply_projection_spill_chunk_entries`) instead of
+  copying half the cache at once: the spill task peaked at about 10 MB
+  instead of 64-76 MB in the same burst.
+
+- `bench/flow_memory_bench.exs` measures Flow memory per flow and the peaks
+  of create, claim and complete.
+
 ## 0.12.17 - 2026-11-01
 
 - A node that lost a Bloom, Cuckoo, Count-Min or Top-K key's file now copies
