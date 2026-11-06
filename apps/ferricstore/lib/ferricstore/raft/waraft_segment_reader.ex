@@ -23,6 +23,37 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   @held_apply_projection_locks_key :ferricstore_waraft_apply_projection_held_locks
   @held_apply_projection_disk_locks_key :ferricstore_waraft_apply_projection_held_disk_locks
   @held_apply_projection_disk_read_locks_key :ferricstore_waraft_apply_projection_held_disk_read_locks
+  @disk_batch_cache_key :ferricstore_waraft_apply_projection_disk_batch_cache
+  # Bounds the decoded batches one with_disk_batch_cache/1 scope holds.
+  @disk_batch_cache_max_bytes 8 * 1_024 * 1_024
+
+  @doc """
+  Runs `fun` with a cache of the apply-projection batches it reads from disk.
+
+  One Raft command's apply projection is stored as one batch, and a disk read
+  decodes the whole batch to answer one key. A caller that reads many keys of
+  the same batches in one pass, such as the Flow LMDB writer projecting a
+  backlog, wraps the pass in this so each batch is decoded once instead of
+  once per key. The cache belongs to the calling process and ends with the
+  call. A written batch never changes, so the cache answers what the disk
+  would; expiry is still checked on every read.
+  """
+  @spec with_disk_batch_cache((-> result)) :: result when result: term()
+  def with_disk_batch_cache(fun) when is_function(fun, 0) do
+    case Process.get(@disk_batch_cache_key) do
+      nil ->
+        Process.put(@disk_batch_cache_key, %{batches: %{}, bytes: 0})
+
+        try do
+          fun.()
+        after
+          Process.delete(@disk_batch_cache_key)
+        end
+
+      _active ->
+        fun.()
+    end
+  end
 
   @spec put_apply_projection(binary(), non_neg_integer(), pos_integer(), [
           {binary(), binary(), non_neg_integer()}
@@ -1477,7 +1508,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   end
 
   defp read_apply_projection_value_from_disk(root, index, key, read_mode) do
-    case read_apply_projection_latest_entries_from_disk(root, index) do
+    case cached_disk_entries(root, index, :latest, fn ->
+           read_apply_projection_latest_entries_from_disk(root, index)
+         end) do
       {:ok, entries} ->
         case value_from_projection_entries(entries, key, read_mode) do
           {:ok, _value} = ok -> ok
@@ -1493,7 +1526,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   end
 
   defp read_apply_projection_value_from_merged_disk(root, index, key, read_mode) do
-    case read_apply_projection_entries_from_disk(root, index) do
+    case cached_disk_entries(root, index, :merged, fn ->
+           read_apply_projection_entries_from_disk(root, index)
+         end) do
       {:ok, entries} -> value_from_projection_entries(entries, key, read_mode)
       :not_found -> :not_found
       {:error, reason} -> {:error, reason}
@@ -1606,6 +1641,71 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     case Process.get(:ferricstore_waraft_apply_projection_disk_read_hook) do
       fun when is_function(fun, 3) -> fun.(root, index, source)
       _other -> :ok
+    end
+  end
+
+  # Inside with_disk_batch_cache/1 a batch is decoded once into a map holding,
+  # per key, the entry a scan of the list would pick: the last one with a
+  # binary value.
+  defp cached_disk_entries(root, index, source, read_fun) do
+    case Process.get(@disk_batch_cache_key) do
+      %{batches: batches, bytes: bytes} = cache ->
+        cache_key = {root, index, source}
+
+        case batches do
+          %{^cache_key => indexed} ->
+            {:ok, indexed}
+
+          _ ->
+            case read_fun.() do
+              {:ok, entries} ->
+                {indexed, entry_bytes} = index_projection_entries(entries)
+
+                Process.put(
+                  @disk_batch_cache_key,
+                  cache_batch(cache, cache_key, indexed, entry_bytes, bytes)
+                )
+
+                {:ok, indexed}
+
+              other ->
+                other
+            end
+        end
+
+      _no_cache ->
+        read_fun.()
+    end
+  end
+
+  defp index_projection_entries(entries) do
+    Enum.reduce(entries, {%{}, 0}, fn
+      {key, value, expire_at_ms}, {indexed, bytes} when is_binary(key) and is_binary(value) ->
+        {Map.put(indexed, key, {value, expire_at_ms}), bytes + byte_size(key) + byte_size(value)}
+
+      _entry, acc ->
+        acc
+    end)
+  end
+
+  defp cache_batch(cache, _cache_key, _indexed, entry_bytes, _bytes)
+       when entry_bytes > @disk_batch_cache_max_bytes,
+       do: cache
+
+  defp cache_batch(_cache, cache_key, indexed, entry_bytes, bytes)
+       when bytes + entry_bytes > @disk_batch_cache_max_bytes,
+       do: %{batches: %{cache_key => indexed}, bytes: entry_bytes}
+
+  defp cache_batch(%{batches: batches}, cache_key, indexed, entry_bytes, bytes),
+    do: %{batches: Map.put(batches, cache_key, indexed), bytes: bytes + entry_bytes}
+
+  defp value_from_projection_entries(entries, key, read_mode) when is_map(entries) do
+    case entries do
+      %{^key => {value, expire_at_ms}} ->
+        if projection_entry_live?(expire_at_ms, read_mode), do: {:ok, value}, else: :not_found
+
+      _missing ->
+        :not_found
     end
   end
 
