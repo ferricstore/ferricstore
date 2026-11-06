@@ -4,7 +4,7 @@ defmodule Ferricstore.Flow.Query.IndexRetirement do
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.Query.{CompositeCounter, CompositeIndex, IndexDefinition}
 
-  @max_items 16
+  @max_items 256
   @max_bytes 16 * 1_024 * 1_024
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
   @max_storage_key_bytes 511

@@ -6,14 +6,13 @@ defmodule Ferricstore.Flow.Query.IndexValidation do
   alias Ferricstore.Flow.Query.{
     BackfillSource,
     CompositeCounter,
-    CompositeIndex,
     IndexDefinition
   }
 
   alias Ferricstore.Flow.Query.IndexValidation.DataPasses
 
   @max_definitions 16
-  @max_items 16
+  @max_items 256
   @max_bytes 16 * 1_024 * 1_024
   @max_read_keys 2_048
   @max_u64 0xFFFF_FFFF_FFFF_FFFF
@@ -116,7 +115,7 @@ defmodule Ferricstore.Flow.Query.IndexValidation do
          max_bytes,
          opts
        ) do
-    page_items = effective_page_items(ctx, max_items, max_bytes, length(definitions))
+    page_items = effective_page_items(max_items, length(definitions))
     staging_page = Keyword.get(opts, :staging_page_fun, &BackfillSource.staging_page/6)
 
     with {:ok, page} <-
@@ -719,21 +718,13 @@ defmodule Ferricstore.Flow.Query.IndexValidation do
     end)
   end
 
-  defp effective_page_items(ctx, max_items, max_bytes, definition_count) do
-    max_value_size =
-      case Map.get(ctx, :max_value_size, 1_048_576) do
-        value when is_integer(value) and value > 0 -> min(value, @max_bytes)
-        _invalid -> 1_048_576
-      end
-
-    value_limited_items = max(div(max_bytes, max_value_size), 1)
-
-    read_limited_items =
-      @max_read_keys
-      |> div(definition_count * CompositeIndex.max_entries_per_record())
-      |> max(1)
-
-    min(max_items, min(value_limited_items, read_limited_items))
+  # Sized for one entry per record per definition. Validation reads bounded
+  # LMDB rows, not primary values; a page whose reads still exceed the byte or
+  # read-key budget fails with :query_index_validation_read_budget_exceeded and
+  # the caller retries it smaller.
+  defp effective_page_items(max_items, definition_count) do
+    read_limited_items = max(div(@max_read_keys, definition_count), 1)
+    min(max_items, read_limited_items)
   end
 
   defp checked_add(left, right)

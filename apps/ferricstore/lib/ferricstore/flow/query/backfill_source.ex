@@ -13,6 +13,9 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
   @max_page_items 256
   @max_page_bytes 16 * 1_024 * 1_024
   @cleanup_page_bytes 2 * 1_024 * 1_024
+  # Router.read_shard_entries accepts at most this many keys and key bytes.
+  @max_primary_read_keys 512
+  @max_primary_read_key_bytes 1_048_576
   @max_expiry 0xFFFF_FFFF_FFFF_FFFF
 
   @spec staging_prefix(binary()) :: binary()
@@ -137,19 +140,33 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
              max_items <= @max_page_items and is_integer(max_bytes) and max_bytes > 0 and
              max_bytes <= @max_page_bytes and is_list(opts) do
     with :ok <- validate_context(ctx, shard_index, build_id),
-         effective_items <- effective_page_items(ctx, max_items, max_bytes),
          {:ok, staged} <-
-           staging_page(ctx, shard_index, build_id, cursor, effective_items, max_bytes),
+           staging_page(ctx, shard_index, build_id, cursor, max_items, max_bytes),
          {:ok, records, hydrated_bytes} <-
-           hydrate_records(ctx, shard_index, staged.state_keys, max_bytes, opts) do
-      {:ok,
-       %{
-         records: records,
-         cursor: staged.cursor,
-         done?: staged.done?,
-         scanned_entries: staged.scanned_entries,
-         hydrated_bytes: hydrated_bytes
-       }}
+           hydrate_page(ctx, shard_index, staged.state_keys, max_bytes, opts) do
+      if length(records) == length(staged.state_keys) do
+        {:ok,
+         %{
+           records: records,
+           cursor: staged.cursor,
+           done?: staged.done?,
+           scanned_entries: staged.scanned_entries,
+           hydrated_bytes: hydrated_bytes
+         }}
+      else
+        # The byte budget ended the page early; the next page resumes after
+        # the last record hydrated here.
+        last_state_key = List.last(records).state_key
+
+        {:ok,
+         %{
+           records: records,
+           cursor: staging_prefix(build_id) <> digest(last_state_key),
+           done?: false,
+           scanned_entries: length(records),
+           hydrated_bytes: hydrated_bytes
+         }}
+      end
     end
   end
 
@@ -380,6 +397,67 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
     end
   end
 
+  # Primary reads are not byte-bounded, so each read takes only as many
+  # records as the remaining budget holds at the largest value size. Small
+  # records fill a page; large ones end it once the budget is spent.
+  defp hydrate_page(ctx, shard_index, state_keys, max_bytes, opts),
+    do: hydrate_page(ctx, shard_index, state_keys, max_bytes, max_value_size(ctx), opts, [], 0)
+
+  defp hydrate_page(_ctx, _shard_index, [], _max_bytes, _value_size, _opts, chunks, bytes),
+    do: {:ok, chunks |> Enum.reverse() |> Enum.concat(), bytes}
+
+  defp hydrate_page(ctx, shard_index, state_keys, max_bytes, value_size, opts, chunks, bytes) do
+    remaining_bytes = max_bytes - bytes
+
+    chunk_items =
+      if chunks == [],
+        do: max(div(remaining_bytes, value_size), 1),
+        else: div(remaining_bytes, value_size)
+
+    if chunk_items == 0 do
+      hydrate_page(ctx, shard_index, [], max_bytes, value_size, opts, chunks, bytes)
+    else
+      {chunk, rest} =
+        take_read_chunk(
+          state_keys,
+          min(chunk_items, @max_primary_read_keys),
+          @max_primary_read_key_bytes
+        )
+
+      with {:ok, records, chunk_bytes} <-
+             hydrate_records(ctx, shard_index, chunk, remaining_bytes, opts) do
+        hydrate_page(
+          ctx,
+          shard_index,
+          rest,
+          max_bytes,
+          value_size,
+          opts,
+          [records | chunks],
+          bytes + chunk_bytes
+        )
+      end
+    end
+  end
+
+  defp take_read_chunk(state_keys, max_items, max_key_bytes),
+    do: take_read_chunk(state_keys, max_items, max_key_bytes, [], 0)
+
+  defp take_read_chunk([state_key | rest], max_items, max_key_bytes, chunk, key_bytes)
+       when max_items > 0 and
+              (chunk == [] or key_bytes + byte_size(state_key) <= max_key_bytes) do
+    take_read_chunk(
+      rest,
+      max_items - 1,
+      max_key_bytes,
+      [state_key | chunk],
+      key_bytes + byte_size(state_key)
+    )
+  end
+
+  defp take_read_chunk(rest, _max_items, _max_key_bytes, chunk, _key_bytes),
+    do: {Enum.reverse(chunk), rest}
+
   defp hydrate_records(ctx, shard_index, state_keys, max_bytes, opts) do
     read_entries = Keyword.get(opts, :read_entries_fun, &Router.read_shard_entries/3)
     decode_record = Keyword.get(opts, :decode_record_fun, &decode_record/1)
@@ -598,14 +676,11 @@ defmodule Ferricstore.Flow.Query.BackfillSource do
   defp valid_record_owner?(record, state_key),
     do: RecordIdentity.owns_state_key?(record, state_key)
 
-  defp effective_page_items(ctx, max_items, max_bytes) do
-    max_value_size =
-      case Map.get(ctx, :max_value_size, 1_048_576) do
-        value when is_integer(value) and value > 0 -> value
-        _invalid -> 1_048_576
-      end
-
-    min(max_items, max(div(max_bytes, max_value_size), 1))
+  defp max_value_size(ctx) do
+    case Map.get(ctx, :max_value_size, 1_048_576) do
+      value when is_integer(value) and value > 0 -> value
+      _invalid -> 1_048_576
+    end
   end
 
   defp validate_cursor(_prefix, ""), do: :ok

@@ -17,11 +17,16 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
   @default_initial_delay_ms 1_000
   @default_interval_ms 1_000
   @default_catchup_delay_ms 10
-  @default_snapshot_items 8
-  @default_backfill_items 8
+  # Pages hold hundreds of records: each step pays a durable checkpoint and
+  # usually an LMDB commit, so small pages make a build over many Flows take
+  # hours. Bytes stay bounded by max_bytes; a page that does not fit is
+  # retried at half the size.
+  @default_snapshot_items 256
+  @default_backfill_items CompositeBackfill.max_page_records()
+  @default_scan_items 256
   @default_max_bytes 8 * 1_024 * 1_024
   @default_shard_concurrency 4
-  @max_page_items 16
+  @max_page_items 256
   @max_page_bytes 16 * 1_024 * 1_024
   @max_shard_concurrency 8
   @max_storage_key_bytes 511
@@ -67,7 +72,13 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
       snapshot_items:
         bounded_positive_opt(opts, :snapshot_items, @default_snapshot_items, @max_page_items),
       backfill_items:
-        bounded_positive_opt(opts, :backfill_items, @default_backfill_items, @max_page_items),
+        bounded_positive_opt(
+          opts,
+          :backfill_items,
+          @default_backfill_items,
+          CompositeBackfill.max_page_records()
+        ),
+      scan_items: bounded_positive_opt(opts, :scan_items, @default_scan_items, @max_page_items),
       shard_concurrency:
         bounded_positive_opt(
           opts,
@@ -233,15 +244,21 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
          shard_index,
          %{phase: :snapshot, fenced: true} = checkpoint
        ) do
-    case state.snapshot_page_fun.(
+    snapshot_page =
+      shrink_on_budget(state.snapshot_items, :query_backfill_snapshot_page_too_large, fn items ->
+        {items,
+         state.snapshot_page_fun.(
            state.instance_ctx,
            shard_index,
            build_id,
-           state.snapshot_items,
+           items,
            state.max_bytes
-         ) do
-      {:ok, page} ->
-        with :ok <- validate_snapshot_page(page, state.snapshot_items),
+         )}
+      end)
+
+    case snapshot_page do
+      {items, {:ok, page}} ->
+        with :ok <- validate_snapshot_page(page, items),
              %{done?: done?, scanned_keys: scanned_keys} <- page do
           progress =
             checkpoint_progress(checkpoint,
@@ -259,7 +276,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
           {:error, _reason} = error -> error
         end
 
-      {:error, _reason} = error ->
+      {_items, {:error, _reason} = error} ->
         error
 
       _invalid ->
@@ -325,16 +342,48 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
          max_items,
          definitions
        ) do
-    with {:ok, page} <-
-           state.page_fun.(
-             state.instance_ctx,
-             shard_index,
-             build_id,
-             cursor,
-             max_items,
-             state.max_bytes,
-             []
-           ),
+    case state.page_fun.(
+           state.instance_ctx,
+           shard_index,
+           build_id,
+           cursor,
+           max_items,
+           state.max_bytes,
+           []
+         ) do
+      {:error, :query_backfill_hydration_budget_exceeded} when max_items > 1 ->
+        read_and_project_backfill_page(
+          state,
+          build_id,
+          shard_index,
+          cursor,
+          div(max_items, 2),
+          definitions
+        )
+
+      page_result ->
+        project_backfill_page(
+          state,
+          build_id,
+          shard_index,
+          cursor,
+          max_items,
+          definitions,
+          page_result
+        )
+    end
+  end
+
+  defp project_backfill_page(
+         state,
+         build_id,
+         shard_index,
+         cursor,
+         max_items,
+         definitions,
+         page_result
+       ) do
+    with {:ok, page} <- page_result,
          :ok <- validate_page(page, cursor, max_items, state.max_bytes) do
       case state.project_fun.(state.instance_ctx, shard_index, page.records, definitions) do
         {:ok, metrics} ->
@@ -437,15 +486,22 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
        when phase in [:source, :index, :counter] do
     definitions = Enum.map(indexes, & &1.definition)
 
-    result =
-      state.validation_fun.(
-        state.instance_ctx,
-        shard_index,
-        build_id,
-        definitions,
-        checkpoint,
-        state.backfill_items,
-        state.max_bytes
+    {items, result} =
+      shrink_on_budget(
+        state.scan_items,
+        :query_index_validation_read_budget_exceeded,
+        fn items ->
+          {items,
+           state.validation_fun.(
+             state.instance_ctx,
+             shard_index,
+             build_id,
+             definitions,
+             checkpoint,
+             items,
+             state.max_bytes
+           )}
+        end
       )
 
     handle_validation_result(
@@ -454,6 +510,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
       shard_index,
       definitions,
       checkpoint,
+      items,
       result,
       true
     )
@@ -492,6 +549,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
          shard_index,
          definitions,
          checkpoint,
+         items,
          result,
          confirm_mismatch?
        ) do
@@ -530,7 +588,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
               build_id,
               definitions,
               checkpoint,
-              state.backfill_items,
+              items,
               state.max_bytes
             )
 
@@ -540,6 +598,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
             shard_index,
             definitions,
             checkpoint,
+            items,
             confirmation,
             false
           )
@@ -664,7 +723,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
            shard_index,
            index.definition,
            checkpoint,
-           state.backfill_items,
+           state.scan_items,
            state.max_bytes
          ) do
       {:ok, %{phase: next_phase} = next} when next_phase in [:index, :counter, :reverse] ->
@@ -822,6 +881,18 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorker do
 
   defp validate_metrics(_metrics, _expected_records, _max_bytes),
     do: {:error, :invalid_query_backfill_metrics}
+
+  # Calls fun with smaller pages while it reports budget_error, down to a
+  # single item. fun returns {items, result}.
+  defp shrink_on_budget(items, budget_error, fun) do
+    case fun.(items) do
+      {_items, {:error, ^budget_error}} when items > 1 ->
+        shrink_on_budget(div(items, 2), budget_error, fun)
+
+      attempt ->
+        attempt
+    end
+  end
 
   defp checkpoint_progress(checkpoint, overrides) do
     [

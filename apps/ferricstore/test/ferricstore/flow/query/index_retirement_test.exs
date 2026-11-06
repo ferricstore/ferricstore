@@ -79,6 +79,44 @@ defmodule Ferricstore.Flow.Query.IndexRetirementTest do
     end)
   end
 
+  test "deletes a page of more than sixteen index rows in one step", context do
+    %{ctx: ctx, retired: retired} = context
+    path = lmdb_path(ctx)
+
+    for number <- 1..40 do
+      record = record("run-#{number}", number)
+      state_key = Keys.state_key(record.id, record.partition_key)
+
+      assert {:ok, ops, _cache} =
+               CompositeProjection.reconcile(
+                 path,
+                 state_key,
+                 record,
+                 0,
+                 [retired],
+                 CompositeProjection.new_cache()
+               )
+
+      assert :ok = LMDB.write_batch(path, ops)
+    end
+
+    assert {:ok, index_done} =
+             IndexRetirement.step(
+               ctx,
+               0,
+               retired,
+               IndexRetirement.empty_checkpoint(),
+               256,
+               8 * 1_024 * 1_024
+             )
+
+    assert index_done.phase == :counter
+    assert index_done.deleted_entries == 40
+
+    assert {:ok, []} =
+             LMDB.prefix_entries(path, IndexDefinition.storage_prefix(retired), 10)
+  end
+
   test "replaying a page after its write is idempotent", context do
     %{ctx: ctx, retired: retired} = context
     record = record("run-replay", 1)
