@@ -28,6 +28,7 @@ Useful local runners:
 | `native_stream_response_codec_bench.exs` | Exact Stream response value encode, size, and frame costs. |
 | `flow_api_bench.exs` | Embedded FerricFlow API benchmark. |
 | `flow_workflow_bench.exs` | Embedded workflow benchmark. |
+| `flow_memory_bench.exs` | Memory per Flow and peaks across create, claim, and complete: RSS, allocator carriers, ETS tables, and processes. |
 | `flow_governance_bench.exs` | Governance command benchmark. |
 | `fql_parser_bench.exs` | Rust NIF boundary, wrapper, binder, and explain-planner benchmark. |
 | `fql_scheduler_bench.exs` | Normal-scheduler saturation and heartbeat tail-latency benchmark. |
