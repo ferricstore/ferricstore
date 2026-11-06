@@ -24,6 +24,9 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
   @held_apply_projection_disk_locks_key :ferricstore_waraft_apply_projection_held_disk_locks
   @held_apply_projection_disk_read_locks_key :ferricstore_waraft_apply_projection_held_disk_read_locks
   @disk_batch_cache_key :ferricstore_waraft_apply_projection_disk_batch_cache
+  # Rows per spill write. A spill writes whole Raft indexes, so one write can
+  # exceed this when a single index holds more rows.
+  @default_apply_projection_spill_chunk_entries 16_384
   # Bounds the decoded batches one with_disk_batch_cache/1 scope holds.
   @disk_batch_cache_max_bytes 8 * 1_024 * 1_024
 
@@ -221,10 +224,13 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
         table ->
           projection_root = Path.join(root, @apply_projection_dir)
 
+          # Byte/count targets choose indexes, then every row of those
+          # indexes spills so the common latest-record read stays O(1). Rows
+          # are read one chunk of indexes at a time.
           table
-          |> apply_projection_cache_entries_for_limits(root, min_entries, min_bytes)
-          |> Enum.group_by(fn {index, _key, _value, _expire_at_ms} -> index end)
-          |> Enum.sort_by(fn {index, _entries} -> index end)
+          |> select_apply_projection_indexes(root, min_entries, min_bytes)
+          |> Enum.sort()
+          |> Stream.map(&{&1, apply_projection_cache_index_entries(table, root, &1)})
           |> spill_apply_projection_groups(data_dir, shard_index, projection_root)
       end
     end)
@@ -1946,30 +1952,14 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end)
   end
 
-  defp apply_projection_cache_entries_for_limits(_table, _root, 0, 0), do: []
-
-  defp apply_projection_cache_entries_for_limits(table, root, min_entries, min_bytes) do
-    # Byte/count targets choose indexes, then spill every row for those indexes
-    # so the common latest-record read stays O(1).
-    table
-    |> select_apply_projection_indexes(root, min_entries, min_bytes)
-    |> Enum.flat_map(fn index ->
-      :ets.select(table, [
-        {{{root, index, :"$1"}, :"$2", :"$3"}, [], [{{index, :"$1", :"$2", :"$3"}}]}
-      ])
-    end)
+  defp apply_projection_cache_index_entries(table, root, index) do
+    :ets.select(table, [
+      {{{root, index, :"$1"}, :"$2", :"$3"}, [], [{{index, :"$1", :"$2", :"$3"}}]}
+    ])
   end
 
   defp apply_projection_cache_entries_for_indexes(table, root, indexes) do
-    if MapSet.size(indexes) == 0 do
-      []
-    else
-      Enum.flat_map(indexes, fn index ->
-        :ets.select(table, [
-          {{{root, index, :"$1"}, :"$2", :"$3"}, [], [{{index, :"$1", :"$2", :"$3"}}]}
-        ])
-      end)
-    end
+    Enum.flat_map(indexes, &apply_projection_cache_index_entries(table, root, &1))
   end
 
   defp normalize_apply_projection_refs(refs) do
@@ -2080,7 +2070,43 @@ defmodule Ferricstore.Raft.WARaftSegmentReader do
     end
   end
 
+  # Writes the groups ({index, rows}, in index order) a bounded number of rows
+  # at a time, so a large spill never holds copies of every spilled row at
+  # once. Each chunk is durable on disk before its rows leave the cache, as a
+  # single write was; a failed chunk stops the spill after the earlier chunks.
   defp spill_apply_projection_groups(groups, data_dir, shard_index, projection_root) do
+    limit = apply_projection_spill_chunk_entries()
+
+    groups
+    |> Stream.reject(fn {_index, entries} -> entries == [] end)
+    |> Stream.chunk_while({[], 0}, &chunk_spill_group(&1, &2, limit), fn
+      {[], 0} -> {:cont, {[], 0}}
+      {chunk, _count} -> {:cont, Enum.reverse(chunk), {[], 0}}
+    end)
+    |> Enum.reduce_while({:ok, 0}, fn chunk, {:ok, removed} ->
+      case spill_apply_projection_chunk(chunk, data_dir, shard_index, projection_root) do
+        {:ok, chunk_removed} -> {:cont, {:ok, removed + chunk_removed}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
+  end
+
+  defp chunk_spill_group({_index, entries} = group, {chunk, count}, limit) do
+    size = length(entries)
+
+    if chunk != [] and count + size > limit,
+      do: {:cont, Enum.reverse(chunk), {[group], size}},
+      else: {:cont, {[group | chunk], count + size}}
+  end
+
+  defp apply_projection_spill_chunk_entries do
+    case Application.get_env(:ferricstore, :waraft_apply_projection_spill_chunk_entries) do
+      entries when is_integer(entries) and entries > 0 -> entries
+      _default -> @default_apply_projection_spill_chunk_entries
+    end
+  end
+
+  defp spill_apply_projection_chunk(groups, data_dir, shard_index, projection_root) do
     {batches, cached_entries} =
       Enum.map_reduce(groups, [], fn {index, entries}, ref_acc ->
         batch =
