@@ -1039,7 +1039,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                      state,
                      FlowKeys.terminal_retention_index_key(),
                      [state_key]
-                   ) do
+                   ),
+                 :ok <- flow_retention_delete_hot_index_entries(state, record) do
               maybe_queue_terminal_lmdb_history_expire_delete(state, record)
 
               {:ok, %{flows: 1, history: history_count, values: values_count}}
@@ -1052,6 +1053,25 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
 
       defp flow_retention_cleanup_record(_state, _state_key, _record, _cleanup_plan),
         do: {:error, "ERR invalid flow retention cleanup plan"}
+
+      # A terminal Flow keeps its state, parent, root and correlation index
+      # entries after its record leaves the keydir, so lists keep listing it
+      # (see AfterFlush). They go with the Flow; left behind, FLOW.INFO and
+      # FLOW.STATS kept counting it and the indexes grew with every Flow
+      # retention removed.
+      # An orphan purge passes what is left of a Flow without its record.
+      defp flow_retention_delete_hot_index_entries(
+             state,
+             %{id: id, type: type, state: flow_state} = record
+           )
+           when is_binary(id) and is_binary(type) and is_binary(flow_state) do
+        record
+        |> flow_hot_cold_index_entries()
+        |> Enum.map(fn {key, member, _score} -> {key, member} end)
+        |> then(&flow_zset_index_delete_grouped(state, &1))
+      end
+
+      defp flow_retention_delete_hot_index_entries(_state, _record), do: :ok
 
       defp flow_retention_split_owned_value_refs(refs, owner_record) do
         {shareable_refs, private_refs} =

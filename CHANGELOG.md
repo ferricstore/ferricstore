@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- `FLOW.INFO` and `FLOW.STATS` no longer keep counting a terminal Flow after
+  retention removes it. A terminal Flow keeps its state, parent, root and
+  correlation index entries in memory after its record moves to LMDB, so
+  lists without `include_cold` keep listing it, but retention cleanup left
+  those entries behind. Lists skipped the missing Flow, while the counts
+  stayed inflated and the in-memory indexes grew with every Flow retention
+  removed.
+
 - A Flow history projector that stops or crashes no longer loses the history
   it has not written yet. Events wait in the projector for up to its flush
   interval (1 s by default), and a restart, such as the shard supervisor's
