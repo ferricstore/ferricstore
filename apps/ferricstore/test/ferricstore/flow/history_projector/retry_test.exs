@@ -49,7 +49,7 @@ defmodule Ferricstore.Flow.HistoryProjector.RetryTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      stop_if_alive(pid)
 
       case previous_hook do
         nil -> Application.delete_env(:ferricstore, :flow_history_projector_lmdb_publish_hook)
@@ -124,7 +124,7 @@ defmodule Ferricstore.Flow.HistoryProjector.RetryTest do
       )
 
     on_exit(fn ->
-      if Process.alive?(pid), do: GenServer.stop(pid)
+      stop_if_alive(pid)
       File.rm_rf!(dir)
     end)
 
@@ -172,5 +172,13 @@ defmodule Ferricstore.Flow.HistoryProjector.RetryTest do
       Process.sleep(10)
       wait_until(fun, attempts - 1)
     end
+  end
+
+  # The projector is linked to the test process, so it may be stopping already
+  # when on_exit runs: it traps exits to hand unflushed history on.
+  defp stop_if_alive(pid) do
+    GenServer.stop(pid)
+  catch
+    :exit, reason -> if Process.alive?(pid), do: exit(reason), else: :ok
   end
 end

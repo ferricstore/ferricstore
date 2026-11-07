@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow history projector that stops or crashes no longer loses the history
+  it has not written yet. Events wait in the projector for up to its flush
+  interval (1 s by default), and a restart, such as the shard supervisor's
+  after repeated shard crashes, dropped them for good: the Flow's state was
+  right but its history missed those events, since applying a command again
+  over the state it already left writes no history. The projector now hands
+  them to its successor through the overflow queue, which outlives it.
+
 - A Flow rewound out of a terminal state and claimed again before the LMDB
   writer flushed no longer stays counted in that terminal state. A claim
   queues only a query-row projection, and the writer, keeping one projection

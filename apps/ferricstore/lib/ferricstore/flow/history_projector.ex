@@ -19,6 +19,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   @retry_interval_ms 50
   @flush_drain_limit 16
+  @stop_enqueue_wait_ms 250
 
   @type entry :: %{
           required(:key) => binary(),
@@ -382,6 +383,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
   @impl true
   def init(opts) do
     Process.flag(:priority, :low)
+    # terminate/2 hands unflushed history on when the supervisor stops us.
+    Process.flag(:trap_exit, true)
 
     shard_index = Keyword.fetch!(opts, :shard_index)
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
@@ -405,6 +408,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
         Config.default_max_pending_entries()
       )
 
+    _ = Pending.take_hand_over(projector_name, shard_data_path)
     pending_counter = :atomics.new(1, signed: true)
     Pending.register_pending_counter(projector_name, pending_counter, max_pending_entries)
     projected_index = projected_index(instance_ctx, shard_index, shard_data_path)
@@ -557,9 +561,57 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   @impl true
-  def terminate(_reason, state) do
-    Pending.unregister_pending_counter(Map.get(state, :projector_name))
+  def terminate(_reason, %{projector_name: projector} = state) do
+    hand_over_unflushed(state)
+    Pending.unregister_pending_counter(projector)
     :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
+  # Unflushed history lives only in this process: its pending entries and the
+  # enqueue casts still in its mailbox. Raft replay does not bring them back,
+  # since applying a command again over the state it left writes no history,
+  # so they go to the overflow queue for the next projector of this shard to
+  # drain. Their row is taken before the counter is unregistered, so it drains
+  # ahead of anything enqueued from then on. (A node that stops closes WARaft
+  # first, which flushes us before we get here.)
+  defp hand_over_unflushed(state) do
+    projector = state.projector_name
+
+    with {:ok, sequence} <- Pending.append_overflow(projector, []) do
+      Pending.unregister_pending_counter(projector)
+      entries = Enum.reverse(state.pending, receive_enqueued(state))
+      Pending.hand_over(projector, state.shard_data_path, sequence, entries)
+    end
+  rescue
+    error ->
+      Logger.error(
+        "Flow history projector shard_#{state.shard_index}: unflushed history hand-over failed: #{inspect(error)}"
+      )
+  end
+
+  # Enqueuers reserve on the pending counter before they cast, so the counter
+  # tells how many entries are still on their way here.
+  defp receive_enqueued(state) do
+    deadline = System.monotonic_time(:millisecond) + @stop_enqueue_wait_ms
+    receive_enqueued(state, deadline, 0, [])
+  end
+
+  defp receive_enqueued(state, deadline, received, acc) do
+    expected = max(:atomics.get(state.pending_counter, 1) - state.pending_count, 0)
+
+    timeout =
+      if received < expected,
+        do: max(deadline - System.monotonic_time(:millisecond), 0),
+        else: 0
+
+    receive do
+      {:"$gen_cast", {:enqueue_reserved, entries}} ->
+        receive_enqueued(state, deadline, received + length(entries), [entries | acc])
+    after
+      timeout -> acc |> Enum.reverse() |> Enum.concat()
+    end
   end
 
   @impl true

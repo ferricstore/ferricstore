@@ -81,6 +81,12 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   def delete_overflow(projector, sequence),
     do: PendingRegistry.delete_overflow(projector, sequence)
 
+  def hand_over(projector, shard_data_path, sequence, entries),
+    do: PendingRegistry.hand_over(projector, shard_data_path, sequence, entries)
+
+  def take_hand_over(projector, shard_data_path),
+    do: PendingRegistry.take_hand_over(projector, shard_data_path)
+
   def take_overflow(projector, max_entries),
     do: PendingRegistry.take_overflow(projector, max_entries)
 
