@@ -45,12 +45,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
       terminal_projection_page_size(),
       0,
       fn entries, op_count ->
-        with {:ok, state_keys} <- terminal_reverse_state_keys(entries),
+        with {:ok, owned_entries} <- terminal_reverse_owners(lmdb_path, entries),
+             state_keys = Enum.map(owned_entries, &elem(&1, 2)),
              {:ok, statuses} <-
                TerminalState.statuses(lmdb_path, keydir, state_keys, decode_entry_fun),
              {:ok, ops} <-
                cleanup_stale_terminal_reverse_scan_result(
-                 {:ok, entries},
+                 {:ok, owned_entries},
                  fn terminal_key, state_key ->
                    LMDB.terminal_index_reconcile_delete_ops_result(
                      lmdb_path,
@@ -103,38 +104,29 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
        when is_list(entries) and is_function(status_fun, 1) do
     entries
     |> Enum.reduce_while({:ok, []}, fn
+      {reverse_key, terminal_key, state_key}, {:ok, reversed_ops}
+      when is_binary(reverse_key) and is_binary(terminal_key) and is_binary(state_key) ->
+        cleanup_terminal_reverse_entry(
+          reverse_key,
+          terminal_key,
+          state_key,
+          delete_fun,
+          status_fun,
+          reversed_ops
+        )
+
       {reverse_key, terminal_key}, {:ok, reversed_ops}
       when is_binary(reverse_key) and is_binary(terminal_key) ->
         case terminal_state_key_from_reverse_key(reverse_key) do
           {:ok, state_key} ->
-            case status_fun.(state_key) do
-              {:ok, status} when status in [:terminal, :retained_terminal] ->
-                {:cont, {:ok, reversed_ops}}
-
-              {:ok, status} when status in [:active, :missing] ->
-                delete_state_key = if status == :missing, do: state_key, else: nil
-
-                case delete_fun.(terminal_key, delete_state_key) do
-                  {:ok, terminal_ops} when is_list(terminal_ops) ->
-                    entry_ops =
-                      if is_binary(delete_state_key) do
-                        terminal_ops
-                      else
-                        [{:delete, reverse_key} | terminal_ops]
-                      end
-
-                    {:cont, {:ok, :lists.reverse(entry_ops, reversed_ops)}}
-
-                  {:error, _reason} = error ->
-                    {:halt, error}
-
-                  invalid ->
-                    {:halt, {:error, {:invalid_terminal_delete_plan, invalid}}}
-                end
-
-              {:error, _reason} = error ->
-                {:halt, error}
-            end
+            cleanup_terminal_reverse_entry(
+              reverse_key,
+              terminal_key,
+              state_key,
+              delete_fun,
+              status_fun,
+              reversed_ops
+            )
 
           :error ->
             {:halt, {:error, :invalid_terminal_reverse_key}}
@@ -229,18 +221,63 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
 
   defp cleanup_stale_terminal_ops_by_id(_lmdb_path, _state_key, _record), do: {:ok, []}
 
-  defp terminal_state_key_from_reverse_key(<<"flow-terminal-by-state:", state_key::binary>>)
-       when byte_size(state_key) > 0,
-       do: {:ok, state_key}
+  defp cleanup_terminal_reverse_entry(
+         reverse_key,
+         terminal_key,
+         state_key,
+         delete_fun,
+         status_fun,
+         reversed_ops
+       ) do
+    case status_fun.(state_key) do
+      {:ok, status} when status in [:terminal, :retained_terminal] ->
+        {:cont, {:ok, reversed_ops}}
 
-  defp terminal_state_key_from_reverse_key(_reverse_key), do: :error
+      {:ok, status} when status in [:active, :missing] ->
+        delete_state_key = if status == :missing, do: state_key, else: nil
 
-  defp terminal_reverse_state_keys(entries) when is_list(entries) do
+        case delete_fun.(terminal_key, delete_state_key) do
+          {:ok, terminal_ops} when is_list(terminal_ops) ->
+            entry_ops =
+              if is_binary(delete_state_key) do
+                terminal_ops
+              else
+                [{:delete, reverse_key} | terminal_ops]
+              end
+
+            {:cont, {:ok, :lists.reverse(entry_ops, reversed_ops)}}
+
+          {:error, _reason} = error ->
+            {:halt, error}
+
+          invalid ->
+            {:halt, {:error, {:invalid_terminal_delete_plan, invalid}}}
+        end
+
+      {:error, _reason} = error ->
+        {:halt, error}
+    end
+  end
+
+  # A reverse key holds the owner's state key raw up to 256 bytes and a
+  # digest of it beyond that. A digest owner is the state key its terminal
+  # index entry stores, if that maps back to the same reverse key; a row
+  # whose owner cannot be found is left alone.
+  defp terminal_reverse_owners(lmdb_path, entries) when is_list(entries) do
     Enum.reduce_while(entries, {:ok, []}, fn
-      {reverse_key, terminal_key}, {:ok, state_keys}
+      {reverse_key, terminal_key}, {:ok, owned}
       when is_binary(reverse_key) and is_binary(terminal_key) ->
-        case terminal_state_key_from_reverse_key(reverse_key) do
-          {:ok, state_key} -> {:cont, {:ok, [state_key | state_keys]}}
+        with {:ok, candidate} <- terminal_state_key_from_reverse_key(reverse_key) do
+          if LMDB.terminal_by_state_key_key(candidate) == reverse_key do
+            {:cont, {:ok, [{reverse_key, terminal_key, candidate} | owned]}}
+          else
+            case stored_terminal_owner(lmdb_path, reverse_key, terminal_key) do
+              {:ok, state_key} -> {:cont, {:ok, [{reverse_key, terminal_key, state_key} | owned]}}
+              :unknown -> {:cont, {:ok, owned}}
+              {:error, _reason} = error -> {:halt, error}
+            end
+          end
+        else
           :error -> {:halt, {:error, :invalid_terminal_reverse_key}}
         end
 
@@ -252,6 +289,31 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjection do
       {:error, _reason} = error -> error
     end
   end
+
+  defp stored_terminal_owner(lmdb_path, reverse_key, terminal_key) do
+    case LMDB.get(lmdb_path, terminal_key) do
+      {:ok, blob} when is_binary(blob) ->
+        with {:ok, {_id, _updated_at_ms, _expire_at_ms, state_key, _count_key}}
+             when is_binary(state_key) <- LMDB.decode_terminal_index_entry_row(terminal_key, blob),
+             true <- LMDB.terminal_by_state_key_key(state_key) == reverse_key do
+          {:ok, state_key}
+        else
+          _unknown -> :unknown
+        end
+
+      :not_found ->
+        :unknown
+
+      {:error, _reason} = error ->
+        error
+    end
+  end
+
+  defp terminal_state_key_from_reverse_key(<<"flow-terminal-by-state:", state_key::binary>>)
+       when byte_size(state_key) > 0,
+       do: {:ok, state_key}
+
+  defp terminal_state_key_from_reverse_key(_reverse_key), do: :error
 
   defp terminal_state_status_for_test(keydir, state_key, decode_entry_fun) do
     case TerminalState.statuses_with_reader(

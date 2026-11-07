@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Reconciling a shard's LMDB projection works for Flows whose state key is
+  longer than 256 bytes (an id over 204 bytes). Index reverse rows keep a
+  state key raw up to 256 bytes and a digest beyond that, and two rebuild
+  steps read the owner back out of the reverse key: the FIFO lane rebuild
+  then failed with `fifo_lane_reverse_owner_mismatch`, and the stale
+  terminal cleanup with `terminal_state_key_mismatch`. Either marked the
+  reconcile unhealthy, so after completing such a Flow every flush failed
+  and the shard's mirror stayed degraded. The FIFO lane owner is now rebuilt
+  from its lane entry and the terminal owner from its terminal index entry,
+  each checked against the reverse key; a terminal row whose owner cannot be
+  found is left alone.
+
 - Flow names a create, claim or transition writes are limited: a type up to
   128 bytes, a state up to 64 (as state metadata already required), a
   worker up to 256, a correlation id up to 256 and a child group id up to

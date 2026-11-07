@@ -3,6 +3,29 @@ defmodule Ferricstore.Flow.LMDBRebuilder.TerminalProjectionTest do
 
   alias Ferricstore.Flow.LMDBRebuilder.TerminalProjection
 
+  test "a digest reverse row whose owner cannot be found is left in place" do
+    data_dir =
+      Path.join(
+        System.tmp_dir!(),
+        "terminal_reverse_unknown_#{System.unique_integer([:positive])}"
+      )
+
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+    path = Ferricstore.Flow.LMDB.path(Ferricstore.DataDir.shard_data_path(data_dir, 0))
+    state_key = Ferricstore.Flow.Keys.state_key(String.duplicate("x", 250), "tenant")
+    reverse_key = Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+    refute String.ends_with?(reverse_key, state_key)
+
+    :ok = Ferricstore.Flow.LMDB.write_batch(path, [{:put, reverse_key, "missing-terminal-key"}])
+    keydir = :ets.new(:terminal_projection_unknown_keydir, [:set])
+
+    assert {:ok, 0} =
+             TerminalProjection.cleanup_stale_terminal_reverse(path, keydir, fn _entry -> [] end)
+
+    assert {:ok, "missing-terminal-key"} = Ferricstore.Flow.LMDB.get(path, reverse_key)
+  end
+
   test "terminal reverse scans preserve backend failures" do
     keydir = :ets.new(:terminal_projection_reverse_keydir, [:set])
 
