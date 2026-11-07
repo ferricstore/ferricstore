@@ -4,6 +4,12 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New Flows take partition keys of up to 256 bytes, rejecting a longer one
+  with `ERR flow partition_key is longer than 256 bytes`. A partition key is
+  stored in the record and in every index entry that leads with it. Spawned
+  children may still inherit a parent's longer partition key, and Flows
+  stored under one keep working.
+
 - New Flows take ids of up to 256 bytes. `FLOW.CREATE`, `FLOW.CREATE_MANY`,
   `FLOW.START_AND_CLAIM` and spawned children reject a longer id with `ERR
   flow id is longer than 256 bytes`, before anything is written; before, an
