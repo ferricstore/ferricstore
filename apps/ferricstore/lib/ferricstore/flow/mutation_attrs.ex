@@ -63,8 +63,34 @@ defmodule Ferricstore.Flow.MutationAttrs do
   # its parent's partition, which already exists.
   @max_new_partition_key_bytes 256
 
+  # Names a Flow keeps in its record, index keys and history. Values already
+  # stored keep working; a create, claim or transition that writes a new one
+  # is limited.
+  @max_type_bytes 128
+  @max_state_bytes 64
+  @max_worker_bytes 256
+  @max_correlation_id_bytes 256
+  @max_group_id_bytes 128
+
   @doc false
   def max_new_id_bytes, do: @max_new_id_bytes
+
+  def validate_new_type(type, opts), do: validate_new_bytes(:type, type, @max_type_bytes, opts)
+
+  def validate_new_state(state, opts),
+    do: validate_new_bytes(:state, state, @max_state_bytes, opts)
+
+  def validate_new_worker(worker, opts),
+    do: validate_new_bytes(:worker, worker, @max_worker_bytes, opts)
+
+  defp validate_new_bytes(name, value, max_bytes, opts)
+       when is_binary(value) and byte_size(value) > max_bytes do
+    if Internal.allowed?(opts),
+      do: :ok,
+      else: {:error, "ERR flow #{name} is longer than #{max_bytes} bytes"}
+  end
+
+  defp validate_new_bytes(_name, _value, _max_bytes, _opts), do: :ok
 
   def validate_new_id(id, opts) do
     with :ok <- validate_id(id) do
@@ -134,8 +160,10 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_new_id(id, opts),
          :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, type} <- required_binary(opts, :type),
+         :ok <- validate_new_type(type, opts),
          :ok <- Internal.reject_reserved_type(type, opts),
          {:ok, state} <- optional_binary(opts, :state, @default_state),
+         :ok <- validate_new_state(state, opts),
          :ok <- reject_running_state_transition(state),
          {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
          :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
@@ -144,6 +172,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          root_flow_id = root_flow_id || id,
          {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
          :ok <- validate_ref_size(:correlation_id, correlation_id),
+         :ok <-
+           validate_new_bytes(:correlation_id, correlation_id, @max_correlation_id_bytes, opts),
          {:ok, idempotent} <- optional_boolean(opts, :idempotent, false),
          {:ok, now} <- optional_now_ms(opts),
          {:ok, run_at_ms} <- optional_non_neg_integer(opts, :run_at_ms, now),
@@ -225,10 +255,13 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_new_id(id, opts),
          :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_state(:type, type),
+         :ok <- validate_new_type(type, opts),
          :ok <- Internal.reject_reserved_type(type, opts),
          :ok <- validate_state(:state, initial_state),
+         :ok <- validate_new_state(initial_state, opts),
          :ok <- reject_running_state_transition(initial_state),
          {:ok, worker} <- required_binary(opts, :worker),
+         :ok <- validate_new_worker(worker, opts),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          {:ok, parent_flow_id} <- optional_binary_or_nil(opts, :parent_flow_id, nil),
          :ok <- validate_ref_size(:parent_flow_id, parent_flow_id),
@@ -237,6 +270,8 @@ defmodule Ferricstore.Flow.MutationAttrs do
          root_flow_id = root_flow_id || id,
          {:ok, correlation_id} <- optional_binary_or_nil(opts, :correlation_id, nil),
          :ok <- validate_ref_size(:correlation_id, correlation_id),
+         :ok <-
+           validate_new_bytes(:correlation_id, correlation_id, @max_correlation_id_bytes, opts),
          {:ok, now} <- optional_now_ms(opts),
          :ok <- validate_deadline(now, lease_ms, :lease_ms),
          {:ok, retention_ttl_ms} <- optional_retention_ttl_ms(opts),
@@ -343,6 +378,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_many_item_count(children),
          {:ok, partition_key} <- required_partition_key(Keyword.get(opts, :partition_key)),
          {:ok, group_id} <- required_binary(opts, :group_id),
+         :ok <- validate_new_bytes(:group_id, group_id, @max_group_id_bytes, opts),
          :ok <- validate_child_group_id(group_id),
          {:ok, wait} <- optional_child_policy(opts, :wait, :all, [:all, :any, :none]),
          {:ok, on_child_failed} <-
@@ -356,8 +392,11 @@ defmodule Ferricstore.Flow.MutationAttrs do
              :abandon_children
            ]),
          {:ok, exhaust_to} <- exhaust_to_opts(opts),
+         :ok <- validate_new_state(exhaust_to["success"], opts),
+         :ok <- validate_new_state(exhaust_to["failure"], opts),
          {:ok, from_state} <- optional_binary_or_nil(opts, :from_state, nil),
          {:ok, wait_state} <- optional_binary_or_nil(opts, :wait_state, nil),
+         :ok <- validate_new_state(wait_state, opts),
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, now} <- optional_now_ms(opts),
@@ -408,6 +447,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_state(:from, from_state),
          :ok <- validate_state(:to, to_state),
+         :ok <- validate_new_state(to_state, opts),
          :ok <- reject_running_state_transition(to_state),
          {:ok, lease_token} <- optional_lease_token(opts),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
@@ -450,6 +490,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- validate_lease_token(lease_token),
          :ok <- validate_state(:from, from_state),
          :ok <- validate_state(:to, to_state),
+         :ok <- validate_new_state(to_state, opts),
          :ok <- reject_running_state_transition(to_state),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),
@@ -458,6 +499,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          :ok <- validate_deadline(now, lease_ms, :lease_ms),
          {:ok, worker} <- optional_binary_or_nil(opts, :worker, nil),
+         :ok <- validate_new_worker(worker, opts),
          {:ok, attributes_merge, attributes_delete} <- Attributes.update_from_opts(opts),
          {:ok, state_meta} <- StateMeta.update_from_opts(opts) do
       attrs =
@@ -521,6 +563,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
          :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_lease_token(lease_token),
          {:ok, state} <- required_binary(opts, :state),
+         :ok <- validate_new_state(state, opts),
          :ok <- reject_running_state_transition(state),
          {:ok, fencing_token} <- required_non_neg_integer(opts, :fencing_token),
          {:ok, partition_key} <- optional_partition_key(opts),

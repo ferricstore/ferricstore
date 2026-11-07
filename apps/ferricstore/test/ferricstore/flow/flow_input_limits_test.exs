@@ -1,4 +1,4 @@
-defmodule Ferricstore.Flow.CreateIdLimitTest do
+defmodule Ferricstore.Flow.FlowInputLimitsTest do
   use Ferricstore.Test.FlowCase
 
   alias Ferricstore.Flow.MutationAttrs
@@ -175,6 +175,130 @@ defmodule Ferricstore.Flow.CreateIdLimitTest do
                now_ms: now + 1
              )
   end
+
+  test "new Flows take a type up to 128 bytes, a state up to 64 and a correlation id up to 256" do
+    partition = "input-limits"
+    create = &FerricStore.flow_create(unique_flow_id("input-limits"), &1)
+
+    assert :ok =
+             create.(
+               type: bytes(128),
+               state: bytes(64),
+               correlation_id: bytes(256),
+               partition_key: partition
+             )
+
+    assert create.(type: bytes(129), partition_key: partition) ==
+             {:error, "ERR flow type is longer than 128 bytes"}
+
+    assert create.(type: "t", state: bytes(65), partition_key: partition) ==
+             {:error, "ERR flow state is longer than 64 bytes"}
+
+    assert create.(type: "t", correlation_id: bytes(257), partition_key: partition) ==
+             {:error, "ERR flow correlation_id is longer than 256 bytes"}
+
+    assert FerricStore.flow_start_and_claim(unique_flow_id("input-limits"), bytes(129), "queued",
+             partition_key: partition,
+             worker: "w"
+           ) == {:error, "ERR flow type is longer than 128 bytes"}
+
+    assert FerricStore.flow_start_and_claim(unique_flow_id("input-limits"), "t", bytes(65),
+             partition_key: partition,
+             worker: "w"
+           ) == {:error, "ERR flow state is longer than 64 bytes"}
+  end
+
+  test "a claim or start takes a worker name up to 256 bytes" do
+    assert FerricStore.flow_claim_due("input-limits-claim",
+             partition_key: "input-limits-claim",
+             worker: bytes(257)
+           ) == {:error, "ERR flow worker is longer than 256 bytes"}
+
+    assert FerricStore.flow_start_and_claim(unique_flow_id("input-limits"), "t", "queued",
+             partition_key: "input-limits-claim",
+             worker: bytes(257)
+           ) == {:error, "ERR flow worker is longer than 256 bytes"}
+
+    assert {:ok, []} =
+             FerricStore.flow_claim_due("input-limits-claim",
+               partition_key: "input-limits-claim",
+               worker: bytes(256)
+             )
+  end
+
+  test "a transition, step or reschedule moves only into a state up to 64 bytes" do
+    too_long = {:error, "ERR flow state is longer than 64 bytes"}
+    opts = [fencing_token: 1, partition_key: "input-limits"]
+
+    assert MutationAttrs.transition_attrs("flow", "queued", bytes(65), opts) == too_long
+    assert {:ok, _attrs} = MutationAttrs.transition_attrs("flow", "queued", bytes(64), opts)
+
+    assert MutationAttrs.step_continue_attrs("flow", "token", "queued", bytes(65), opts) ==
+             too_long
+
+    assert MutationAttrs.reschedule_attrs("flow", "token", [state: bytes(65)] ++ opts) ==
+             too_long
+  end
+
+  test "a child group takes a group id up to 128 bytes and states up to 64" do
+    spawn = fn opts ->
+      MutationAttrs.spawn_children_attrs(
+        unique_flow_id("input-limits-parent"),
+        [%{id: unique_flow_id("input-limits-child"), type: "t"}],
+        Keyword.merge(
+          [
+            partition_key: "input-limits",
+            group_id: "g",
+            exhaust_to: %{success: "completed", failure: "failed"},
+            fencing_token: 1
+          ],
+          opts
+        )
+      )
+    end
+
+    assert {:ok, _attrs} = spawn.(group_id: bytes(128), wait_state: bytes(64))
+    assert spawn.(group_id: bytes(129)) == {:error, "ERR flow group_id is longer than 128 bytes"}
+    assert spawn.(wait_state: bytes(65)) == {:error, "ERR flow state is longer than 64 bytes"}
+
+    assert spawn.(exhaust_to: %{success: bytes(65), failure: "failed"}) ==
+             {:error, "ERR flow state is longer than 64 bytes"}
+  end
+
+  test "a Flow stored with a longer type and state can still be claimed and completed" do
+    partition = "input-limits-existing"
+    type = bytes(200)
+    id = unique_flow_id("input-limits-existing")
+    now = System.system_time(:millisecond)
+
+    assert :ok =
+             Ferricstore.Flow.create_internal(
+               FerricStore.Instance.get(:default),
+               id,
+               type: type,
+               state: bytes(100),
+               partition_key: partition,
+               run_at_ms: now
+             )
+
+    assert {:ok, [%{id: ^id} = claimed]} =
+             FerricStore.flow_claim_due(type,
+               state: bytes(100),
+               partition_key: partition,
+               worker: "w",
+               limit: 1,
+               now_ms: now
+             )
+
+    assert :ok =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: now + 1
+             )
+  end
+
+  defp bytes(count), do: String.duplicate("s", count)
 
   defp id_of(bytes) do
     prefix = unique_flow_id("id-limit") <> "-"

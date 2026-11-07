@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Flow names a create, claim or transition writes are limited: a type up to
+  128 bytes, a state up to 64 (as state metadata already required), a
+  worker up to 256, a correlation id up to 256 and a child group id up to
+  128. A longer one is rejected with `ERR flow <field> is longer than <n>
+  bytes`. They are kept in the record, index keys and history. Commands
+  that only read or match a name, such as a claim's type and state filter,
+  still take longer ones, so Flows stored with them keep working.
+
 - New Flows take partition keys of up to 256 bytes, rejecting a longer one
   with `ERR flow partition_key is longer than 256 bytes`. A partition key is
   stored in the record and in every index entry that leads with it. Spawned

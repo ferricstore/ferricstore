@@ -92,6 +92,7 @@ defmodule Ferricstore.Flow.ClaimDueAPI do
          :ok <- Internal.reject_reserved_type(type, opts),
          {:ok, state} <- optional_claim_states(opts),
          {:ok, worker} <- required_binary(opts, :worker),
+         :ok <- Ferricstore.Flow.MutationAttrs.validate_new_worker(worker, opts),
          {:ok, lease_ms} <- optional_pos_integer(opts, :lease_ms, @default_lease_ms),
          {:ok, limit} <- optional_claim_limit(opts),
          {:ok, priority} <- optional_priority_or_nil(opts),

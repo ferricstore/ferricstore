@@ -29,10 +29,12 @@ defmodule Ferricstore.FlowWriteContractTest do
     type = :binary.copy("t", max_metadata_bytes)
     opts = [type: type, state: "queued", partition_key: "query-row-contract", now_ms: 1_000]
 
+    # Public creates cap the type first; internal creates are not capped and
+    # still meet the QueryRow bound.
     assert {:error, ^expected_error} =
-             Ferricstore.Flow.MutationAttrs.create_attrs(id, opts)
+             Ferricstore.Flow.MutationAttrs.create_attrs(id, Ferricstore.Flow.Internal.put(opts))
 
-    assert {:error, ^expected_error} = FerricStore.flow_create(id, opts)
+    assert {:error, "ERR flow type is longer than 128 bytes"} = FerricStore.flow_create(id, opts)
 
     assert {:ok, nil} = FerricStore.flow_get(id, partition_key: "query-row-contract")
   end
@@ -53,12 +55,24 @@ defmodule Ferricstore.FlowWriteContractTest do
                now_ms: 1_000
              )
 
+    transition_opts = [
+      fencing_token: 0,
+      partition_key: partition,
+      run_at_ms: 1_001,
+      now_ms: 1_001
+    ]
+
+    assert {:error, "ERR flow state is longer than 64 bytes"} =
+             FerricStore.flow_transition(id, "queued", oversized_state, transition_opts)
+
+    # Internal transitions are not capped and still meet the QueryRow bound.
     assert {:error, ^expected_error} =
-             FerricStore.flow_transition(id, "queued", oversized_state,
-               fencing_token: 0,
-               partition_key: partition,
-               run_at_ms: 1_001,
-               now_ms: 1_001
+             Ferricstore.Flow.transition(
+               FerricStore.Instance.get(:default),
+               id,
+               "queued",
+               oversized_state,
+               Ferricstore.Flow.Internal.put(transition_opts)
              )
 
     assert {:ok, record} = FerricStore.flow_get(id, partition_key: partition)
@@ -72,13 +86,16 @@ defmodule Ferricstore.FlowWriteContractTest do
     expected_error = "ERR flow query metadata exceeds #{max_metadata_bytes} bytes"
 
     assert {:error, ^expected_error} =
-             Ferricstore.Flow.MutationAttrs.create_attrs(id,
-               type: :binary.copy("t", max_metadata_bytes),
-               state: "queued",
-               partition_key: "query-row-contract",
-               attributes: %{"kind" => "invoice"},
-               state_meta: %{"owner" => "worker-1"},
-               now_ms: 1_000
+             Ferricstore.Flow.MutationAttrs.create_attrs(
+               id,
+               Ferricstore.Flow.Internal.put(
+                 type: :binary.copy("t", max_metadata_bytes),
+                 state: "queued",
+                 partition_key: "query-row-contract",
+                 attributes: %{"kind" => "invoice"},
+                 state_meta: %{"owner" => "worker-1"},
+                 now_ms: 1_000
+               )
              )
   end
 
