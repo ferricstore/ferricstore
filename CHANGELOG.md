@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Reconciling a shard's LMDB projection works for Flows whose state key is
+  longer than 256 bytes (an id over 204 bytes). Index reverse rows keep a
+  state key raw up to 256 bytes and a digest beyond that, and two rebuild
+  steps read the owner back out of the reverse key: the FIFO lane rebuild
+  then failed with `fifo_lane_reverse_owner_mismatch`, and the stale
+  terminal cleanup with `terminal_state_key_mismatch`. Either marked the
+  reconcile unhealthy, so after completing such a Flow every flush failed
+  and the shard's mirror stayed degraded. The FIFO lane owner is now rebuilt
+  from its lane entry and the terminal owner from its terminal index entry,
+  each checked against the reverse key; a terminal row whose owner cannot be
+  found is left alone.
+
 - Reconciling a shard's LMDB projection from its keydir is about twice as
   fast. Each commit took the state rows of one 64-row keydir page, about 11
   Flows, since a Flow owns several keydir rows; and each commit read every
