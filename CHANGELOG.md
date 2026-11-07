@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- History that retention removed no longer comes back after a restart.
+  Startup recovery reads the active history log file again (up to 128 MiB
+  by default) and indexes every entry in it, and retention removed a Flow's
+  history entries only from the indexes. A restart indexed them again: a
+  Flow created later under the same ID listed the old Flow's events before
+  its own, and the entries stayed in the indexes for good. Retention now
+  writes tombstones for them to the history log, through the history
+  projector.
+
 - `FLOW.INFO` and `FLOW.STATS` no longer keep counting a terminal Flow after
   retention removes it. A terminal Flow keeps its state, parent, root and
   correlation index entries in memory after its record moves to LMDB, so

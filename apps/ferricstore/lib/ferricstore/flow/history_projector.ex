@@ -292,12 +292,24 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   @spec pending_count(map() | nil, non_neg_integer(), timeout()) ::
           {:ok, non_neg_integer()} | {:error, term()}
-  def pending_count(instance_ctx, shard_index, timeout \\ 1_000) do
+  def pending_count(instance_ctx, shard_index, timeout \\ 1_000),
+    do: call_pending(instance_ctx, shard_index, :pending_count, timeout)
+
+  @doc """
+  Pending entries that add history, leaving out the tombstones of entries
+  already removed: what a reader of the indexes cannot see yet.
+  """
+  @spec pending_history_count(map() | nil, non_neg_integer(), timeout()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def pending_history_count(instance_ctx, shard_index, timeout \\ 1_000),
+    do: call_pending(instance_ctx, shard_index, :pending_history_count, timeout)
+
+  defp call_pending(instance_ctx, shard_index, request, timeout) do
     projector = name(instance_ctx, shard_index)
 
     case Process.whereis(projector) do
       nil -> {:error, :not_started}
-      _pid -> GenServer.call(projector, :pending_count, timeout)
+      _pid -> GenServer.call(projector, request, timeout)
     end
   catch
     :exit, reason -> {:error, {:pending_count_exit, reason}}
@@ -538,6 +550,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   def handle_call(:pending_count, _from, state) do
     {:reply, {:ok, state.pending_count}, state}
+  end
+
+  def handle_call(:pending_history_count, _from, state) do
+    {:reply, {:ok, Enum.count(state.pending, &(not history_tombstone?(&1)))}, state}
   end
 
   def handle_call({:enqueue, entries}, _from, state) do
@@ -953,7 +969,80 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp flush_outstanding_request(state), do: state
 
+  # Tombstone entries (`%{key: key, tombstone: true}`) delete a history entry
+  # from the log, so recovery, which reads the log again, leaves it deleted.
+  # Runs of them and of new entries are written in the order they came.
   defp do_project(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         entries,
+         requested_index,
+         keydir_override
+       ) do
+    if Enum.any?(entries, &history_tombstone?/1) do
+      entries
+      |> Enum.chunk_by(&history_tombstone?/1)
+      |> Enum.reduce_while(:ok, fn [first | _] = run, :ok ->
+        result =
+          if history_tombstone?(first) do
+            keydir = keydir_override || keydir(instance_ctx, shard_index)
+            append_history_tombstones(instance_ctx, shard_index, shard_data_path, keydir, run)
+          else
+            project_entries(instance_ctx, shard_index, shard_data_path, run, nil, keydir_override)
+          end
+
+        if result == :ok, do: {:cont, :ok}, else: {:halt, result}
+      end)
+      |> case do
+        :ok ->
+          project_entries(
+            instance_ctx,
+            shard_index,
+            shard_data_path,
+            [],
+            requested_index,
+            keydir_override
+          )
+
+        error ->
+          error
+      end
+    else
+      project_entries(
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        entries,
+        requested_index,
+        keydir_override
+      )
+    end
+  end
+
+  defp history_tombstone?(%{tombstone: true}), do: true
+  defp history_tombstone?(_entry), do: false
+
+  defp append_history_tombstones(instance_ctx, shard_index, shard_data_path, keydir, tombstones) do
+    with {:ok, _file_id, file_path} <- history_append_file(shard_data_path, keydir),
+         :ok <-
+           Trim.append_tombstones(file_path, Enum.map(tombstones, & &1.key), %{
+             sync_history_log_before_publish: &Storage.sync_history_log_before_publish/1
+           }) do
+      clear_disk_pressure(instance_ctx, shard_index)
+      :ok
+    else
+      error ->
+        set_disk_pressure(instance_ctx, shard_index)
+        if match?({:error, _reason}, error), do: error, else: {:error, error}
+    end
+  rescue
+    error ->
+      set_disk_pressure(instance_ctx, shard_index)
+      {:error, {:history_projection_exception, error}}
+  end
+
+  defp project_entries(
          instance_ctx,
          shard_index,
          shard_data_path,
@@ -977,7 +1066,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
       {:error, {:history_projection_exception, error}}
   end
 
-  defp do_project(
+  defp project_entries(
          instance_ctx,
          shard_index,
          shard_data_path,

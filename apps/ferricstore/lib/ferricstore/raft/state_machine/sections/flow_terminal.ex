@@ -1169,7 +1169,11 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowTerminal do
       end
 
       defp flow_retention_history_projection_pending?(state) do
-        case HistoryProjector.pending_count(instance_ctx_for_state(state), state.shard_index, 500) do
+        case HistoryProjector.pending_history_count(
+               instance_ctx_for_state(state),
+               state.shard_index,
+               500
+             ) do
           {:ok, 0} -> false
           {:ok, count} when is_integer(count) and count > 0 -> true
           {:error, :not_started} -> false
