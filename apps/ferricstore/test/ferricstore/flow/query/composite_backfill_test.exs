@@ -206,11 +206,11 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
     assert preserved_key == existing_entry.key
   end
 
-  test "projects the benchmarked 64-record page and reuses existing reverse ownership" do
-    data_dir = tmp_data_dir("page-64")
+  test "projects a 256-record page and reuses existing reverse ownership" do
+    data_dir = tmp_data_dir("page-256")
     ctx = %{data_dir: data_dir, shard_count: 1}
     definition = definition()
-    records = Enum.map(1..64, &projected_record("record-#{&1}", &1))
+    records = Enum.map(1..256, &projected_record("record-#{&1}", &1))
 
     read_entries = fn _ctx, 0, state_keys ->
       versions = Map.new(records, &{&1.state_key, &1.record.version})
@@ -221,17 +221,51 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
        end)}
     end
 
-    assert CompositeBackfill.max_page_records() == 64
+    assert CompositeBackfill.max_page_records() == 256
 
     for _pass <- 1..2 do
-      assert {:ok, %{projected_records: 64, written_entries: 64}} =
+      assert {:ok, %{projected_records: 256, written_entries: 256}} =
                CompositeBackfill.project_page(ctx, 0, records, [definition],
                  read_entries_fun: read_entries
                )
     end
 
-    assert {:ok, 64} =
+    assert {:ok, 256} =
              LMDB.prefix_count(lmdb_path(data_dir), IndexDefinition.storage_prefix(definition))
+  end
+
+  test "verifies long state keys in reads within the shard reader's key limits" do
+    data_dir = tmp_data_dir("long-keys")
+    ctx = %{data_dir: data_dir, shard_count: 1}
+    definition = definition()
+    page_records = CompositeBackfill.max_page_records()
+    padding = String.duplicate("k", div(1_100_000, page_records))
+    records = Enum.map(1..page_records, &projected_record("#{padding}-#{&1}", &1))
+    versions = Map.new(records, &{&1.state_key, &1.record.version})
+    parent = self()
+
+    read_entries = fn _ctx, 0, state_keys ->
+      send(parent, {:verify_read, state_keys})
+
+      if length(state_keys) <= 512 and
+           Enum.sum(Enum.map(state_keys, &byte_size/1)) <= 1_048_576 do
+        {:ok,
+         Enum.map(state_keys, fn state_key ->
+           {encoded_record(state_key, Map.fetch!(versions, state_key)), 0}
+         end)}
+      else
+        {:error, "ERR invalid shard batch read request"}
+      end
+    end
+
+    assert {:ok, %{projected_records: ^page_records, written_entries: ^page_records}} =
+             CompositeBackfill.project_page(ctx, 0, records, [definition],
+               read_entries_fun: read_entries
+             )
+
+    verified = collect_verify_reads([])
+    assert length(verified) > 1
+    assert Enum.concat(verified) == Enum.map(records, & &1.state_key)
   end
 
   test "backfill writes byte-identical dynamic covering entries to live derivation" do
@@ -377,7 +411,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
   end
 
   test "rejects an oversized page before allocating projection state" do
-    records = List.duplicate(projected_record("one", 1), 65)
+    records = List.duplicate(projected_record("one", 1), 257)
 
     assert {:error, :query_backfill_page_too_large} =
              CompositeBackfill.project_page(%{}, 0, records, [])
@@ -591,6 +625,14 @@ defmodule Ferricstore.Flow.Query.CompositeBackfillTest do
                IndexDefinition.global_storage_prefix(),
                1
              )
+  end
+
+  defp collect_verify_reads(reads) do
+    receive do
+      {:verify_read, state_keys} -> collect_verify_reads([state_keys | reads])
+    after
+      0 -> Enum.reverse(reads)
+    end
   end
 
   defp projected_record(id, version) do

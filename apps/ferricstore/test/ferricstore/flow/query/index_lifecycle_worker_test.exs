@@ -892,7 +892,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
     assert_receive {:snapshot_items, 256}
     assert {:ok, :shard_complete} = IndexLifecycleWorker.run_once(worker)
-    assert_receive {:backfill_items, 64}
+    assert_receive {:backfill_items, 256}
     assert {:ok, :validation_fenced} = IndexLifecycleWorker.run_once(worker)
     assert {:ok, :validation_progress} = IndexLifecycleWorker.run_once(worker)
     assert_receive {:validation_items, 256}
@@ -1037,7 +1037,7 @@ defmodule Ferricstore.Flow.Query.IndexLifecycleWorkerTest do
     assert {:ok, :snapshot_complete} = IndexLifecycleWorker.run_once(worker)
     assert {:ok, :backfill_progress} = IndexLifecycleWorker.run_once(worker)
 
-    for items <- [64, 32, 16], do: assert_receive({:hydration_attempt, ^items})
+    for items <- [256, 128, 64, 32, 16], do: assert_receive({:hydration_attempt, ^items})
     refute_receive {:hydration_attempt, _items}
   end
 
