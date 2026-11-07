@@ -14,13 +14,19 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
 
   alias Ferricstore.Store.Router
 
-  @max_page_records Limits.max_projection_page_records()
+  # Each page is one LMDB commit of about 10 ms plus about 0.12 ms per
+  # record, so 256 records spend most of the commit on the records.
+  @max_page_records 256
+  @max_reverse_prefetch_records Limits.max_projection_page_records()
   @max_definitions 16
   @max_projection_definitions 32
   @max_exact_integer 9_007_199_254_740_991
   @max_expiry 0xFFFF_FFFF_FFFF_FFFF
   @max_query_row_bytes QueryRowCodec.max_encoded_bytes()
   @max_projection_operation_bytes 16 * 1_024 * 1_024
+  # The shard reader takes at most 512 keys and 1 MiB of key bytes per read.
+  @max_verify_read_keys 512
+  @max_verify_read_key_bytes 1_048_576
 
   @spec max_page_records() :: pos_integer()
   def max_page_records, do: @max_page_records
@@ -91,12 +97,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   defp projection_ops(path, records, definitions, projection_definitions, operation_budget) do
     state_keys = Enum.map(records, & &1.state_key)
 
-    with {:ok, initial_cache} <-
-           CompositeProjection.prefetch_reverse_values(
-             path,
-             state_keys,
-             CompositeProjection.new_cache()
-           ) do
+    with {:ok, initial_cache} <- prefetch_reverse_values(path, state_keys) do
       Enum.reduce_while(
         records,
         {:ok, [], initial_cache, 0},
@@ -130,6 +131,17 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
         {:error, _reason} = error -> error
       end
     end
+  end
+
+  defp prefetch_reverse_values(path, state_keys) do
+    state_keys
+    |> Enum.chunk_every(@max_reverse_prefetch_records)
+    |> Enum.reduce_while({:ok, CompositeProjection.new_cache()}, fn chunk, {:ok, cache} ->
+      case CompositeProjection.prefetch_reverse_values(path, chunk, cache) do
+        {:ok, cache} -> {:cont, {:ok, cache}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp validate_record(%{state_key: state_key, record: nil, expire_at_ms: 0} = projected)
@@ -263,31 +275,55 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   defp verify_current_records(ctx, shard_index, records, opts) do
     records = Enum.reject(records, &retained_query_row?/1)
     read_entries = Keyword.get(opts, :read_entries_fun, &Router.read_shard_entries/3)
-    state_keys = Enum.map(records, & &1.state_key)
 
     cond do
       records == [] ->
         :ok
 
       is_function(read_entries, 3) ->
-        case read_entries.(ctx, shard_index, state_keys) do
-          {:ok, entries} when is_list(entries) and length(entries) == length(records) ->
-            verify_entries(records, entries)
-
-          :unavailable ->
-            {:error, :query_backfill_primary_unavailable}
-
-          {:error, _reason} = error ->
-            error
-
-          _invalid ->
-            {:error, :invalid_query_backfill_primary_read}
-        end
+        verify_record_chunks(ctx, shard_index, records, read_entries)
 
       true ->
         {:error, :invalid_query_backfill_reader}
     end
   end
+
+  # Long state keys can exceed one read's key bytes, so a page is verified in
+  # as many reads as the reader's limits need.
+  defp verify_record_chunks(_ctx, _shard_index, [], _read_entries), do: :ok
+
+  defp verify_record_chunks(ctx, shard_index, records, read_entries) do
+    {chunk, rest} =
+      take_verify_chunk(records, @max_verify_read_keys, @max_verify_read_key_bytes, [])
+
+    case read_entries.(ctx, shard_index, Enum.map(chunk, & &1.state_key)) do
+      {:ok, entries} when is_list(entries) and length(entries) == length(chunk) ->
+        with :ok <- verify_entries(chunk, entries),
+             do: verify_record_chunks(ctx, shard_index, rest, read_entries)
+
+      :unavailable ->
+        {:error, :query_backfill_primary_unavailable}
+
+      {:error, _reason} = error ->
+        error
+
+      _invalid ->
+        {:error, :invalid_query_backfill_primary_read}
+    end
+  end
+
+  defp take_verify_chunk([record | rest], max_keys, max_key_bytes, chunk)
+       when max_keys > 0 and (chunk == [] or byte_size(record.state_key) <= max_key_bytes) do
+    take_verify_chunk(
+      rest,
+      max_keys - 1,
+      max_key_bytes - byte_size(record.state_key),
+      [record | chunk]
+    )
+  end
+
+  defp take_verify_chunk(rest, _max_keys, _max_key_bytes, chunk),
+    do: {Enum.reverse(chunk), rest}
 
   defp retained_query_row?(%{record: record, projection_guard: {:value, encoded}}),
     do: is_map(record) and is_binary(encoded)

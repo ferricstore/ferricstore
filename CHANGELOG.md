@@ -4,6 +4,20 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Query index backfill projects 256 records per LMDB commit instead of 64.
+  A commit costs about 10 ms plus about 0.12 ms per record, so 64-record
+  pages spent most of their write time on the commit itself. Over 100k
+  existing Flows on one shard, backfill took 32 s instead of 43 s, and the
+  five built-in indexes went from building to active in 60 s instead of
+  70 s.
+
+- A query index build no longer stalls on Flows with long ids. After
+  projecting a page, the build re-reads its records from primary storage in
+  one shard read, which takes at most 1 MiB of keys, so a page whose state
+  keys added up to more (64 Flows with ids of about 17 KB) failed with `ERR
+  invalid shard batch read request` and was retried forever. The page is
+  now verified in as many reads as those limits need.
+
 - A burst of Flow writes no longer leaves Flows out of the LMDB projection
   until the node restarts. When the LMDB writer's queue was full, the Raft
   apply path marked the shard's mirror degraded and dropped the projection,
