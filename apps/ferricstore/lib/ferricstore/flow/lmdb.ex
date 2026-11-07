@@ -857,6 +857,26 @@ defmodule Ferricstore.Flow.LMDB do
   def active_by_state_global_prefix,
     do: Ferricstore.Flow.LMDB.IndexCodec.active_by_state_global_prefix()
 
+  @doc """
+  Returns the state key that owns an active reverse row. The reverse key holds
+  the state key raw up to 256 bytes and a digest of it beyond that, so the
+  owner is rebuilt from the row's lane entry (the partition tag and the Flow
+  id) and must map back to the same reverse key.
+  """
+  def active_reverse_owner(reverse_key, lane_key, lane_member)
+      when is_binary(reverse_key) and is_binary(lane_key) do
+    with {:ok, {_sequence, id}} <- FifoLane.decode_member(lane_member),
+         {pos, 1} when pos > 2 <- :binary.match(lane_key, "}"),
+         state_key = binary_part(lane_key, 0, pos + 1) <> ":s:" <> id,
+         true <- active_by_state_key_key(state_key) == reverse_key do
+      {:ok, state_key}
+    else
+      _mismatch -> :error
+    end
+  end
+
+  def active_reverse_owner(_reverse_key, _lane_key, _lane_member), do: :error
+
   def active_index_put_ops(state_key, record, expire_at_ms)
       when is_binary(state_key) and is_map(record) and is_integer(expire_at_ms) do
     {ops, _reverse_value} = active_index_put_ops_with_reverse(state_key, record, expire_at_ms)

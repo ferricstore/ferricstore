@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Below feature level 8, a hibernating Flow no longer leaves the LMDB writer
+  failing every flush with `compare_failed` on its `flow-active-by-state`
+  row. Parking a Flow compares that row with the value apply read in LMDB,
+  but a dirty-projection reconcile that runs before the writer flushes the
+  park rewrites it in the hot form, since the Flow's keydir row stays until
+  the park is written. The compare could then never pass, so each retry
+  failed the same way and the shard's mirror stayed degraded. Any Flow that
+  is written again while parked could hit it, for example by a signal. The
+  writer now compares against the row as it finds it and removes the active
+  rows that row lists, after checking that they belong to the same Flow.
+
 - Reconciling a shard's LMDB projection works for Flows whose state key is
   longer than 256 bytes (an id over 204 bytes). Index reverse rows keep a
   state key raw up to 256 bytes and a digest beyond that, and two rebuild

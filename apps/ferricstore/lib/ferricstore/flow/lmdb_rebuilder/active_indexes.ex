@@ -662,7 +662,7 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
         case {String.starts_with?(key, prefix), LMDB.decode_active_index_reverse_metadata(blob)} do
           {true, {:ok, {active_keys, {lane_key, lane_member, lane_score}}}}
           when lane_score in [-1, 0] ->
-            with {:ok, state_key} <- fifo_lane_reverse_owner(key, lane_key, lane_member),
+            with {:ok, state_key} <- LMDB.active_reverse_owner(key, lane_key, lane_member),
                  true <- valid_fifo_lane_reverse_owner?(state_key, lane_key, lane_member) do
               row = %{
                 reverse_key: key,
@@ -836,20 +836,6 @@ defmodule Ferricstore.Flow.LMDBRebuilder.ActiveIndexes do
     end
   rescue
     _error -> {:error, {:active_index_record_mismatch, state_key}}
-  end
-
-  # The reverse key holds the owner's state key raw up to 256 bytes and a
-  # digest of it beyond that, so the owner is rebuilt from its lane entry (the
-  # partition tag and the Flow id) and must map back to the same reverse key.
-  defp fifo_lane_reverse_owner(reverse_key, lane_key, lane_member) do
-    with {:ok, {_sequence, id}} <- FifoLane.decode_member(lane_member),
-         {:ok, tag_prefix} <- flow_key_tag(lane_key),
-         state_key = tag_prefix <> ":s:" <> id,
-         true <- LMDB.active_by_state_key_key(state_key) == reverse_key do
-      {:ok, state_key}
-    else
-      _mismatch -> :error
-    end
   end
 
   defp valid_fifo_lane_reverse_owner?(state_key, lane_key, lane_member) do
