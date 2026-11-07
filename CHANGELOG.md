@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New Flows take ids of up to 256 bytes. `FLOW.CREATE`, `FLOW.CREATE_MANY`,
+  `FLOW.START_AND_CLAIM` and spawned children reject a longer id with `ERR
+  flow id is longer than 256 bytes`, before anything is written; before, an
+  id could be as long as a key (about 64 KB). An id is part of every key and
+  index row a Flow owns: with 5,000 Flows on one shard, 1 KB ids took 12 KB of
+  BEAM memory and 57 KB of LMDB per Flow against 4.8 KB and 27 KB at 256
+  bytes, 17 KB ids paused creates under the default memory budget after about
+  1,800 Flows, and 64 KB ids timed out claims. Flows stored with longer ids
+  keep working, and every other command still takes their ids.
+
 - Reconciling a shard's LMDB projection from its keydir is about twice as
   fast. Each commit took the state rows of one 64-row keydir page, about 11
   Flows, since a Flow owns several keydir rows; and each commit read every

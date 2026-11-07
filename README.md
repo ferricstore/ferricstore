@@ -133,7 +133,7 @@ A Flow is one durable workflow record:
 | Field | Meaning |
 | --- | --- |
 | `type` | Workflow or queue type, such as `email` or `order`. |
-| `id` | Application-defined Flow id. |
+| `id` | Application-defined Flow id, up to 256 bytes. |
 | `partition_key` | Routing/co-location boundary required by bounded collection queries and FIFO lanes. |
 | `state` | Current durable state, such as `queued`, `created`, or `charged`. |
 | `attributes` | Small indexed metadata for Flow query, stats, and dashboard filters. |

@@ -52,6 +52,24 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def validate_id(id) when is_binary(id) and id != "", do: :ok
   def validate_id(_id), do: {:error, "ERR flow id must be a non-empty string"}
 
+  # A Flow's id is part of its state key, history keys, every index entry and
+  # reverse row, so each id byte costs about 12 bytes of RAM and 30-60 bytes
+  # of LMDB and disk. New Flows take ids up to this size. Flows stored with
+  # longer ids keep working, and internal creates (schedule runs) derive their
+  # ids from already admitted ones.
+  @max_new_id_bytes 256
+
+  @doc false
+  def max_new_id_bytes, do: @max_new_id_bytes
+
+  def validate_new_id(id, opts) do
+    with :ok <- validate_id(id) do
+      if byte_size(id) > @max_new_id_bytes and not Internal.allowed?(opts),
+        do: {:error, "ERR flow id is longer than #{@max_new_id_bytes} bytes"},
+        else: :ok
+    end
+  end
+
   def validate_state(_name, state) when is_binary(state) and state != "", do: :ok
   def validate_state(name, _state), do: {:error, "ERR flow #{name} must be a non-empty string"}
 
@@ -99,7 +117,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
 
   def create_attrs(id, opts) do
     with :ok <- validate_opts(opts),
-         :ok <- validate_id(id),
+         :ok <- validate_new_id(id, opts),
          :ok <- Internal.reject_reserved_id(id, opts),
          {:ok, type} <- required_binary(opts, :type),
          :ok <- Internal.reject_reserved_type(type, opts),
@@ -189,7 +207,7 @@ defmodule Ferricstore.Flow.MutationAttrs do
   def start_and_claim_attrs(id, type, initial_state, opts) do
     with :ok <- validate_opts(opts, return: true),
          :ok <- reject_start_and_claim_create_opts(opts),
-         :ok <- validate_id(id),
+         :ok <- validate_new_id(id, opts),
          :ok <- Internal.reject_reserved_id(id, opts),
          :ok <- validate_state(:type, type),
          :ok <- Internal.reject_reserved_type(type, opts),
