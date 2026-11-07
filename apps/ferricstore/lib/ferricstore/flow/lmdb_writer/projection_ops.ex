@@ -422,7 +422,7 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
       case flow_state_projection_key(op) do
         {:ok, state_key} ->
           case Map.fetch!(winners, state_key) do
-            {^index, _winner, _rank} -> [op | acc]
+            {^index, winner, _rank} -> [winner | acc]
             {_other_index, _winner, _rank} -> acc
           end
 
@@ -433,11 +433,28 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     retain_projection_winners(rest, winners, index + 1, acc)
   end
 
-  defp preferred_projection({old_index, old_op, old_rank}, {new_index, new_op, new_rank}) do
-    if new_rank >= old_rank,
-      do: {new_index, new_op, new_rank},
-      else: {old_index, old_op, old_rank}
+  defp preferred_projection(
+         {_old_index, old_op, old_rank} = old,
+         {_new_index, new_op, new_rank} = new
+       ) do
+    {index, op, rank} = if new_rank >= old_rank, do: new, else: old
+
+    if full_projection?(old_op) or full_projection?(new_op),
+      do: {index, full_projection(op), rank},
+      else: {index, op, rank}
   end
+
+  defp full_projection?({:project_flow_state_from_source, _state_key}), do: true
+  defp full_projection?({:project_flow_state_from_source, _state_key, _version}), do: true
+  defp full_projection?(_query_only), do: false
+
+  defp full_projection({:project_flow_query_state_from_source, state_key}),
+    do: {:project_flow_state_from_source, state_key}
+
+  defp full_projection({:project_flow_query_state_from_source, state_key, version}),
+    do: {:project_flow_state_from_source, state_key, version}
+
+  defp full_projection(full), do: full
 
   # One projection per state key: the highest expected version, which the
   # source reaches once it has published. A versionless full projection (what a
@@ -445,6 +462,10 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
   # A Flow deleted and created again under the same id starts over at version
   # 1, and an earlier incarnation's projection (one drained late from the
   # outbox, say) expects a version the source never reaches again.
+  # A query-only projection refreshes only the query row, so a winner that is
+  # one is projected in full when it replaces a full projection: what the full
+  # one would have changed, such as deleting a terminal row a rewind left,
+  # would otherwise never reach LMDB.
   defp projection_rank({:project_flow_state_from_source, _state_key}), do: {4, 0, 1}
 
   defp projection_rank({:project_flow_state_from_source, _state_key, expected_version}),

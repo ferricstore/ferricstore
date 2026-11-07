@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A Flow rewound out of a terminal state and claimed again before the LMDB
+  writer flushed no longer stays counted in that terminal state. A claim
+  queues only a query-row projection, and the writer, keeping one projection
+  per Flow in a flush, kept the claim's and dropped the rewind's full
+  projection, which deletes the terminal row. `FLOW.INFO` with
+  `consistent_projection` or `include_cold` then counted the Flow in both
+  its new state and the old terminal one. The writer now projects the kept
+  projection in full when it replaces a full one.
+
 - A node that lost a large Bloom, Cuckoo, Count-Min or Top-K file gets it
   back. A replica asked for its copy while it was still copying the file
   aside answered that it had applied the repair without one, because its
