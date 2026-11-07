@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.18 - 2026-11-07
+
+- The HTTP server takes Cowboy and Cowlib fixes for three security
+  advisories, pinned to their upstream commits until Hex releases include
+  them: EEF-CVE-2026-115701 (HIGH), where Cowboy buffered pipelined HTTP/1.1
+  data without bound while a request ran, so one client could exhaust the
+  server's memory; EEF-CVE-2026-43966, response splitting through non-VCHAR
+  bytes in structured headers; and EEF-CVE-2026-113431 (HIGH), HPACK
+  amplification through an unbounded decoded HTTP/2 header list.
+
 - Below feature level 8, a hibernating Flow no longer leaves the LMDB writer
   failing every flush with `compare_failed` on its `flow-active-by-state`
   row. Parking a Flow compares that row with the value apply read in LMDB,
