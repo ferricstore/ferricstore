@@ -367,7 +367,7 @@ defmodule Ferricstore.FlowTest.Sections.FlowSpawnChildrenWaitAnyResolvesOnFirstS
         large_id = String.duplicate("x", 65_536)
         large_due_state = String.duplicate("s", 65_536)
 
-        assert {:error, "ERR key too large" <> _} =
+        assert {:error, "ERR flow id is longer than 256 bytes"} =
                  flow_create_and_get(large_id, type: "checkout")
 
         assert {:error, "ERR key too large" <> _} =

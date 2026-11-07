@@ -418,8 +418,10 @@ defmodule Ferricstore.Store.BlobSideChannelTest.Sections.RaGenericBatchAcceptsPr
 
         assert byte_size(state_key) > 511
 
+        # New Flows take ids up to 256 bytes; an internal create stands in for
+        # a long-key Flow stored before that limit.
         assert :ok =
-                 Ferricstore.Flow.create(ctx, id,
+                 Ferricstore.Flow.create_internal(ctx, id,
                    type: "blob-query-catalog",
                    partition_key: partition_key,
                    correlation_id: :binary.copy("c", 256),

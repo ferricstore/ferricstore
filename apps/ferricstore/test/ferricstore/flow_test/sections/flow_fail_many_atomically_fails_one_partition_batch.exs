@@ -712,11 +712,19 @@ defmodule Ferricstore.FlowTest.Sections.FlowFailManyAtomicallyFailsOnePartitionB
         assert {:ok, _} =
                  flow_create_and_get(id, type: "audit", state: "queued", run_at_ms: 1_000)
 
+        transition_opts = [fencing_token: 0, run_at_ms: 2_000, now_ms: 1_100]
+
+        assert {:error, "ERR flow state is longer than 64 bytes"} =
+                 flow_transition_and_get(id, "queued", huge_state, transition_opts)
+
+        # Internal transitions are not capped and still reach the key bound.
         assert {:error, "ERR key too large" <> _} =
-                 flow_transition_and_get(id, "queued", huge_state,
-                   fencing_token: 0,
-                   run_at_ms: 2_000,
-                   now_ms: 1_100
+                 Ferricstore.Flow.transition(
+                   FerricStore.Instance.get(:default),
+                   id,
+                   "queued",
+                   huge_state,
+                   Ferricstore.Flow.Internal.put(transition_opts)
                  )
 
         assert {:ok, fetched} = FerricStore.flow_get(id)
