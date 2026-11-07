@@ -14,7 +14,10 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
 
   alias Ferricstore.Store.Router
 
-  @max_page_records Limits.max_projection_page_records()
+  # Each page is one LMDB commit of about 10 ms plus about 0.12 ms per
+  # record, so 256 records spend most of the commit on the records.
+  @max_page_records 256
+  @max_reverse_prefetch_records Limits.max_projection_page_records()
   @max_definitions 16
   @max_projection_definitions 32
   @max_exact_integer 9_007_199_254_740_991
@@ -94,12 +97,7 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
   defp projection_ops(path, records, definitions, projection_definitions, operation_budget) do
     state_keys = Enum.map(records, & &1.state_key)
 
-    with {:ok, initial_cache} <-
-           CompositeProjection.prefetch_reverse_values(
-             path,
-             state_keys,
-             CompositeProjection.new_cache()
-           ) do
+    with {:ok, initial_cache} <- prefetch_reverse_values(path, state_keys) do
       Enum.reduce_while(
         records,
         {:ok, [], initial_cache, 0},
@@ -133,6 +131,17 @@ defmodule Ferricstore.Flow.Query.CompositeBackfill do
         {:error, _reason} = error -> error
       end
     end
+  end
+
+  defp prefetch_reverse_values(path, state_keys) do
+    state_keys
+    |> Enum.chunk_every(@max_reverse_prefetch_records)
+    |> Enum.reduce_while({:ok, CompositeProjection.new_cache()}, fn chunk, {:ok, cache} ->
+      case CompositeProjection.prefetch_reverse_values(path, chunk, cache) do
+        {:ok, cache} -> {:cont, {:ok, cache}}
+        {:error, _reason} = error -> {:halt, error}
+      end
+    end)
   end
 
   defp validate_record(%{state_key: state_key, record: nil, expire_at_ms: 0} = projected)
