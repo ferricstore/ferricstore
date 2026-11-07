@@ -23,6 +23,10 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   # State reconciliation prefetches one composite reverse row per source.
   # Keep its entire page inside the projection admission bound.
   @state_page_size min(@batch_size, Limits.max_projection_page_records())
+  # State rows wait in a bounded window that is sorted by source location
+  # before it is cut into pages.
+  @state_window_rows 4_096
+  @state_window_bytes 8 * 1_024 * 1_024
   @max_reconcile_source_retries 2
   @default_history_projection_page_size 4_096
   @max_history_projection_page_size 65_536
@@ -1963,16 +1967,50 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     end
   end
 
-  defp reduce_state_entry_chunks(:"$end_of_table", acc, _reducer), do: {:ok, acc}
+  # A Flow owns several keydir rows, so a keydir page holds only a few state
+  # rows. Each reducer call is an LMDB commit that also reads every raft frame
+  # its rows came from, and one frame can hold hundreds of Flows. State rows
+  # are collected across keydir pages into a window, sorted by location, and
+  # handed over in full pages that share frames.
+  defp reduce_state_entry_chunks(page, acc, reducer),
+    do: reduce_state_entry_chunks(page, [], 0, 0, acc, reducer)
 
-  defp reduce_state_entry_chunks({entries, continuation}, acc, reducer) do
-    state_entries = Enum.filter(entries, &flow_state_entry?/1)
-    acc = if state_entries == [], do: acc, else: reducer.(state_entries, acc)
+  defp reduce_state_entry_chunks(:"$end_of_table", window, _count, _bytes, acc, reducer),
+    do: {:ok, reduce_state_window(window, acc, reducer)}
+
+  defp reduce_state_entry_chunks({entries, continuation}, window, count, bytes, acc, reducer) do
+    {window, count, bytes} =
+      Enum.reduce(entries, {window, count, bytes}, fn entry, {window, count, bytes} ->
+        if flow_state_entry?(entry),
+          do: {[entry | window], count + 1, bytes + state_entry_bytes(entry)},
+          else: {window, count, bytes}
+      end)
+
+    {window, count, bytes, acc} =
+      if count >= @state_window_rows or bytes >= @state_window_bytes,
+        do: {[], 0, 0, reduce_state_window(window, acc, reducer)},
+        else: {window, count, bytes, acc}
 
     with {:ok, page} <- safe_select_state_entry_page(continuation) do
-      reduce_state_entry_chunks(page, acc, reducer)
+      reduce_state_entry_chunks(page, window, count, bytes, acc, reducer)
     end
   end
+
+  defp reduce_state_window([], acc, _reducer), do: acc
+
+  defp reduce_state_window(window, acc, reducer) do
+    window
+    |> Enum.sort_by(&{elem(&1, 4), elem(&1, 5)})
+    |> Enum.chunk_every(@state_page_size)
+    |> Enum.reduce(acc, reducer)
+  end
+
+  defp state_entry_bytes({key, value, _expire_at_ms, _lfu, _fid, _off, _vsize})
+       when is_binary(value),
+       do: byte_size(key) + byte_size(value)
+
+  defp state_entry_bytes({key, _value, _expire_at_ms, _lfu, _fid, _off, _vsize}),
+    do: byte_size(key)
 
   defp safe_fix_keydir(keydir) do
     :ets.safe_fixtable(keydir, true)

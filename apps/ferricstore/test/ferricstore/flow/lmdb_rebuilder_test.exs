@@ -112,6 +112,63 @@ defmodule Ferricstore.Flow.LMDBRebuilderTest do
     assert length(page_sizes) > 1
   end
 
+  test "state entry rebuilds fill each page with state rows across other keydir rows" do
+    keydir = :ets.new(:lmdb_rebuilder_sparse_state_keydir, [:set])
+    page_records = Ferricstore.Flow.Query.Limits.max_projection_page_records()
+
+    # A Flow owns several keydir rows besides its state row.
+    rows =
+      for index <- 1..1_000, row <- 0..5 do
+        key =
+          if row == 0,
+            do: Keys.state_key("flow-#{index}"),
+            else: "flow-#{index}-companion-#{row}"
+
+        {key, "value", 0, 0, 0, index, 5}
+      end
+
+    true = :ets.insert(keydir, rows)
+
+    assert {:ok, {1_000, page_sizes}} =
+             LMDBRebuilder.__reduce_state_entries_for_test__(
+               keydir,
+               {0, []},
+               fn entries, {count, page_sizes} ->
+                 assert Enum.all?(entries, fn {key, _, _, _, _, _, _} -> Keys.state_key?(key) end)
+                 {count + length(entries), [length(entries) | page_sizes]}
+               end
+             )
+
+    {full_pages, [last_page]} = page_sizes |> Enum.reverse() |> Enum.split(-1)
+    assert Enum.all?(full_pages, &(&1 == page_records))
+    assert last_page in 1..page_records
+  end
+
+  test "state entry rebuilds hand over pages ordered by source location" do
+    keydir = :ets.new(:lmdb_rebuilder_located_state_keydir, [:set])
+
+    # Many Flows share one raft frame; a page checks every frame it reads from.
+    rows =
+      for index <- 1..2_000 do
+        frame = rem(index * 7, 40) + 1
+
+        {Keys.state_key("flow-#{index}"), "value", 0, 0, {:waraft_apply_projection, frame}, index,
+         5}
+      end
+
+    true = :ets.insert(keydir, rows)
+
+    assert {:ok, pages} = LMDBRebuilder.__select_state_entries_for_test__(keydir)
+
+    locations = pages |> Enum.concat() |> Enum.map(&{elem(&1, 4), elem(&1, 5)})
+    assert length(locations) == 2_000
+    assert locations == Enum.sort(locations)
+
+    assert pages
+           |> Enum.map(&(&1 |> Enum.map(fn row -> elem(row, 4) end) |> Enum.uniq()))
+           |> Enum.all?(&(length(&1) <= 3))
+  end
+
   test "state entry scans do not misclassify reducer failures as a missing keydir" do
     keydir = :ets.new(:lmdb_rebuilder_reducer_failure_keydir, [:set])
     state_key = Keys.state_key("flow-reducer-failure")

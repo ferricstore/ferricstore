@@ -4,6 +4,26 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Reconciling a shard's LMDB projection from its keydir is about twice as
+  fast. Each commit took the state rows of one 64-row keydir page, about 11
+  Flows, since a Flow owns several keydir rows; and each commit read every
+  raft frame its Flows came from, so in hash order one 500-Flow
+  FLOW.CREATE_MANY frame was read again for almost every Flow in it. State
+  rows are now collected into a window of up to 4,096 rows (8 MiB), sorted
+  by source location and committed 64 at a time. With 100k Flows on one
+  shard, the reconcile after a burst took 104 s instead of 238 s.
+
+- After a burst of Flow writes that filled the LMDB writer's queue, the
+  writer replays the shard's keydir once instead of once per batch of
+  notifications. Every refused batch marks the shard dirty and notifies the
+  writer, and those notifications queue up behind the replay. Each one then
+  set the dirty flag again, even though the replay had already covered it
+  and cleared its marker, so the writer replayed the whole shard again.
+  With 30k Flows created on one shard and the queue capped at 20k ops, the
+  writer replayed the shard three times and drained after 189 s; it now
+  replays once and drains after 62 s. A notification whose marker is gone
+  is now ignored.
+
 - Query index backfill projects 256 records per LMDB commit instead of 64.
   A commit costs about 10 ms plus about 0.12 ms per record, so 64-record
   pages spent most of their write time on the commit itself. Over 100k
