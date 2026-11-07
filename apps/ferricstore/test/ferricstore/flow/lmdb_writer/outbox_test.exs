@@ -251,6 +251,35 @@ defmodule Ferricstore.Flow.LMDBWriter.OutboxTest do
     assert is_reference(state.timer_ref)
   end
 
+  test "ignores a dirty notification whose marker a reconcile already cleared" do
+    unique = System.unique_integer([:positive])
+    instance_name = :"lmdb_dirty_stale_#{unique}"
+    data_dir = Path.join(System.tmp_dir!(), "ferricstore_lmdb_dirty_stale_#{unique}")
+    Ferricstore.DataDir.ensure_layout!(data_dir, 1)
+
+    on_exit(fn -> File.rm_rf!(data_dir) end)
+
+    pid =
+      start_supervised!(
+        {LMDBWriter, shard_index: 0, data_dir: data_dir, instance_ctx: %{name: instance_name}}
+      )
+
+    refute :sys.get_state(pid).projection_dirty?
+
+    # A busy writer handles the notification after a reconcile, already
+    # running, read and cleared the marker it was sent for.
+    :sys.suspend(pid)
+    assert :ok = LMDBWriter.mark_projection_dirty(instance_name, 0)
+    table = Registry.projection_outbox_name(instance_name, 0)
+    assert [{:dirty, generation, token}] = :ets.lookup(table, :dirty)
+    :ets.delete_object(table, {:dirty, generation, token})
+    :sys.resume(pid)
+
+    state = :sys.get_state(pid)
+    refute state.projection_dirty?
+    assert state.timer_ref == nil
+  end
+
   test "treats a previous writer generation as possible volatile projection loss" do
     unique = System.unique_integer([:positive])
     instance_name = :"lmdb_writer_restart_#{unique}"

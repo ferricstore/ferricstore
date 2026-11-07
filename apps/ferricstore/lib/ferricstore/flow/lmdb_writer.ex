@@ -562,6 +562,13 @@ defmodule Ferricstore.Flow.LMDBWriter do
         Outbox.clear_projection_dirty_generation(state, generation)
         {:noreply, state}
 
+      # The marker is put before the notification is sent, so a missing marker
+      # was cleared by a reconcile that read it, after the writes it covers.
+      # A burst queues one notification per refused enqueue behind that
+      # reconcile, and each would otherwise start another full replay.
+      Outbox.projection_dirty_marker(state) == :none ->
+        {:noreply, state}
+
       writer_suspended?(state) ->
         {:noreply, %{state | projection_dirty?: true}}
 

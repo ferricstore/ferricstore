@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- After a burst of Flow writes that filled the LMDB writer's queue, the
+  writer replays the shard's keydir once instead of once per batch of
+  notifications. Every refused batch marks the shard dirty and notifies the
+  writer, and those notifications queue up behind the replay. Each one then
+  set the dirty flag again, even though the replay had already covered it
+  and cleared its marker, so the writer replayed the whole shard again.
+  With 30k Flows created on one shard and the queue capped at 20k ops, the
+  writer replayed the shard three times and drained after 189 s; it now
+  replays once and drains after 62 s. A notification whose marker is gone
+  is now ignored.
+
 - A burst of Flow writes no longer leaves Flows out of the LMDB projection
   until the node restarts. When the LMDB writer's queue was full, the Raft
   apply path marked the shard's mirror degraded and dropped the projection,
