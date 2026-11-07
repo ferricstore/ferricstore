@@ -967,6 +967,61 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
     end
   end
 
+  # Apply builds a raw cleanup, such as a hibernation demotion, from the active
+  # reverse row it reads in LMDB before the writer flushes the work queued
+  # ahead of it, and a dirty-projection reconcile can rewrite the row in
+  # between. When the row has moved on, compare against it as this batch finds
+  # it and delete the active rows it lists; the raw ops that follow then still
+  # replace every row the Flow has.
+  defp expand_raw_active_reverse_compare(path, {:compare, reverse_key, expected} = op, acc) do
+    current =
+      case Map.fetch(acc.active_reverse_values, reverse_key) do
+        {:ok, nil} -> :not_found
+        {:ok, value} -> {:ok, value}
+        :error -> Ferricstore.Flow.LMDB.get(path, reverse_key)
+      end
+
+    case current do
+      {:ok, ^expected} ->
+        {:ok, prepend_ops(acc, [op])}
+
+      {:ok, value} when is_binary(value) ->
+        rebase_raw_active_reverse_compare(path, op, [expected, value], acc)
+
+      :not_found ->
+        rebase_raw_active_reverse_compare(path, op, [expected], acc)
+
+      {:error, _reason} = error ->
+        error
+
+      invalid ->
+        {:error, {:invalid_active_index_reverse_read, invalid}}
+    end
+  end
+
+  defp rebase_raw_active_reverse_compare(
+         path,
+         {:compare, reverse_key, _expected} = op,
+         values,
+         acc
+       ) do
+    case Enum.find_value(values, &active_reverse_value_owner(reverse_key, &1)) do
+      {:ok, state_key} -> maybe_expand_stale_active_delete(path, state_key, acc)
+      nil -> {:ok, prepend_ops(acc, [op])}
+    end
+  end
+
+  defp active_reverse_value_owner(reverse_key, reverse_value) do
+    with {:ok, {_active_keys, {lane_key, lane_member, _lane_score}}} <-
+           Ferricstore.Flow.LMDB.decode_active_index_reverse_metadata(reverse_value),
+         {:ok, state_key} <-
+           Ferricstore.Flow.LMDB.active_reverse_owner(reverse_key, lane_key, lane_member) do
+      {:ok, state_key}
+    else
+      _unknown_owner -> nil
+    end
+  end
+
   defp put_active_reverse_value(acc, state_key, reverse_value) do
     reverse_key = Ferricstore.Flow.LMDB.active_by_state_key_key(state_key)
     put_in(acc, [:active_reverse_values, reverse_key], reverse_value)
@@ -1865,6 +1920,13 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOps do
 
       {:ok, acc}
     end
+  end
+
+  def expand_path_op(path, {:compare, key, expected} = op, acc)
+      when is_binary(key) and is_binary(expected) do
+    if String.starts_with?(key, Ferricstore.Flow.LMDB.active_by_state_global_prefix()),
+      do: expand_raw_active_reverse_compare(path, op, acc),
+      else: {:ok, prepend_ops(acc, [op])}
   end
 
   def expand_path_op(_path, {:delete, key} = op, acc) when is_binary(key),

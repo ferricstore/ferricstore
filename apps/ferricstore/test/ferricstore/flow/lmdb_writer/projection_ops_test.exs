@@ -1,7 +1,7 @@
 defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Flow.{Keys, Locator}
+  alias Ferricstore.Flow.{Hibernation, Keys, Locator}
   alias Ferricstore.Flow.LMDBWriter.ProjectionOps
   alias Ferricstore.Flow.LMDB
   alias Ferricstore.Flow.Query.{QueryRowCodec, SourceCatalog}
@@ -218,6 +218,69 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
     assert {:ok, acc} = ProjectionOps.maybe_expand_stale_active_delete(path, state_key, acc)
     assert :ok = LMDB.write_batch(path, Enum.reverse(acc.ops))
     assert :not_found = LMDB.get(path, reverse_key)
+  end
+
+  test "raw demotion cleanup replaces an active reverse row rewritten after apply read it" do
+    # Apply builds a demotion from the reverse row it reads in LMDB, but the
+    # writer can write other changes to that row first: a dirty-projection
+    # reconcile puts the hot form back while the Flow's keydir row waits for
+    # eviction. The raw cleanup must still replace the rows the reverse lists.
+    path = tmp_lmdb_path("raw_demotion_after_reconcile")
+    candidate = demotion_candidate()
+    state_key = candidate.record.state_key
+    reverse_key = LMDB.active_by_state_key_key(state_key)
+
+    {:put, ^reverse_key, parked_reverse} =
+      state_key
+      |> LMDB.active_timeout_index_put_ops(candidate.record, 0)
+      |> Enum.find(&match?({:put, ^reverse_key, _value}, &1))
+
+    {hot_ops, hot_reverse} =
+      LMDB.active_index_put_ops_with_reverse(state_key, candidate.record, 0)
+
+    assert {:ok, [_ | _] = hot_keys} = LMDB.decode_active_index_reverse_value(hot_reverse)
+    assert :ok = LMDB.write_batch(path, hot_ops)
+
+    # Apply read the parked form a previous demotion left before the reconcile.
+    acc = expand_demotion(path, candidate, parked_reverse, writer_acc())
+    # A second demotion queued before the first flushed read the hot form.
+    acc = expand_demotion(path, candidate, hot_reverse, acc)
+
+    assert :ok = LMDB.write_batch(path, Enum.reverse(acc.ops))
+    assert {:ok, ^parked_reverse} = LMDB.get(path, reverse_key)
+    for key <- hot_keys, do: assert(:not_found = LMDB.get(path, key))
+  end
+
+  test "raw demotion cleanup cannot delete another state's active row" do
+    path = tmp_lmdb_path("raw_demotion_foreign_active_row")
+    candidate = demotion_candidate()
+    state_key = candidate.record.state_key
+    reverse_key = LMDB.active_by_state_key_key(state_key)
+
+    {hot_ops, hot_reverse} =
+      LMDB.active_index_put_ops_with_reverse(state_key, candidate.record, 0)
+
+    {:ok, [active_key | _]} = LMDB.decode_active_index_reverse_value(hot_reverse)
+
+    foreign_value =
+      LMDB.encode_active_index_value("active-index", "flow-b", 10, 0, "state-b")
+
+    assert :ok = LMDB.write_batch(path, hot_ops ++ [{:put, active_key, foreign_value}])
+
+    {:put, ^reverse_key, parked_reverse} =
+      state_key
+      |> LMDB.active_timeout_index_put_ops(candidate.record, 0)
+      |> Enum.find(&match?({:put, ^reverse_key, _value}, &1))
+
+    {:ok, demotion_ops} =
+      candidate
+      |> Map.put(:active_index_reverse_value, parked_reverse)
+      |> Hibernation.demotion_ops_result()
+
+    compare = Enum.find(demotion_ops, &match?({:compare, ^reverse_key, _value}, &1))
+
+    assert {:error, {:active_index_reverse_state_mismatch, ^active_key}} =
+             ProjectionOps.expand_path_op(path, compare, writer_acc())
   end
 
   test "stale persisted active reverses cannot delete another state's active row" do
@@ -1525,6 +1588,64 @@ defmodule Ferricstore.Flow.LMDBWriter.ProjectionOpsTest do
              ])
 
     assert {:delete, state_key} in ops
+  end
+
+  defp writer_acc do
+    %{
+      ops: [],
+      counts: %{},
+      terminal_values: %{},
+      active_reverse_values: %{},
+      terminal_count_inits: MapSet.new()
+    }
+  end
+
+  defp expand_demotion(path, candidate, read_reverse, acc) do
+    {:ok, ops} =
+      candidate
+      |> Map.put(:active_index_reverse_value, read_reverse)
+      |> Hibernation.demotion_ops_result()
+
+    Enum.reduce(ops, acc, fn op, acc ->
+      {:ok, acc} = ProjectionOps.expand_path_op(path, op, acc)
+      acc
+    end)
+  end
+
+  defp demotion_candidate do
+    locator =
+      Locator.new!(
+        flow_id: "flow-1",
+        kind: :state,
+        version: 1,
+        raft_index: 10,
+        file_id: 0,
+        offset: 128,
+        value_size: 256,
+        checksum: :binary.copy(<<1>>, 32)
+      )
+
+    %{
+      locator: locator,
+      record: %{
+        id: "flow-1",
+        state_key: Keys.state_key("flow-1", "tenant-1"),
+        type: "email",
+        state: "waiting",
+        run_state: "waiting",
+        state_enter_seq: 1,
+        version: 1,
+        updated_at_ms: 1_000,
+        next_run_at_ms: 900_000,
+        priority: 0,
+        partition_key: "tenant-1",
+        lease_owner: nil,
+        lease_token: nil,
+        lease_deadline_ms: 0,
+        fencing_token: 1,
+        value_refs: %{"payload" => "ref-1"}
+      }
+    }
   end
 
   defp tmp_lmdb_path(prefix) do
