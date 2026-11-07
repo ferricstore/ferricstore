@@ -235,12 +235,32 @@ defmodule Ferricstore.ProbRepair do
   @spec staged_info(non_neg_integer(), binary(), non_neg_integer()) ::
           {:ready, map()} | :none | :gone | :pending
   def staged_info(shard_index, id, index) do
-    dir = staging_dir(local_data_dir(), shard_index)
+    staged_answer(staging_dir(local_data_dir(), shard_index), id, fn ->
+      applied_past?(shard_index, index)
+    end)
+  end
 
+  @doc false
+  def __staged_answer_for_test__(dir, id, applied_fun), do: staged_answer(dir, id, applied_fun)
+
+  # The storage answers whether this replica applied the repair entry only once
+  # the apply in progress returns, and that apply writes the replica's marker.
+  # So the markers are read again after it: one read before could miss a copy
+  # still being written and answer :gone for a replica that has it.
+  defp staged_answer(dir, id, applied_fun) do
+    if valid_id?(id) do
+      with :missing <- staged_marker(dir, id),
+           applied? = applied_fun.(),
+           :missing <- staged_marker(dir, id) do
+        if applied?, do: :gone, else: :pending
+      end
+    else
+      :none
+    end
+  end
+
+  defp staged_marker(dir, id) do
     cond do
-      not valid_id?(id) ->
-        :none
-
       FS.exists?(Path.join(dir, id <> ".ready")) ->
         case read_marker(Path.join(dir, id <> ".ready")) do
           {:ok, %{} = info} -> {:ready, info}
@@ -250,11 +270,8 @@ defmodule Ferricstore.ProbRepair do
       FS.exists?(Path.join(dir, id <> ".none")) ->
         :none
 
-      applied_past?(shard_index, index) ->
-        :gone
-
       true ->
-        :pending
+        :missing
     end
   end
 

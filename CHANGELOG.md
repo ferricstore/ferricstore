@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A node that lost a large Bloom, Cuckoo, Count-Min or Top-K file gets it
+  back. A replica asked for its copy while it was still copying the file
+  aside answered that it had applied the repair without one, because its
+  check for the copy ran before it waited for that apply to finish. When
+  every replica was still copying, which a file of a few megabytes made
+  likely, the node concluded no copy existed and the key stayed damaged on
+  it. The replica now looks for its copy again after the apply finishes.
+
 ## 0.12.18 - 2026-11-07
 
 - The HTTP server takes Cowboy and Cowlib fixes for three security

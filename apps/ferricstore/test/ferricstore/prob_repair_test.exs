@@ -51,6 +51,40 @@ defmodule Ferricstore.ProbRepairTest do
     assert :none == ProbRepair.staged_info(3, other, 1)
   end
 
+  # Asking whether a replica applied the repair entry waits for the apply in
+  # progress, and that apply is what writes the replica's marker. A replica
+  # still copying a large file aside when asked must answer with its copy, not
+  # :gone; when every replica answered :gone, the node that lost the file
+  # concluded no copy existed.
+  test "a replica that finishes staging while asked serves its copy", %{root: root} do
+    path = Path.join(root, "data/shard_3/prob/key.bloom")
+    File.write!(path, "bloom bits")
+    dir = ProbRepair.staging_dir(root, 3)
+    staged = String.duplicate("ab", 12)
+
+    assert {:ready, %{data: %{size: 10}}} =
+             ProbRepair.__staged_answer_for_test__(dir, staged, fn ->
+               :ok = ProbRepair.stage(root, 3, staged, path)
+               true
+             end)
+
+    none = String.duplicate("cd", 12)
+
+    assert :none ==
+             ProbRepair.__staged_answer_for_test__(dir, none, fn ->
+               :ok = ProbRepair.stage_none(root, 3, none)
+               true
+             end)
+
+    assert :gone ==
+             ProbRepair.__staged_answer_for_test__(dir, String.duplicate("ef", 12), fn -> true end)
+
+    assert :pending ==
+             ProbRepair.__staged_answer_for_test__(dir, String.duplicate("01", 12), fn ->
+               false
+             end)
+  end
+
   test "copies older than the staging TTL are swept", %{root: root} do
     dir = ProbRepair.staging_dir(root, 0)
     File.mkdir_p!(dir)
