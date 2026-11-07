@@ -4,6 +4,30 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Flow names a create, claim or transition writes are limited: a type up to
+  128 bytes, a state up to 64 (as state metadata already required), a
+  worker up to 256, a correlation id up to 256 and a child group id up to
+  128. A longer one is rejected with `ERR flow <field> is longer than <n>
+  bytes`. They are kept in the record, index keys and history. Commands
+  that only read or match a name, such as a claim's type and state filter,
+  still take longer ones, so Flows stored with them keep working.
+
+- New Flows take partition keys of up to 256 bytes, rejecting a longer one
+  with `ERR flow partition_key is longer than 256 bytes`. A partition key is
+  stored in the record and in every index entry that leads with it. Spawned
+  children may still inherit a parent's longer partition key, and Flows
+  stored under one keep working.
+
+- New Flows take ids of up to 256 bytes. `FLOW.CREATE`, `FLOW.CREATE_MANY`,
+  `FLOW.START_AND_CLAIM` and spawned children reject a longer id with `ERR
+  flow id is longer than 256 bytes`, before anything is written; before, an
+  id could be as long as a key (about 64 KB). An id is part of every key and
+  index row a Flow owns: with 5,000 Flows on one shard, 1 KB ids took 12 KB of
+  BEAM memory and 57 KB of LMDB per Flow against 4.8 KB and 27 KB at 256
+  bytes, 17 KB ids paused creates under the default memory budget after about
+  1,800 Flows, and 64 KB ids timed out claims. Flows stored with longer ids
+  keep working, and every other command still takes their ids.
+
 - Reconciling a shard's LMDB projection from its keydir is about twice as
   fast. Each commit took the state rows of one 64-row keydir page, about 11
   Flows, since a Flow owns several keydir rows; and each commit read every

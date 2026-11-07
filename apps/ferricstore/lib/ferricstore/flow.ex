@@ -164,8 +164,12 @@ defmodule Ferricstore.Flow do
 
   defp run_steps_many_worker(opts) do
     case Keyword.fetch(opts, :worker) do
-      {:ok, worker} when is_binary(worker) and worker != "" -> {:ok, worker}
-      _ -> {:error, "ERR flow worker must be a non-empty string"}
+      {:ok, worker} when is_binary(worker) and worker != "" ->
+        with :ok <- Ferricstore.Flow.MutationAttrs.validate_new_worker(worker, opts),
+             do: {:ok, worker}
+
+      _ ->
+        {:error, "ERR flow worker must be a non-empty string"}
     end
   end
 
