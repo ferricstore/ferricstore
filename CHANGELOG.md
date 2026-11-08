@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.19 - 2026-11-08
+
 - History a Flow history projector held when it was killed outright is no
   longer lost for good. A killed projector runs no shutdown code, so the
   history it had not written yet went with it, and only Raft can write it
