@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.HistoryProjectorKillTest do
   @moduletag :global_state
   @moduletag timeout: 180_000
 
+  alias Ferricstore.FaultInjection
   alias Ferricstore.Flow.{HistoryProjector, Keys}
   alias Ferricstore.Store.Router
   alias Ferricstore.Test.ShardHelpers
@@ -27,11 +28,14 @@ defmodule Ferricstore.Flow.HistoryProjectorKillTest do
     later = "later-#{System.unique_integer([:positive])}"
     later_partition = partition_on_shard(ctx, later, shard)
     restart_projector_flushing_every(shard, 600_000)
+    hold_history_writes(ctx, shard)
 
     create!(lost, "lost")
+    assert {:error, :flush_failed} = HistoryProjector.flush(ctx, shard, 30_000)
     assert {:ok, pending} = HistoryProjector.pending_count(ctx, shard)
     assert pending > 0
     kill_projector!(ctx, shard)
+    FaultInjection.clear_hook()
 
     # Newer history on the shard is written past the lost one.
     create!(later, later_partition)
@@ -94,6 +98,19 @@ defmodule Ferricstore.Flow.HistoryProjectorKillTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
     ctx
+  end
+
+  # WARaft asks the projector to write whenever it moves its release cursor,
+  # whatever the flush interval, so the projector's writes fail instead, to
+  # keep the history in its memory.
+  defp hold_history_writes(ctx, shard) do
+    projector = Process.whereis(HistoryProjector.name(ctx, shard))
+    on_exit(&FaultInjection.clear_hook/0)
+
+    FaultInjection.put_hook(fn
+      :before_flow_history_write, _metadata when self() == projector -> {:error, :held_by_test}
+      _point, _metadata -> :ok
+    end)
   end
 
   defp restart_projector_flushing_every(shard, interval_ms) do

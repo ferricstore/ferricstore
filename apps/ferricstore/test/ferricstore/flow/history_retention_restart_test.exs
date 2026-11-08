@@ -9,6 +9,7 @@ defmodule Ferricstore.Flow.HistoryRetentionRestartTest do
   @moduletag :global_state
   @moduletag timeout: 180_000
 
+  alias Ferricstore.FaultInjection
   alias Ferricstore.Flow.HistoryProjector
   alias Ferricstore.Test.ShardHelpers
 
@@ -95,6 +96,7 @@ defmodule Ferricstore.Flow.HistoryRetentionRestartTest do
       Ferricstore.Store.Router.shard_for(ctx, Ferricstore.Flow.Keys.state_key(id, @partition))
 
     restart_projector_flushing_every(shard, 600_000)
+    hold_history_tombstones(ctx, shard)
 
     assert {:ok, %{flows: 1}} =
              FerricStore.flow_retention_cleanup(
@@ -105,10 +107,12 @@ defmodule Ferricstore.Flow.HistoryRetentionRestartTest do
     # The tombstones wait in its memory and die with the node. A projector
     # restarted on its own would scan the log and move the recovery
     # checkpoint past the removed entries, which a crash does not.
+    assert {:error, :flush_failed} = HistoryProjector.flush(ctx, shard, 30_000)
     assert {:ok, pending} = HistoryProjector.pending_count(ctx, shard)
     assert pending > 0
     :ok = Supervisor.terminate_child(Ferricstore.Store.ShardSupervisor, projector_child(shard))
     :ok = HistoryProjector.Pending.discard(HistoryProjector.name(ctx, shard))
+    FaultInjection.clear_hook()
     :ok = restart_as_new_process(isolated, ctx.shard_count)
     flush!()
     :ok = restart_as_new_process(isolated, ctx.shard_count)
@@ -174,6 +178,24 @@ defmodule Ferricstore.Flow.HistoryRetentionRestartTest do
                include_cold: true,
                consistent_projection: true
              )
+  end
+
+  # WARaft asks the projector to write whenever it moves its release cursor,
+  # whatever the flush interval, so its tombstone writes fail instead, to keep
+  # the tombstones in its memory.
+  defp hold_history_tombstones(ctx, shard) do
+    projector = Process.whereis(HistoryProjector.name(ctx, shard))
+    on_exit(&FaultInjection.clear_hook/0)
+
+    FaultInjection.put_hook(fn
+      :before_flow_history_write, %{entries: entries} when self() == projector ->
+        if Enum.any?(entries, &match?(%{tombstone: true}, &1)),
+          do: {:error, :held_by_test},
+          else: :ok
+
+      _point, _metadata ->
+        :ok
+    end)
   end
 
   defp restart_projector_flushing_every(shard, interval_ms) do

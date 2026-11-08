@@ -1032,6 +1032,32 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp flush_outstanding_request(state), do: state
 
+  # Crash tests fail the write here, before anything reaches the log, to keep
+  # history in the projector's memory: WARaft asks it to write at any time.
+  defp do_project(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         entries,
+         requested_index,
+         keydir_override
+       ) do
+    with :ok <-
+           Ferricstore.FaultInjection.maybe_pause(:before_flow_history_write, %{
+             shard_index: shard_index,
+             entries: entries
+           }) do
+      project_runs(
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        entries,
+        requested_index,
+        keydir_override
+      )
+    end
+  end
+
   # Tombstone entries (`%{key: key, tombstone: true}`) delete a history entry
   # from the log, so recovery, which reads the log again, leaves it deleted.
   # Runs of them and of new entries are written in the order they came.
@@ -1043,7 +1069,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
   # successor could not reach that index until newer history came, and every
   # flush failed meanwhile. An earlier run's sync does not count: the runs
   # after it can hold more of the same index.
-  defp do_project(
+  defp project_runs(
          instance_ctx,
          shard_index,
          shard_data_path,
