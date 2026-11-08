@@ -64,6 +64,89 @@ defmodule Ferricstore.Flow.HistoryRetentionRestartTest do
              )
   end
 
+  # The node dies before the history projector writes the tombstones. Raft
+  # replays the cleanup on the next start; that start removes the history
+  # again either way, so only the start after it shows whether the replay
+  # wrote the tombstones.
+  test "history retention removed stays removed when the node dies before its tombstones",
+       %{isolated: isolated} do
+    id = "retained-crash-#{System.unique_integer([:positive])}"
+    create!(id, 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("retained",
+               partition_key: @partition,
+               worker: "w",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: @partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_100
+             )
+
+    ctx = flush!()
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+
+    shard =
+      Ferricstore.Store.Router.shard_for(ctx, Ferricstore.Flow.Keys.state_key(id, @partition))
+
+    restart_projector_flushing_every(shard, 600_000)
+
+    assert {:ok, %{flows: 1}} =
+             FerricStore.flow_retention_cleanup(
+               limit: 10,
+               now_ms: completed.terminal_retention_until_ms + 1
+             )
+
+    # The tombstones wait in its memory and die with the node. A projector
+    # restarted on its own would scan the log and move the recovery
+    # checkpoint past the removed entries, which a crash does not.
+    assert {:ok, pending} = HistoryProjector.pending_count(ctx, shard)
+    assert pending > 0
+    :ok = Supervisor.terminate_child(Ferricstore.Store.ShardSupervisor, projector_child(shard))
+    :ok = HistoryProjector.Pending.discard(HistoryProjector.name(ctx, shard))
+    :ok = restart_as_new_process(isolated, ctx.shard_count)
+    flush!()
+    :ok = restart_as_new_process(isolated, ctx.shard_count)
+
+    create!(id, 5_000)
+    flush!()
+
+    assert {:ok, [{_event_id, %{"event" => "created"}}]} =
+             FerricStore.flow_history(id,
+               partition_key: @partition,
+               count: 10,
+               include_cold: true,
+               consistent_projection: true
+             )
+  end
+
+  defp restart_projector_flushing_every(shard, interval_ms) do
+    key = :flow_history_projector_flush_interval_ms
+    previous = Application.fetch_env(:ferricstore, key)
+    Application.put_env(:ferricstore, key, interval_ms)
+
+    on_exit(fn ->
+      case previous do
+        {:ok, value} -> Application.put_env(:ferricstore, key, value)
+        :error -> Application.delete_env(:ferricstore, key)
+      end
+    end)
+
+    :ok = Supervisor.terminate_child(Ferricstore.Store.ShardSupervisor, projector_child(shard))
+
+    {:ok, _pid} =
+      Supervisor.restart_child(Ferricstore.Store.ShardSupervisor, projector_child(shard))
+
+    :ok
+  end
+
+  defp projector_child(shard), do: :"flow_history_projector_#{shard}"
+
   defp create!(id, now_ms) do
     assert :ok =
              FerricStore.flow_create(id,
