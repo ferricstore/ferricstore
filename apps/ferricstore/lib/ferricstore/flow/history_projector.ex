@@ -412,10 +412,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
     instance_ctx = Keyword.get(opts, :instance_ctx)
     projector_name = name(instance_ctx, shard_index)
-    # Taken first: until we register our own counter, enqueuers find none of
-    # theirs and use the overflow queue, so the counter a killed predecessor
-    # left counts only what went with it.
-    predecessor = Pending.take_registration(projector_name)
+    # Enqueuers reserve only on the counter of the projector they cast to, and
+    # until we register ours they use the overflow queue; so the counter a
+    # killed predecessor left counts only what went with it.
+    predecessor = Pending.predecessor_held(projector_name)
 
     recover_on_init? =
       Keyword.get(opts, :recover_on_init, true) or

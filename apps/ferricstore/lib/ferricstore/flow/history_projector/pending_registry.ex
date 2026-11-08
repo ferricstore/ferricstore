@@ -69,11 +69,16 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
   # What a projector of this name left registered: one that stopped took its
   # registration with it, one killed outright did not, and its counter holds
-  # the history it had not written.
-  def take_registration(projector) when is_atom(projector) do
-    case :ets.take(ensure_pending_registry(@pending_registry), projector) do
-      [{^projector, counter, _max_pending, _owner}] -> {:ok, max(:atomics.get(counter, 1), 0)}
-      _none -> :none
+  # the history it had not written. It stays until the next projector
+  # registers its own, so a successor that dies starting up leaves it to the
+  # one after.
+  def predecessor_held(projector) when is_atom(projector) do
+    case lookup(projector) do
+      {:ok, counter, _max_pending, owner} when owner != self() ->
+        {:ok, max(:atomics.get(counter, 1), 0)}
+
+      _none ->
+        :none
     end
   rescue
     _ -> :none

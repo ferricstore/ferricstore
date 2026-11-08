@@ -72,7 +72,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   defdelegate replay_recovery_required?(projector), to: PendingRegistry
   defdelegate mark_replay_range_logged(projector, shard_data_path, index), to: PendingRegistry
   defdelegate replay_reservation_max_index(projector), to: PendingRegistry
-  defdelegate take_registration(projector), to: PendingRegistry
+  defdelegate predecessor_held(projector), to: PendingRegistry
   defdelegate mark_history_lost(projector, shard_data_path, floor), to: PendingRegistry
   defdelegate lost_history_publish_limit(projector, shard_data_path), to: PendingRegistry
   defdelegate replay_logged_index(projector, shard_data_path), to: PendingRegistry
