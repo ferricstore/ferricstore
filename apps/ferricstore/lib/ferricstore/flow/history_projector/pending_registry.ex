@@ -114,6 +114,39 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     _ -> 0
   end
 
+  # How far the history log holds a projector's history: everything up to
+  # the index is appended and synced, though maybe not published yet. Only a
+  # successor that recovered, which publishes what the log holds, may count
+  # it as flushed. It names the shard data directory, so a projector of the
+  # same name started for another directory does not take it.
+  def mark_replay_range_logged(projector, shard_data_path, index)
+      when is_atom(projector) and is_binary(shard_data_path) and is_integer(index) and
+             index >= 0 do
+    table = ensure_replay_reservation_registry()
+    key = {:logged, projector}
+
+    case :ets.lookup(table, key) do
+      [{^key, ^shard_data_path, logged}] when is_integer(logged) and logged >= index -> :ok
+      _older_other_directory_or_none -> :ets.insert(table, {key, shard_data_path, index})
+    end
+
+    :ok
+  rescue
+    error -> {:error, {:replay_log_mark_failed, error}}
+  end
+
+  def replay_logged_index(projector, shard_data_path)
+      when is_atom(projector) and is_binary(shard_data_path) do
+    table = ensure_replay_reservation_registry()
+
+    case :ets.lookup(table, {:logged, projector}) do
+      [{_key, ^shard_data_path, index}] when is_integer(index) and index >= 0 -> index
+      _none_or_other_directory -> 0
+    end
+  rescue
+    _ -> 0
+  end
+
   def replay_recovery_required?(projector) when is_atom(projector) do
     table = ensure_replay_reservation_registry()
 
@@ -222,6 +255,48 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     end
   end
 
+  # Whether history waits in the overflow queue: an entry that is not the
+  # tombstone of one already removed, in a row the drain will take. Rows a
+  # writer died before committing are dropped by the drain, so they do not
+  # count.
+  def overflow_history_pending?(projector) when is_atom(projector) do
+    case :ets.whereis(@overflow_registry) do
+      :undefined -> {:ok, false}
+      table -> {:ok, overflow_history_pending?(table, projector, {projector, 0})}
+    end
+  rescue
+    error -> {:error, {:overflow_read_failed, error}}
+  end
+
+  defp overflow_history_pending?(table, projector, key) do
+    case :ets.next(table, key) do
+      {^projector, _sequence} = next_key ->
+        case :ets.lookup(table, next_key) do
+          [{_key, {:pending, entries, writer}}] ->
+            (not abandoned_writer?(writer) and history_entries?(entries)) or
+              overflow_history_pending?(table, projector, next_key)
+
+          [{_key, {:ready, entries}}] ->
+            history_entries?(entries) or overflow_history_pending?(table, projector, next_key)
+
+          # Drained meanwhile.
+          [] ->
+            overflow_history_pending?(table, projector, next_key)
+
+          _invalid ->
+            true
+        end
+
+      _end_or_other_projector ->
+        false
+    end
+  end
+
+  defp history_entries?(entries) when is_list(entries),
+    do: Enum.any?(entries, &(not match?(%{tombstone: true}, &1)))
+
+  defp history_entries?(_invalid), do: true
+
   # Rows are staged and committed by the applying process on this node.
   defp abandoned_writer?(writer) when is_pid(writer), do: not Process.alive?(writer)
   defp abandoned_writer?(_writer), do: false
@@ -302,6 +377,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     ])
 
     :ets.delete(replay_table, projector)
+    :ets.delete(replay_table, {:logged, projector})
     :ok
   rescue
     error -> {:error, {:pending_discard_failed, error}}

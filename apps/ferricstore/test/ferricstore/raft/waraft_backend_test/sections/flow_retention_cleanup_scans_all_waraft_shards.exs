@@ -39,6 +39,19 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.FlowRetentionCleanupScansA
               {:ok, _pid} -> :ok
               {:error, {:already_started, _pid}} -> :ok
             end
+
+            # Retention waits for history still to be written, and without a
+            # projector it waits in the overflow queue for good.
+            start_supervised!(
+              Supervisor.child_spec(
+                {Ferricstore.Flow.HistoryProjector,
+                 shard_index: shard_index,
+                 shard_data_path: Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard_index),
+                 instance_ctx: ctx,
+                 recover_on_init: false},
+                id: {Ferricstore.Flow.HistoryProjector, ctx.name, shard_index}
+              )
+            )
           end
 
           for {id, partition, worker} <- [
