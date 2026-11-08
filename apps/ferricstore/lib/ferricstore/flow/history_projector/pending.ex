@@ -68,6 +68,8 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   defdelegate trim_replay_reservation(projector, index), to: PendingRegistry
   defdelegate replay_reservation_flushed_index(projector), to: PendingRegistry
   defdelegate replay_recovery_required?(projector), to: PendingRegistry
+  defdelegate mark_replay_range_logged(projector, shard_data_path, index), to: PendingRegistry
+  defdelegate replay_logged_index(projector, shard_data_path), to: PendingRegistry
 
   def append_overflow(projector, entries),
     do: PendingRegistry.append_overflow(projector, entries)

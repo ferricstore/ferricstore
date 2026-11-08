@@ -70,18 +70,13 @@ defmodule Ferricstore.Flow.HistoryProjector.Storage do
 
   def append_batch(file_path, batch), do: NIF.v2_append_batch_nosync(file_path, batch)
 
-  def sync_history_log_before_publish(file_path) do
-    with :ok <- NIF.v2_fsync(file_path) do
-      after_history_log_sync(file_path)
-    end
-  end
-
-  def after_history_log_sync(file_path) do
-    with :ok <-
-           Ferricstore.FaultInjection.maybe_pause(:after_flow_history_fsync, %{
-             file_path: file_path
-           }) do
-      maybe_history_projector_fsync_hook(file_path)
+  # `synced` runs once the log is synced, before the crash-test pause that
+  # stands for everything after the sync.
+  def sync_history_log_before_publish(file_path, synced \\ fn -> :ok end) do
+    with :ok <- NIF.v2_fsync(file_path),
+         :ok <- maybe_history_projector_fsync_hook(file_path),
+         :ok <- synced.() do
+      Ferricstore.FaultInjection.maybe_pause(:after_flow_history_fsync, %{file_path: file_path})
     end
   end
 

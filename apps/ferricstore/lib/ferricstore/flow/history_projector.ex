@@ -434,7 +434,20 @@ defmodule Ferricstore.Flow.HistoryProjector do
     pending_counter = :atomics.new(1, signed: true)
     Pending.register_pending_counter(projector_name, pending_counter, max_pending_entries)
     projected_index = projected_index(instance_ctx, shard_index, shard_data_path)
-    flushed_index = max(projected_index, Pending.replay_reservation_flushed_index(projector_name))
+
+    # Recovery published what the log holds, so what a projector killed while
+    # publishing had synced counts as flushed (see do_project/6).
+    logged_index =
+      if recover_on_init?,
+        do: Pending.replay_logged_index(projector_name, shard_data_path),
+        else: 0
+
+    flushed_index =
+      Enum.max([
+        projected_index,
+        Pending.replay_reservation_flushed_index(projector_name),
+        logged_index
+      ])
 
     state =
       Config.initial_state(
@@ -982,6 +995,14 @@ defmodule Ferricstore.Flow.HistoryProjector do
   # Tombstone entries (`%{key: key, tombstone: true}`) delete a history entry
   # from the log, so recovery, which reads the log again, leaves it deleted.
   # Runs of them and of new entries are written in the order they came.
+  #
+  # Once the batch's last run is synced, the log holds the batch, and that is
+  # marked before publishing. A projector killed while publishing runs no
+  # terminate/2; its successor's recovery publishes what the log holds, and
+  # the mark tells it that this covers the batch's Raft index. Without it the
+  # successor could not reach that index until newer history came, and every
+  # flush failed meanwhile. An earlier run's sync does not count: the runs
+  # after it can hold more of the same index.
   defp do_project(
          instance_ctx,
          shard_index,
@@ -990,16 +1011,41 @@ defmodule Ferricstore.Flow.HistoryProjector do
          requested_index,
          keydir_override
        ) do
+    logged =
+      {name(instance_ctx, shard_index), shard_data_path,
+       max_projected_index(entries, requested_index)}
+
     if Enum.any?(entries, &history_tombstone?/1) do
-      entries
-      |> Enum.chunk_by(&history_tombstone?/1)
-      |> Enum.reduce_while(:ok, fn [first | _] = run, :ok ->
+      runs = Enum.chunk_by(entries, &history_tombstone?/1)
+      last = length(runs) - 1
+
+      runs
+      |> Enum.with_index()
+      |> Enum.reduce_while(:ok, fn {[first | _] = run, position}, :ok ->
+        run_logged = if position == last, do: logged
+
         result =
           if history_tombstone?(first) do
             keydir = keydir_override || keydir(instance_ctx, shard_index)
-            append_history_tombstones(instance_ctx, shard_index, shard_data_path, keydir, run)
+
+            append_history_tombstones(
+              instance_ctx,
+              shard_index,
+              shard_data_path,
+              keydir,
+              run,
+              run_logged
+            )
           else
-            project_entries(instance_ctx, shard_index, shard_data_path, run, nil, keydir_override)
+            project_entries(
+              instance_ctx,
+              shard_index,
+              shard_data_path,
+              run,
+              nil,
+              keydir_override,
+              run_logged
+            )
           end
 
         if result == :ok, do: {:cont, :ok}, else: {:halt, result}
@@ -1012,7 +1058,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
             shard_data_path,
             [],
             requested_index,
-            keydir_override
+            keydir_override,
+            nil
           )
 
         error ->
@@ -1025,19 +1072,42 @@ defmodule Ferricstore.Flow.HistoryProjector do
         shard_data_path,
         entries,
         requested_index,
-        keydir_override
+        keydir_override,
+        logged
       )
+    end
+  end
+
+  defp mark_logged(nil), do: :ok
+  defp mark_logged({_projector, _shard_data_path, nil}), do: :ok
+
+  defp mark_logged({projector, shard_data_path, index}) do
+    case Pending.mark_replay_range_logged(projector, shard_data_path, index) do
+      :ok ->
+        :ok
+
+      {:error, reason} ->
+        Logger.warning("Flow history log mark not recorded: #{inspect(reason)}")
+        :ok
     end
   end
 
   defp history_tombstone?(%{tombstone: true}), do: true
   defp history_tombstone?(_entry), do: false
 
-  defp append_history_tombstones(instance_ctx, shard_index, shard_data_path, keydir, tombstones) do
+  defp append_history_tombstones(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         keydir,
+         tombstones,
+         logged
+       ) do
     with {:ok, _file_id, file_path} <- history_append_file(shard_data_path, keydir),
          :ok <-
            Trim.append_tombstones(file_path, Enum.map(tombstones, & &1.key), %{
-             sync_history_log_before_publish: &Storage.sync_history_log_before_publish/1
+             sync_history_log_before_publish:
+               &Storage.sync_history_log_before_publish(&1, fn -> mark_logged(logged) end)
            }) do
       clear_disk_pressure(instance_ctx, shard_index)
       :ok
@@ -1058,7 +1128,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
          shard_data_path,
          [],
          requested_index,
-         _keydir_override
+         _keydir_override,
+         _logged
        ) do
     case requested_index do
       index when is_integer(index) and index >= 0 ->
@@ -1082,7 +1153,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
          shard_data_path,
          entries,
          requested_index,
-         keydir_override
+         keydir_override,
+         logged
        ) do
     keydir = keydir_override || keydir(instance_ctx, shard_index)
 
@@ -1093,7 +1165,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
          batch <- Enum.map(encoded_entries, &{&1.key, &1.value, &1.expire_at_ms}),
          {:ok, locations} <- Storage.append_batch(file_path, batch),
          :ok <- Storage.validate_locations(encoded_entries, locations),
-         :ok <- Storage.sync_history_log_before_publish(file_path) do
+         :ok <- Storage.sync_history_log_before_publish(file_path, fn -> mark_logged(logged) end) do
       clear_disk_pressure(instance_ctx, shard_index)
 
       with :ok <-

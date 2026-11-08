@@ -4,6 +4,17 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Consistent history reads no longer fail for good after a Flow history
+  projector is killed between syncing a batch to the history log and
+  publishing it. A projector killed outright runs no shutdown code; its
+  successor recovered the batch from the log, but did not know the log
+  covered the batch's Raft index. Once WARaft asked for that index, every
+  projector flush, and so every `FLOW.HISTORY` with `consistent_projection`,
+  failed with "flow history projection unavailable" until newer history
+  reached the shard or the node restarted. The projector now marks how far
+  the log goes as soon as a batch is synced, and a successor that recovered
+  counts it as flushed.
+
 - Retention no longer removes a terminal Flow while some of its history
   waits in the history projector's overflow queue. History goes there while
   the projector's queue is full or the projector restarts, and retention

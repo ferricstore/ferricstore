@@ -250,6 +250,52 @@ defmodule Ferricstore.Flow.HistoryProjectorRequestTest do
     assert history_log_keys(dir) == []
   end
 
+  # Killed outright, the projector runs no terminate/2 and hands nothing over.
+  # What it synced is in the log, and its successor's recovery publishes it;
+  # without knowing the log covers the requested index, the successor failed
+  # every flush, and every consistent read with it, until newer history came.
+  test "a projector killed after syncing a batch leaves the batch's index reachable", %{
+    ctx: ctx,
+    dir: dir,
+    pid: pid
+  } do
+    parent = self()
+
+    for index <- 1..3,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    Ferricstore.FaultInjection.put_hook(fn
+      :after_flow_history_fsync, _metadata ->
+        send(parent, {:history_synced, self()})
+
+        receive do
+          :never -> :ok
+        end
+
+      _point, _metadata ->
+        :ok
+    end)
+
+    on_exit(&Ferricstore.FaultInjection.clear_hook/0)
+    flush = Task.async(fn -> HistoryProjector.flush(ctx, 0, 30_000) end)
+    assert_receive {:history_synced, ^pid}, 5_000
+    Ferricstore.FaultInjection.clear_hook()
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+    Task.shutdown(flush, :brutal_kill)
+
+    assert Ferricstore.Test.Eventually.eventually(fn ->
+             successor = Process.whereis(HistoryProjector.name(ctx, 0))
+             is_pid(successor) and successor != pid
+           end)
+
+    assert :requested = HistoryProjector.request(ctx, 0, dir, 3)
+    assert :ok = HistoryProjector.flush(ctx, 0)
+    assert HistoryProjector.durable?(ctx, 0, dir, 3)
+    assert history_log_keys(dir) == Enum.map(1..3, &entry(&1).key)
+  end
+
   test "history waiting in the overflow queue is pending, tombstones and abandoned rows are not",
        %{ctx: ctx} do
     :ok = stop_supervised(HistoryProjector)

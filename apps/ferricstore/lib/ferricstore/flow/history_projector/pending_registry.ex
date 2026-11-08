@@ -114,6 +114,39 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     _ -> 0
   end
 
+  # How far the history log holds a projector's history: everything up to
+  # the index is appended and synced, though maybe not published yet. Only a
+  # successor that recovered, which publishes what the log holds, may count
+  # it as flushed. It names the shard data directory, so a projector of the
+  # same name started for another directory does not take it.
+  def mark_replay_range_logged(projector, shard_data_path, index)
+      when is_atom(projector) and is_binary(shard_data_path) and is_integer(index) and
+             index >= 0 do
+    table = ensure_replay_reservation_registry()
+    key = {:logged, projector}
+
+    case :ets.lookup(table, key) do
+      [{^key, ^shard_data_path, logged}] when is_integer(logged) and logged >= index -> :ok
+      _older_other_directory_or_none -> :ets.insert(table, {key, shard_data_path, index})
+    end
+
+    :ok
+  rescue
+    error -> {:error, {:replay_log_mark_failed, error}}
+  end
+
+  def replay_logged_index(projector, shard_data_path)
+      when is_atom(projector) and is_binary(shard_data_path) do
+    table = ensure_replay_reservation_registry()
+
+    case :ets.lookup(table, {:logged, projector}) do
+      [{_key, ^shard_data_path, index}] when is_integer(index) and index >= 0 -> index
+      _none_or_other_directory -> 0
+    end
+  rescue
+    _ -> 0
+  end
+
   def replay_recovery_required?(projector) when is_atom(projector) do
     table = ensure_replay_reservation_registry()
 
@@ -344,6 +377,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     ])
 
     :ets.delete(replay_table, projector)
+    :ets.delete(replay_table, {:logged, projector})
     :ok
   rescue
     error -> {:error, {:pending_discard_failed, error}}

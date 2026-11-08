@@ -199,7 +199,19 @@ defmodule Ferricstore.FlowCrashMatrixTest do
     Ferricstore.FaultInjection.clear_hook()
     kill_process(pid)
     shutdown_op(op)
-    wait_named_restart(HistoryProjector.name(FerricStore.Instance.get(:default), shard), pid)
+    ctx = FerricStore.Instance.get(:default)
+    wait_named_restart(HistoryProjector.name(ctx, shard), pid)
+
+    # WARaft asks the restarted projector for the history of what it applied,
+    # which the killed projector had synced but not published. Left to timing
+    # before, this made every later flush, and so every consistent read, fail.
+    assert HistoryProjector.request(
+             ctx,
+             shard,
+             Ferricstore.DataDir.shard_data_path(ctx.data_dir, shard),
+             :atomics.get(ctx.last_applied_index, shard + 1)
+           ) in [:durable, :requested]
+
     ShardHelpers.kill_shard_safely(shard, timeout: 45_000)
 
     assert {:ok, %{state: "completed"}} =
