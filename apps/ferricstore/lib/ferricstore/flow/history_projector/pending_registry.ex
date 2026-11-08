@@ -10,7 +10,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
   def reserve(projector, count) when is_atom(projector) do
     case lookup(projector) do
-      {:ok, counter, max_pending} -> reserve_counter(counter, count, max_pending)
+      {:ok, counter, max_pending, _owner} -> reserve_counter(counter, count, max_pending)
       :error -> {:error, :not_registered}
     end
   end
@@ -48,12 +48,40 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     _ -> :ok
   end
 
+  # Called by the projector itself, which owns the counter.
   def register(projector, counter, max_pending) when is_atom(projector) do
     @pending_registry
     |> ensure_pending_registry()
-    |> :ets.insert({projector, counter, max_pending})
+    |> :ets.insert({projector, counter, max_pending, self()})
 
     :ok
+  end
+
+  # An enqueuer that casts to `owner` reserves only on owner's own counter.
+  # So a projector killed outright, which leaves its registration behind,
+  # leaves a counter that counts exactly the history it took with it.
+  def reserve_owned(projector, owner, count) when is_atom(projector) and is_pid(owner) do
+    case lookup(projector) do
+      {:ok, counter, max_pending, ^owner} -> reserve_counter(counter, count, max_pending)
+      _missing_or_other_owner -> {:error, :not_registered}
+    end
+  end
+
+  # What a projector of this name left registered: one that stopped took its
+  # registration with it, one killed outright did not, and its counter holds
+  # the history it had not written. It stays until the next projector
+  # registers its own, so a successor that dies starting up leaves it to the
+  # one after.
+  def predecessor_held(projector) when is_atom(projector) do
+    case lookup(projector) do
+      {:ok, counter, _max_pending, owner} when owner != self() ->
+        {:ok, max(:atomics.get(counter, 1), 0)}
+
+      _none ->
+        :none
+    end
+  rescue
+    _ -> :none
   end
 
   def unregister(nil), do: :ok
@@ -147,6 +175,55 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     _ -> 0
   end
 
+  def replay_reservation_max_index(projector) when is_atom(projector) do
+    case :ets.lookup(ensure_replay_reservation_registry(), projector) do
+      [{^projector, _min_index, max_index, _flushed_index}] when is_integer(max_index) ->
+        max_index
+
+      _missing ->
+        nil
+    end
+  rescue
+    _ -> nil
+  end
+
+  # History from `floor` on went with a projector killed outright. Raft
+  # writes it again only by replaying its commands, on the node's next start,
+  # and only from where the history projected index stands; so that index
+  # stays below the floor until then, however far newer history gets. Like
+  # every mark here it names the shard data directory.
+  def mark_history_lost(projector, shard_data_path, floor)
+      when is_atom(projector) and is_binary(shard_data_path) and is_integer(floor) and
+             floor > 0 do
+    table = ensure_replay_reservation_registry()
+    key = {:lost, projector}
+
+    case :ets.lookup(table, key) do
+      [{^key, ^shard_data_path, lost}] when is_integer(lost) and lost <= floor -> :ok
+      _later_other_directory_or_none -> :ets.insert(table, {key, shard_data_path, floor})
+    end
+
+    :ok
+  rescue
+    error -> {:error, {:history_lost_mark_failed, error}}
+  end
+
+  def lost_history_publish_limit(projector, shard_data_path)
+      when is_atom(projector) and is_binary(shard_data_path) do
+    case :ets.whereis(@replay_reservation_registry) do
+      :undefined ->
+        :infinity
+
+      table ->
+        case :ets.lookup(table, {:lost, projector}) do
+          [{_key, ^shard_data_path, floor}] when is_integer(floor) -> floor - 1
+          _none_or_other_directory -> :infinity
+        end
+    end
+  rescue
+    ArgumentError -> :infinity
+  end
+
   def replay_recovery_required?(projector) when is_atom(projector) do
     table = ensure_replay_reservation_registry()
 
@@ -170,7 +247,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     table = ensure_pending_registry(@pending_registry)
 
     case :ets.lookup(table, projector) do
-      [{^projector, counter, max_pending}] -> {:ok, counter, max_pending}
+      [{^projector, counter, max_pending, owner}] -> {:ok, counter, max_pending, owner}
       _ -> :error
     end
   rescue
@@ -378,6 +455,7 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
 
     :ets.delete(replay_table, projector)
     :ets.delete(replay_table, {:logged, projector})
+    :ets.delete(replay_table, {:lost, projector})
     :ok
   rescue
     error -> {:error, {:pending_discard_failed, error}}
