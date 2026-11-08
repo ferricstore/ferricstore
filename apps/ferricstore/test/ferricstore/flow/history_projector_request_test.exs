@@ -296,6 +296,30 @@ defmodule Ferricstore.Flow.HistoryProjectorRequestTest do
     assert history_log_keys(dir) == Enum.map(1..3, &entry(&1).key)
   end
 
+  # Raft writes the lost history again by replaying, on the node's next
+  # start, from where the projected index stands. Newer history must not move
+  # that index past it.
+  test "history a killed projector never synced keeps newer history from counting as durable",
+       %{ctx: ctx, dir: dir, pid: pid} do
+    for index <- 1..3,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    ref = Process.monitor(pid)
+    Process.exit(pid, :kill)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :killed}
+
+    assert Ferricstore.Test.Eventually.eventually(fn ->
+             successor = Process.whereis(HistoryProjector.name(ctx, 0))
+             is_pid(successor) and successor != pid
+           end)
+
+    assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry(4)], 4)
+    assert :requested = HistoryProjector.request(ctx, 0, dir, 4)
+    assert {:error, :flush_failed} = HistoryProjector.flush(ctx, 0)
+    assert history_log_keys(dir) == [entry(4).key]
+    refute HistoryProjector.durable?(ctx, 0, dir, 1)
+  end
+
   test "history waiting in the overflow queue is pending, tombstones and abandoned rows are not",
        %{ctx: ctx} do
     :ok = stop_supervised(HistoryProjector)

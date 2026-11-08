@@ -8,10 +8,12 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
 
   def reserve_pending(projector, count) when is_atom(projector) do
     case PendingRegistry.lookup(projector) do
-      {:ok, counter, max_pending} -> reserve_pending_counter(counter, count, max_pending)
+      {:ok, counter, max_pending, _owner} -> reserve_pending_counter(counter, count, max_pending)
       :error -> {:error, :not_registered}
     end
   end
+
+  defdelegate reserve_pending(projector, owner, count), to: PendingRegistry, as: :reserve_owned
 
   def reserve_pending_counter(_counter, count, _max_pending) when count <= 0, do: :ok
 
@@ -40,7 +42,7 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
 
   def release_pending(projector, count) when is_atom(projector) do
     case PendingRegistry.lookup(projector) do
-      {:ok, counter, _max_pending} -> release_pending_counter(counter, count)
+      {:ok, counter, _max_pending, _owner} -> release_pending_counter(counter, count)
       :error -> {:error, :not_registered}
     end
   end
@@ -69,6 +71,10 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   defdelegate replay_reservation_flushed_index(projector), to: PendingRegistry
   defdelegate replay_recovery_required?(projector), to: PendingRegistry
   defdelegate mark_replay_range_logged(projector, shard_data_path, index), to: PendingRegistry
+  defdelegate replay_reservation_max_index(projector), to: PendingRegistry
+  defdelegate take_registration(projector), to: PendingRegistry
+  defdelegate mark_history_lost(projector, shard_data_path, floor), to: PendingRegistry
+  defdelegate lost_history_publish_limit(projector, shard_data_path), to: PendingRegistry
   defdelegate replay_logged_index(projector, shard_data_path), to: PendingRegistry
 
   def append_overflow(projector, entries),

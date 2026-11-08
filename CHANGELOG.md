@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- History a Flow history projector held when it was killed outright is no
+  longer lost for good. A killed projector runs no shutdown code, so the
+  history it had not written yet went with it, and only Raft can write it
+  again, by replaying the commands on the next start. But once newer history
+  on the shard was written, it counted as durable past the lost history, and
+  the next start did not replay that far back. The projector that takes over
+  now sees what its predecessor took with it and keeps history on the shard
+  from counting as durable past it until the node restarts, logging an error
+  that says so; meanwhile consistent history reads on the shard fail and its
+  Raft log is not trimmed. The projector also gets 120 s instead of 5 s to
+  stop, so a supervisor stopping it mid-flush no longer kills it.
+
 - Consistent history reads no longer fail for good after a Flow history
   projector is killed between syncing a batch to the history log and
   publishing it. A projector killed outright runs no shutdown code; its

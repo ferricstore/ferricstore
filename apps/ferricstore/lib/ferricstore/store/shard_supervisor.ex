@@ -72,7 +72,11 @@ defmodule Ferricstore.Store.ShardSupervisor do
                instance_ctx: instance_ctx,
                recover_on_init: false
              ]},
-            id: :"flow_history_projector_#{i}"
+            id: :"flow_history_projector_#{i}",
+            # It hands unwritten history to its successor once the flush in
+            # progress returns; killed before that, the history waits for a
+            # node restart (see HistoryProjector.note_lost_history/5).
+            shutdown: 120_000
           ),
           Supervisor.child_spec(
             {Ferricstore.Store.BitcaskCheckpointer, [index: i, instance_ctx: instance_ctx]},

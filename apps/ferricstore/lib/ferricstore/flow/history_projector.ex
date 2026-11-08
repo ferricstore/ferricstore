@@ -171,7 +171,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
         enqueue_overflow(instance_ctx, shard_index, projector, nil, entries)
 
       pid when is_pid(pid) ->
-        case Pending.reserve_pending(projector, length(entries)) do
+        case Pending.reserve_pending(projector, pid, length(entries)) do
           :ok ->
             case Pending.reserve_replay_range(projector, entries) do
               :ok ->
@@ -412,6 +412,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
     instance_ctx = Keyword.get(opts, :instance_ctx)
     projector_name = name(instance_ctx, shard_index)
+    # Taken first: until we register our own counter, enqueuers find none of
+    # theirs and use the overflow queue, so the counter a killed predecessor
+    # left counts only what went with it.
+    predecessor = Pending.take_registration(projector_name)
 
     recover_on_init? =
       Keyword.get(opts, :recover_on_init, true) or
@@ -448,6 +452,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
         Pending.replay_reservation_flushed_index(projector_name),
         logged_index
       ])
+
+    note_lost_history(projector_name, shard_index, shard_data_path, predecessor, flushed_index)
 
     state =
       Config.initial_state(
@@ -607,6 +613,40 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   def terminate(_reason, _state), do: :ok
+
+  # A predecessor killed outright ran no terminate/2, so the history it held
+  # and had not written is gone from here. Raft replay writes it again on the
+  # node's next start, from where the history projected index stands, so that
+  # index must not pass it meanwhile: newer history is written, but counts as
+  # durable only after the restart.
+  defp note_lost_history(projector, shard_index, shard_data_path, {:ok, held}, flushed_index)
+       when held > 0 do
+    case Pending.replay_reservation_max_index(projector) do
+      reserved when is_integer(reserved) and reserved > flushed_index ->
+        floor = flushed_index + 1
+        :ok = Pending.mark_history_lost(projector, shard_data_path, floor)
+
+        :telemetry.execute(
+          [:ferricstore, :flow, :history_projector, :history_lost],
+          %{entries: held},
+          %{shard_index: shard_index, from_index: floor}
+        )
+
+        Logger.error(
+          "Flow history projector shard_#{shard_index} restarted after being killed with " <>
+            "history it had not written (#{held} entries, from Raft index #{floor}). Raft " <>
+            "writes it again when the node restarts; until then history on this shard is " <>
+            "not durable from that index, consistent history reads on it fail, and its " <>
+            "Raft log is not trimmed."
+        )
+
+      _written ->
+        :ok
+    end
+  end
+
+  defp note_lost_history(_projector, _shard_index, _shard_data_path, _none, _flushed_index),
+    do: :ok
 
   # Unflushed history lives only in this process: its pending entries and the
   # enqueue casts still in its mailbox. Raft replay does not bring them back,
@@ -1451,9 +1491,12 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   def publish_projected_index(instance_ctx, shard_index, shard_data_path, index)
       when is_integer(index) and index >= 0 do
+    projector = name(instance_ctx, shard_index)
+
     index =
       index
-      |> min(Pending.overflow_publish_limit(name(instance_ctx, shard_index)))
+      |> min(Pending.overflow_publish_limit(projector))
+      |> min(Pending.lost_history_publish_limit(projector, shard_data_path))
       |> max(projected_index(instance_ctx, shard_index, shard_data_path))
 
     with :ok <- HistoryProjectedIndex.persist(shard_data_path, index) do
