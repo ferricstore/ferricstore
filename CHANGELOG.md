@@ -4,6 +4,22 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Deleting members of a hash, set or sorted set past the promotion threshold
+  (100 entries by default), or deleting the whole key, no longer leaves the
+  members' keys in the shard's WARaft storage process. The keys were marked
+  deleted for the reads of a transaction, but outside one nothing cleared the
+  marks: they stayed until a transaction next ran on the shard, and the
+  memory grew with every such delete. A sorted-set write on the shard went
+  through all of them for each member while the set was below the threshold;
+  after a 100,000-field hash was deleted, a 250-member ZADD took 4.4 s
+  instead of 60 ms, and on a slow runner it timed out.
+
+- The Flow LMDB writer persists its replay-safe index once for all the
+  requests waiting for it, instead of once per request. A shard can ask once
+  per Raft entry, and each persist syncs the marker file twice, so under a
+  burst of writes the writer fell behind and kept the disk syncing for
+  seconds after the burst ended.
+
 ## 0.12.19 - 2026-11-08
 
 - History a Flow history projector held when it was killed outright is no

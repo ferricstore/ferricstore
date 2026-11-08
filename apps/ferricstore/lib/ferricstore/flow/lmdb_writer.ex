@@ -577,11 +577,15 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  # A shard can ask once per Raft entry, and each persist syncs the marker file
+  # twice. The flush runs after the messages already waiting here, so the
+  # requests among them persist once instead of once each; the ops they cover
+  # were sent before them, so the flush still has those.
   def handle_cast({:persist_replay_safe, index}, state) when is_integer(index) and index >= 0 do
     requested_index = max(state.requested_index, index)
     publish_requested(state.instance_ctx, state.shard_index, requested_index)
 
-    {:noreply, maybe_flush_replay_safe_request(%{state | requested_index: requested_index})}
+    {:noreply, schedule_replay_safe_flush(%{state | requested_index: requested_index})}
   end
 
   def handle_cast(:suspend_without_flush, state) do
@@ -790,6 +794,10 @@ defmodule Ferricstore.Flow.LMDBWriter do
     end
   end
 
+  def handle_info(:flush_replay_safe, state) do
+    {:noreply, maybe_flush_replay_safe_request(%{state | replay_safe_flush_scheduled?: false})}
+  end
+
   # Spill copies ride along with the next flush but do not count as pending
   # projection work: retention and idle checks wait for that count to drain, and
   # a spilled row stays in the keydir until its copy is written.
@@ -856,6 +864,13 @@ defmodule Ferricstore.Flow.LMDBWriter do
 
   defp maybe_defer_timer_flush(state),
     do: Ferricstore.Flow.LMDBWriter.Timer.maybe_defer_timer_flush(state)
+
+  defp schedule_replay_safe_flush(%{replay_safe_flush_scheduled?: true} = state), do: state
+
+  defp schedule_replay_safe_flush(state) do
+    send(self(), :flush_replay_safe)
+    %{state | replay_safe_flush_scheduled?: true}
+  end
 
   defp maybe_flush_replay_safe_request(state) do
     case timer_flush_decision(state) do

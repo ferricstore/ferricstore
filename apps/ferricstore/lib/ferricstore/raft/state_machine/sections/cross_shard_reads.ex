@@ -203,13 +203,22 @@ defmodule Ferricstore.Raft.StateMachine.Sections.CrossShardReads do
         sm_tx_unindex_compound_key(:tx_pending_compound_keys, key)
       end
 
+      # A mark is for the reads of the transaction whose execution context holds
+      # the marks. Outside one the caller has already removed the keydir row,
+      # and nothing would clear the mark: the storage process kept every member
+      # of each promoted collection it deleted.
       defp sm_tx_mark_deleted(key) do
         sm_tx_drop_pending(key)
 
-        deleted = Process.get(:tx_deleted_keys, MapSet.new())
-        Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
-        sm_tx_index_compound_key(:tx_deleted_compound_keys, key)
-        :ok
+        case Process.get(:tx_deleted_keys) do
+          nil ->
+            :ok
+
+          deleted ->
+            Process.put(:tx_deleted_keys, MapSet.put(deleted, key))
+            sm_tx_index_compound_key(:tx_deleted_compound_keys, key)
+            :ok
+        end
       end
 
       defp sm_tx_unmark_deleted(key) do

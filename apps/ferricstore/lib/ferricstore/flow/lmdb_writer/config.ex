@@ -53,6 +53,7 @@ defmodule Ferricstore.Flow.LMDBWriter.Config do
       timer_ref: nil,
       durable_index: 0,
       requested_index: 0,
+      replay_safe_flush_scheduled?: false,
       terminal_count_inits: MapSet.new(),
       terminal_atomic_write?: false,
       write_group_sizes: [],
