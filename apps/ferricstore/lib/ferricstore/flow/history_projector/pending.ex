@@ -78,6 +78,9 @@ defmodule Ferricstore.Flow.HistoryProjector.Pending do
   def overflow_publish_limit(projector),
     do: PendingRegistry.overflow_publish_limit(projector)
 
+  def overflow_history_pending?(projector),
+    do: PendingRegistry.overflow_history_pending?(projector)
+
   def delete_overflow(projector, sequence),
     do: PendingRegistry.delete_overflow(projector, sequence)
 

@@ -296,13 +296,23 @@ defmodule Ferricstore.Flow.HistoryProjector do
     do: call_pending(instance_ctx, shard_index, :pending_count, timeout)
 
   @doc """
-  Pending entries that add history, leaving out the tombstones of entries
-  already removed: what a reader of the indexes cannot see yet.
+  Whether history a reader of the indexes cannot see yet waits to be written:
+  in the queue, or in the overflow queue, where it waits while the queue is
+  full or the projector restarts. Tombstones of entries already removed do
+  not count.
   """
-  @spec pending_history_count(map() | nil, non_neg_integer(), timeout()) ::
-          {:ok, non_neg_integer()} | {:error, term()}
-  def pending_history_count(instance_ctx, shard_index, timeout \\ 1_000),
-    do: call_pending(instance_ctx, shard_index, :pending_history_count, timeout)
+  @spec history_pending?(map() | nil, non_neg_integer(), timeout()) ::
+          {:ok, boolean()} | {:error, term()}
+  def history_pending?(instance_ctx, shard_index, timeout \\ 1_000) do
+    # Overflow first: the projector drains it into the queue, so in the other
+    # order an entry could move from the overflow queue between the two reads.
+    with {:ok, false} <- Pending.overflow_history_pending?(name(instance_ctx, shard_index)) do
+      case call_pending(instance_ctx, shard_index, :history_pending?, timeout) do
+        {:error, :not_started} -> {:ok, false}
+        result -> result
+      end
+    end
+  end
 
   defp call_pending(instance_ctx, shard_index, request, timeout) do
     projector = name(instance_ctx, shard_index)
@@ -552,8 +562,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
     {:reply, {:ok, state.pending_count}, state}
   end
 
-  def handle_call(:pending_history_count, _from, state) do
-    {:reply, {:ok, Enum.count(state.pending, &(not history_tombstone?(&1)))}, state}
+  def handle_call(:history_pending?, _from, state) do
+    {:reply, {:ok, Enum.any?(state.pending, &(not history_tombstone?(&1)))}, state}
   end
 
   def handle_call({:enqueue, entries}, _from, state) do

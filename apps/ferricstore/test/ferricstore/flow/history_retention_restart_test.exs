@@ -125,6 +125,57 @@ defmodule Ferricstore.Flow.HistoryRetentionRestartTest do
              )
   end
 
+  # History written while the projector is down waits in the overflow queue.
+  # Removed before it lands, the Flow would leave that history behind.
+  test "retention waits for a Flow's history that waits in the overflow queue" do
+    id = "retained-overflow-#{System.unique_integer([:positive])}"
+    ctx = FerricStore.Instance.get(:default)
+
+    shard =
+      Ferricstore.Store.Router.shard_for(ctx, Ferricstore.Flow.Keys.state_key(id, @partition))
+
+    :ok = Supervisor.terminate_child(Ferricstore.Store.ShardSupervisor, projector_child(shard))
+    create!(id, 1_000)
+
+    assert {:ok, [claimed]} =
+             FerricStore.flow_claim_due("retained",
+               partition_key: @partition,
+               worker: "w",
+               limit: 1,
+               now_ms: 1_000
+             )
+
+    assert :ok =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               partition_key: @partition,
+               fencing_token: claimed.fencing_token,
+               now_ms: 1_100
+             )
+
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+    cleanup = [limit: 10, now_ms: completed.terminal_retention_until_ms + 1]
+    assert {:ok, %{flows: 0}} = FerricStore.flow_retention_cleanup(cleanup)
+
+    {:ok, _pid} =
+      Supervisor.restart_child(Ferricstore.Store.ShardSupervisor, projector_child(shard))
+
+    flush!()
+    assert {:ok, %{flows: 1}} = FerricStore.flow_retention_cleanup(cleanup)
+    flush!()
+
+    create!(id, 5_000)
+    flush!()
+
+    assert {:ok, [{_event_id, %{"event" => "created"}}]} =
+             FerricStore.flow_history(id,
+               partition_key: @partition,
+               count: 10,
+               include_cold: true,
+               consistent_projection: true
+             )
+  end
+
   defp restart_projector_flushing_every(shard, interval_ms) do
     key = :flow_history_projector_flush_interval_ms
     previous = Application.fetch_env(:ferricstore, key)

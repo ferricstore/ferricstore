@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Retention no longer removes a terminal Flow while some of its history
+  waits in the history projector's overflow queue. History goes there while
+  the projector's queue is full or the projector restarts, and retention
+  waited only for the queue. It removed the history it could see, and the
+  rest landed later for a Flow that no longer existed: a Flow created later
+  under the same ID listed those events before its own.
+
 - History that retention removed no longer comes back after a restart.
   Startup recovery reads the active history log file again (up to 128 MiB
   by default) and indexes every entry in it, and retention removed a Flow's

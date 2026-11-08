@@ -250,6 +250,27 @@ defmodule Ferricstore.Flow.HistoryProjectorRequestTest do
     assert history_log_keys(dir) == []
   end
 
+  test "history waiting in the overflow queue is pending, tombstones and abandoned rows are not",
+       %{ctx: ctx} do
+    :ok = stop_supervised(HistoryProjector)
+    projector = HistoryProjector.name(ctx, 0)
+    on_exit(fn -> HistoryProjector.Pending.discard(projector) end)
+    assert {:ok, false} = HistoryProjector.history_pending?(ctx, 0)
+
+    tombstone = %{key: entry(1).key, tombstone: true, shard_index: 0}
+    assert :ok = HistoryProjector.enqueue_async(ctx, 0, [tombstone], 1)
+
+    # A writer that died before committing its row; the drain drops the row.
+    {writer, ref} =
+      spawn_monitor(fn -> HistoryProjector.Pending.append_overflow(projector, [entry(2)]) end)
+
+    assert_receive {:DOWN, ^ref, :process, ^writer, :normal}
+    assert {:ok, false} = HistoryProjector.history_pending?(ctx, 0)
+
+    assert :ok = HistoryProjector.enqueue_async(ctx, 0, [entry(3)], 3)
+    assert {:ok, true} = HistoryProjector.history_pending?(ctx, 0)
+  end
+
   defp history_log_keys(dir) do
     {:ok, file_ids} = Ferricstore.Flow.HistoryProjector.Files.list(dir)
 
