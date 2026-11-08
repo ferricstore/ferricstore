@@ -1017,6 +1017,7 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
 
         with :ok <- flow_retention_delete_history_index(state, history_key, history_entries),
              {:ok, history_count} <- flow_retention_delete_keys(state, history_keys),
+             :ok <- flow_retention_tombstone_history(state, history_keys),
              {:ok, values_count} <- flow_retention_delete_keys(state, private_value_refs),
              {:ok, _auxiliary_count} <- flow_retention_delete_keys(state, auxiliary_keys),
              :ok <-
@@ -1039,7 +1040,8 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
                      state,
                      FlowKeys.terminal_retention_index_key(),
                      [state_key]
-                   ) do
+                   ),
+                 :ok <- flow_retention_delete_hot_index_entries(state, record) do
               maybe_queue_terminal_lmdb_history_expire_delete(state, record)
 
               {:ok, %{flows: 1, history: history_count, values: values_count}}
@@ -1052,6 +1054,55 @@ defmodule Ferricstore.Raft.StateMachine.Sections.FlowRetentionState do
 
       defp flow_retention_cleanup_record(_state, _state_key, _record, _cleanup_plan),
         do: {:error, "ERR invalid flow retention cleanup plan"}
+
+      # A terminal Flow keeps its state, parent, root and correlation index
+      # entries after its record leaves the keydir, so lists keep listing it
+      # (see AfterFlush). They go with the Flow; left behind, FLOW.INFO and
+      # FLOW.STATS kept counting it and the indexes grew with every Flow
+      # retention removed.
+      # Startup recovery reads the active history log file again and indexes
+      # every entry it holds, so a removed entry needs a tombstone in the log.
+      # The history projector writes it, in order with the entries it writes.
+      defp flow_retention_tombstone_history(_state, []), do: :ok
+
+      defp flow_retention_tombstone_history(state, history_keys) do
+        entries =
+          Enum.map(history_keys, &%{key: &1, tombstone: true, shard_index: state.shard_index})
+
+        if Process.get(:sm_pending_flow_history_projections, :undefined) == :undefined do
+          ra_index = current_ra_index()
+
+          case HistoryProjector.enqueue_async(
+                 instance_ctx_for_state(state),
+                 state.shard_index,
+                 entries,
+                 ra_index
+               ) do
+            :ok ->
+              record_waraft_replay_dependency(:history, state.shard_index, ra_index)
+              :ok
+
+            {:error, reason} ->
+              {:error, {:flow_history_projection_failed, reason}}
+          end
+        else
+          queue_pending_flow_history_projections_batch(entries)
+        end
+      end
+
+      # An orphan purge passes what is left of a Flow without its record.
+      defp flow_retention_delete_hot_index_entries(
+             state,
+             %{id: id, type: type, state: flow_state} = record
+           )
+           when is_binary(id) and is_binary(type) and is_binary(flow_state) do
+        record
+        |> flow_hot_cold_index_entries()
+        |> Enum.map(fn {key, member, _score} -> {key, member} end)
+        |> then(&flow_zset_index_delete_grouped(state, &1))
+      end
+
+      defp flow_retention_delete_hot_index_entries(_state, _record), do: :ok
 
       defp flow_retention_split_owned_value_refs(refs, owner_record) do
         {shareable_refs, private_refs} =

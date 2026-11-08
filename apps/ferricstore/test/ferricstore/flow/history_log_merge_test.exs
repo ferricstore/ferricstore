@@ -343,8 +343,11 @@ defmodule Ferricstore.Flow.HistoryLogBackgroundMergeTest do
                100
              )
 
-    assert_received {:history_merge, %{merged: merged, deleted: deleted}}
-                    when merged + deleted > 0
+    # The merge reports once it has gone through every closed file, after it
+    # replaced file 0.
+    assert_receive {:history_merge, %{merged: merged, deleted: deleted}}
+                   when merged + deleted > 0,
+                   30_000
 
     for id <- keepers do
       assert {:ok, [{_event_id, %{"event" => "created"}} | _]} =

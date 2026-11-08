@@ -351,6 +351,104 @@ defmodule Ferricstore.Flow.LMDBTest.Sections.HistoryProjectorFsyncsCopiedGenerat
         end
       end
 
+      # A claim queues only a query-row projection. When it lands in one flush
+      # with a rewind's full projection of the same Flow, the coalesced
+      # projection must still remove the terminal row the rewind left behind.
+      @tag :flow_projection_coalescing
+      test "LMDB writer keeps a full projection coalesced with a later query-only one" do
+        fixture = start_active_lmdb_projection_fixture!("coalesced-rewind")
+
+        completed =
+          active_lmdb_record("flow-coalesced-rewind", "coalesced-rewind", "completed",
+            partition_key: fixture.partition_key,
+            version: 3,
+            updated_at_ms: 50,
+            next_run_at_ms: nil
+          )
+
+        state_key = Ferricstore.Flow.Keys.state_key(completed.id, completed.partition_key)
+
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.source_keydir,
+          completed
+        )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
+                   {:project_flow_state_from_source, state_key, completed.version}
+                 ])
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+        completed_index_key =
+          Ferricstore.Flow.Keys.state_index_key(
+            completed.type,
+            completed.state,
+            completed.partition_key
+          )
+
+        assert {:ok, 1} =
+                 Ferricstore.Flow.LMDB.prefix_count(
+                   fixture.lmdb_path,
+                   Ferricstore.Flow.LMDB.terminal_index_prefix(completed_index_key)
+                 )
+
+        rewound = %{
+          completed
+          | state: "queued",
+            version: 4,
+            updated_at_ms: 60,
+            next_run_at_ms: 60
+        }
+
+        running = %{
+          rewound
+          | state: "running",
+            version: 5,
+            updated_at_ms: 70,
+            next_run_at_ms: nil,
+            lease_owner: "worker",
+            lease_deadline_ms: 80
+        }
+
+        put_durable_flow_source!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.source_keydir,
+          running
+        )
+
+        assert :ok =
+                 Ferricstore.Flow.LMDBWriter.enqueue(fixture.instance_name, fixture.shard_index, [
+                   {:project_flow_state_from_source, state_key, rewound.version},
+                   {:project_flow_query_state_from_source, state_key, running.version}
+                 ])
+
+        assert :ok = Ferricstore.Flow.LMDBWriter.flush(fixture.instance_name, fixture.shard_index)
+
+        assert_query_row_hydrates!(
+          fixture.data_dir,
+          fixture.shard_index,
+          fixture.lmdb_path,
+          state_key,
+          running
+        )
+
+        assert {:ok, 0} =
+                 Ferricstore.Flow.LMDB.prefix_count(
+                   fixture.lmdb_path,
+                   Ferricstore.Flow.LMDB.terminal_index_prefix(completed_index_key)
+                 )
+
+        assert :not_found =
+                 Ferricstore.Flow.LMDB.get(
+                   fixture.lmdb_path,
+                   Ferricstore.Flow.LMDB.terminal_by_state_key_key(state_key)
+                 )
+      end
+
       test "terminal Flow state projection removes stale active LMDB rows" do
         fixture = start_active_lmdb_projection_fixture!("terminal-fast-state")
 

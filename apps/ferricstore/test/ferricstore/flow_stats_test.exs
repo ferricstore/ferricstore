@@ -91,6 +91,45 @@ defmodule Ferricstore.FlowStatsTest do
              )
   end
 
+  # A terminal Flow keeps its hot index entries after its record leaves the
+  # keydir, so lists keep listing it. Retention cleanup removes the Flow.
+  test "info and stats stop counting a Flow that retention cleaned up" do
+    type = unique_flow_id("stats-retained-type")
+    id = create_queued(type, "acme", retention_ttl_ms: 60_000, correlation_id: "stats-retained")
+    claimed = claim_one!(type)
+
+    assert :ok =
+             FerricStore.flow_complete(id, claimed.lease_token,
+               fencing_token: claimed.fencing_token,
+               partition_key: @partition,
+               now_ms: 1_002
+             )
+
+    assert {:ok, %{completed: 1}} = FerricStore.flow_info(type, partition_key: @partition)
+    assert {:ok, completed} = FerricStore.flow_get(id, partition_key: @partition)
+
+    assert {:ok, %{flows: 1}} =
+             FerricStore.flow_retention_cleanup(
+               limit: 10,
+               now_ms: completed.terminal_retention_until_ms + 1
+             )
+
+    assert {:ok, nil} = FerricStore.flow_get(id, partition_key: @partition)
+    assert {:ok, %{completed: 0}} = FerricStore.flow_info(type, partition_key: @partition)
+
+    assert {:ok, %{count: 0}} =
+             FerricStore.flow_stats(type, state: "completed", partition_key: @partition)
+
+    ctx = FerricStore.Instance.get(:default)
+
+    for key <- [
+          Ferricstore.Flow.Keys.state_index_key(type, "completed", @partition),
+          Ferricstore.Flow.Keys.correlation_index_key("stats-retained", @partition)
+        ] do
+      assert {:ok, []} = Ferricstore.Flow.IndexZSet.range(ctx, key, 0, -1)
+    end
+  end
+
   defp create_queued(type, tenant, opts \\ []) do
     id = unique_flow_id("stats-record")
 

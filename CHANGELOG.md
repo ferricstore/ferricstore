@@ -4,6 +4,40 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- History that retention removed no longer comes back after a restart.
+  Startup recovery reads the active history log file again (up to 128 MiB
+  by default) and indexes every entry in it, and retention removed a Flow's
+  history entries only from the indexes. A restart indexed them again: a
+  Flow created later under the same ID listed the old Flow's events before
+  its own, and the entries stayed in the indexes for good. Retention now
+  writes tombstones for them to the history log, through the history
+  projector.
+
+- `FLOW.INFO` and `FLOW.STATS` no longer keep counting a terminal Flow after
+  retention removes it. A terminal Flow keeps its state, parent, root and
+  correlation index entries in memory after its record moves to LMDB, so
+  lists without `include_cold` keep listing it, but retention cleanup left
+  those entries behind. Lists skipped the missing Flow, while the counts
+  stayed inflated and the in-memory indexes grew with every Flow retention
+  removed.
+
+- A Flow history projector that stops or crashes no longer loses the history
+  it has not written yet. Events wait in the projector for up to its flush
+  interval (1 s by default), and a restart, such as the shard supervisor's
+  after repeated shard crashes, dropped them for good: the Flow's state was
+  right but its history missed those events, since applying a command again
+  over the state it already left writes no history. The projector now hands
+  them to its successor through the overflow queue, which outlives it.
+
+- A Flow rewound out of a terminal state and claimed again before the LMDB
+  writer flushed no longer stays counted in that terminal state. A claim
+  queues only a query-row projection, and the writer, keeping one projection
+  per Flow in a flush, kept the claim's and dropped the rewind's full
+  projection, which deletes the terminal row. `FLOW.INFO` with
+  `consistent_projection` or `include_cold` then counted the Flow in both
+  its new state and the old terminal one. The writer now projects the kept
+  projection in full when it replaces a full one.
+
 - A node that lost a large Bloom, Cuckoo, Count-Min or Top-K file gets it
   back. A replica asked for its copy while it was still copying the file
   aside answered that it had applied the repair without one, because its

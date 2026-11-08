@@ -235,6 +235,53 @@ defmodule Ferricstore.Flow.HistoryProjector.PendingRegistry do
     error -> {:error, {:overflow_delete_failed, error}}
   end
 
+  # A stopping projector fills the overflow row it took with
+  # `append_overflow(projector, [])` with the history it never flushed. The
+  # row keeps its place in drain order. The hand-over names the shard data
+  # directory: a projector of the same name started for another directory (a
+  # restarted instance) drops it instead of writing it there.
+  def hand_over(projector, _shard_data_path, sequence, []),
+    do: delete_overflow(projector, sequence)
+
+  def hand_over(projector, shard_data_path, sequence, entries)
+      when is_atom(projector) and is_binary(shard_data_path) and is_integer(sequence) and
+             sequence > 0 and is_list(entries) do
+    registry = ensure_pending_registry(@pending_registry)
+    overflow = ensure_overflow_registry()
+
+    sequences =
+      case :ets.lookup(registry, {:hand_over, projector}) do
+        [{_key, ^shard_data_path, sequences}] -> sequences
+        _none_or_other_directory -> []
+      end
+
+    # The marker goes first: a row it names but never filled stays a
+    # placeholder of a dead writer, which the drain drops.
+    :ets.insert(registry, {{:hand_over, projector}, shard_data_path, [sequence | sequences]})
+    :ets.insert(overflow, {{projector, sequence}, {:ready, entries}})
+    :ok
+  rescue
+    error -> {:error, {:history_hand_over_failed, error}}
+  end
+
+  def take_hand_over(projector, shard_data_path)
+      when is_atom(projector) and is_binary(shard_data_path) do
+    registry = ensure_pending_registry(@pending_registry)
+
+    case :ets.take(registry, {:hand_over, projector}) do
+      [{_key, ^shard_data_path, _sequences}] ->
+        :ok
+
+      [{_key, _other_directory, sequences}] ->
+        Enum.each(sequences, &delete_overflow(projector, &1))
+
+      [] ->
+        :ok
+    end
+  rescue
+    error -> {:error, {:history_hand_over_take_failed, error}}
+  end
+
   def take_overflow(projector, max_entries)
       when is_atom(projector) and is_integer(max_entries) and max_entries > 0 do
     table = ensure_overflow_registry()

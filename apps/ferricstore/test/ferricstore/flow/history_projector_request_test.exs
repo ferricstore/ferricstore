@@ -173,6 +173,99 @@ defmodule Ferricstore.Flow.HistoryProjectorRequestTest do
     refute HistoryProjector.durable?(ctx, 0, dir, 100)
   end
 
+  # Raft replay cannot bring these entries back: apply already moved the Flow
+  # on, so applying its command again writes no history.
+  test "a projector stopped with unflushed history hands it to its successor", %{
+    ctx: ctx,
+    dir: dir,
+    pid: pid
+  } do
+    for index <- 1..3,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    assert {:ok, 3} = HistoryProjector.pending_count(ctx, 0)
+
+    # Casts still in its mailbox when it stops.
+    :ok = :sys.suspend(pid)
+
+    for index <- 4..5,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    :ok = stop_supervised(HistoryProjector)
+
+    start_supervised!(
+      {HistoryProjector,
+       shard_index: 0, shard_data_path: dir, instance_ctx: ctx, recover_on_init: false}
+    )
+
+    assert :ok = HistoryProjector.flush(ctx, 0)
+    assert history_log_keys(dir) == Enum.map(1..5, &entry(&1).key)
+  end
+
+  test "a projector that crashes with unflushed history leaves it to its restart", %{
+    ctx: ctx,
+    dir: dir,
+    pid: pid
+  } do
+    for index <- 1..3,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    :ok = :sys.suspend(pid)
+
+    for index <- 4..5,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    ref = Process.monitor(pid)
+    :ok = :sys.terminate(pid, :simulated_crash)
+    assert_receive {:DOWN, ^ref, :process, ^pid, :simulated_crash}
+    assert history_log_keys(dir) == []
+
+    assert Ferricstore.Test.Eventually.eventually(fn ->
+             successor = Process.whereis(HistoryProjector.name(ctx, 0))
+
+             is_pid(successor) and successor != pid and
+               HistoryProjector.flush(ctx, 0) == :ok and
+               history_log_keys(dir) == Enum.map(1..5, &entry(&1).key)
+           end)
+  end
+
+  test "a projector started for another data directory drops a hand-over", %{
+    ctx: ctx,
+    dir: dir
+  } do
+    for index <- 1..2,
+        do: assert(:ok = HistoryProjector.enqueue_async(ctx, 0, [entry(index)], index))
+
+    :ok = stop_supervised(HistoryProjector)
+    other = dir <> "-other"
+    on_exit(fn -> Ferricstore.Test.LMDBFixture.cleanup_data_dir!(other) end)
+
+    start_supervised!(
+      {HistoryProjector,
+       shard_index: 0, shard_data_path: other, instance_ctx: ctx, recover_on_init: false}
+    )
+
+    assert :ok = HistoryProjector.flush(ctx, 0)
+    assert history_log_keys(other) == []
+    assert history_log_keys(dir) == []
+  end
+
+  defp history_log_keys(dir) do
+    {:ok, file_ids} = Ferricstore.Flow.HistoryProjector.Files.list(dir)
+
+    Enum.flat_map(file_ids, fn file_id ->
+      {:ok, keys} =
+        Ferricstore.Flow.HistoryProjector.Log.reduce_metadata_pages_buffered(
+          HistoryProjector.history_file_path(dir, file_id),
+          0,
+          [],
+          fn {key, _offset, _size, _expire_at_ms, _tombstone?}, acc -> [key | acc] end
+        )
+
+      Enum.reverse(keys)
+    end)
+  end
+
   defp entry(index) do
     id = "request-#{index}"
     event_ms = 1_000 + index

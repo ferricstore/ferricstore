@@ -33,11 +33,14 @@ defmodule Ferricstore.Flow.HistoryProjectorTest do
 
   use Ferricstore.Flow.HistoryProjectorTest.Sections.AsyncEnqueueRejectsAboveConfiguredPendingCapSoApplyFallBackSy
 
+  # A projector linked to the test process may be stopping already: it traps
+  # exits to hand unflushed history on.
   defp stop_if_alive(pid) do
     GenServer.stop(pid)
   catch
     :exit, :noproc -> :ok
     :exit, {:noproc, _call} -> :ok
+    :exit, reason -> if Process.alive?(pid), do: exit(reason), else: :ok
   end
 
   defp restore_env(key, nil), do: Application.delete_env(:ferricstore, key)

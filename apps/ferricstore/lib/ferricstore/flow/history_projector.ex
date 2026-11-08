@@ -19,6 +19,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   @retry_interval_ms 50
   @flush_drain_limit 16
+  @stop_enqueue_wait_ms 250
 
   @type entry :: %{
           required(:key) => binary(),
@@ -291,12 +292,24 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   @spec pending_count(map() | nil, non_neg_integer(), timeout()) ::
           {:ok, non_neg_integer()} | {:error, term()}
-  def pending_count(instance_ctx, shard_index, timeout \\ 1_000) do
+  def pending_count(instance_ctx, shard_index, timeout \\ 1_000),
+    do: call_pending(instance_ctx, shard_index, :pending_count, timeout)
+
+  @doc """
+  Pending entries that add history, leaving out the tombstones of entries
+  already removed: what a reader of the indexes cannot see yet.
+  """
+  @spec pending_history_count(map() | nil, non_neg_integer(), timeout()) ::
+          {:ok, non_neg_integer()} | {:error, term()}
+  def pending_history_count(instance_ctx, shard_index, timeout \\ 1_000),
+    do: call_pending(instance_ctx, shard_index, :pending_history_count, timeout)
+
+  defp call_pending(instance_ctx, shard_index, request, timeout) do
     projector = name(instance_ctx, shard_index)
 
     case Process.whereis(projector) do
       nil -> {:error, :not_started}
-      _pid -> GenServer.call(projector, :pending_count, timeout)
+      _pid -> GenServer.call(projector, request, timeout)
     end
   catch
     :exit, reason -> {:error, {:pending_count_exit, reason}}
@@ -382,6 +395,8 @@ defmodule Ferricstore.Flow.HistoryProjector do
   @impl true
   def init(opts) do
     Process.flag(:priority, :low)
+    # terminate/2 hands unflushed history on when the supervisor stops us.
+    Process.flag(:trap_exit, true)
 
     shard_index = Keyword.fetch!(opts, :shard_index)
     shard_data_path = Keyword.fetch!(opts, :shard_data_path)
@@ -405,6 +420,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
         Config.default_max_pending_entries()
       )
 
+    _ = Pending.take_hand_over(projector_name, shard_data_path)
     pending_counter = :atomics.new(1, signed: true)
     Pending.register_pending_counter(projector_name, pending_counter, max_pending_entries)
     projected_index = projected_index(instance_ctx, shard_index, shard_data_path)
@@ -536,6 +552,10 @@ defmodule Ferricstore.Flow.HistoryProjector do
     {:reply, {:ok, state.pending_count}, state}
   end
 
+  def handle_call(:pending_history_count, _from, state) do
+    {:reply, {:ok, Enum.count(state.pending, &(not history_tombstone?(&1)))}, state}
+  end
+
   def handle_call({:enqueue, entries}, _from, state) do
     case Pending.reserve_pending(state, length(entries)) do
       :ok ->
@@ -557,9 +577,57 @@ defmodule Ferricstore.Flow.HistoryProjector do
   end
 
   @impl true
-  def terminate(_reason, state) do
-    Pending.unregister_pending_counter(Map.get(state, :projector_name))
+  def terminate(_reason, %{projector_name: projector} = state) do
+    hand_over_unflushed(state)
+    Pending.unregister_pending_counter(projector)
     :ok
+  end
+
+  def terminate(_reason, _state), do: :ok
+
+  # Unflushed history lives only in this process: its pending entries and the
+  # enqueue casts still in its mailbox. Raft replay does not bring them back,
+  # since applying a command again over the state it left writes no history,
+  # so they go to the overflow queue for the next projector of this shard to
+  # drain. Their row is taken before the counter is unregistered, so it drains
+  # ahead of anything enqueued from then on. (A node that stops closes WARaft
+  # first, which flushes us before we get here.)
+  defp hand_over_unflushed(state) do
+    projector = state.projector_name
+
+    with {:ok, sequence} <- Pending.append_overflow(projector, []) do
+      Pending.unregister_pending_counter(projector)
+      entries = Enum.reverse(state.pending, receive_enqueued(state))
+      Pending.hand_over(projector, state.shard_data_path, sequence, entries)
+    end
+  rescue
+    error ->
+      Logger.error(
+        "Flow history projector shard_#{state.shard_index}: unflushed history hand-over failed: #{inspect(error)}"
+      )
+  end
+
+  # Enqueuers reserve on the pending counter before they cast, so the counter
+  # tells how many entries are still on their way here.
+  defp receive_enqueued(state) do
+    deadline = System.monotonic_time(:millisecond) + @stop_enqueue_wait_ms
+    receive_enqueued(state, deadline, 0, [])
+  end
+
+  defp receive_enqueued(state, deadline, received, acc) do
+    expected = max(:atomics.get(state.pending_counter, 1) - state.pending_count, 0)
+
+    timeout =
+      if received < expected,
+        do: max(deadline - System.monotonic_time(:millisecond), 0),
+        else: 0
+
+    receive do
+      {:"$gen_cast", {:enqueue_reserved, entries}} ->
+        receive_enqueued(state, deadline, received + length(entries), [entries | acc])
+    after
+      timeout -> acc |> Enum.reverse() |> Enum.concat()
+    end
   end
 
   @impl true
@@ -901,7 +969,80 @@ defmodule Ferricstore.Flow.HistoryProjector do
 
   defp flush_outstanding_request(state), do: state
 
+  # Tombstone entries (`%{key: key, tombstone: true}`) delete a history entry
+  # from the log, so recovery, which reads the log again, leaves it deleted.
+  # Runs of them and of new entries are written in the order they came.
   defp do_project(
+         instance_ctx,
+         shard_index,
+         shard_data_path,
+         entries,
+         requested_index,
+         keydir_override
+       ) do
+    if Enum.any?(entries, &history_tombstone?/1) do
+      entries
+      |> Enum.chunk_by(&history_tombstone?/1)
+      |> Enum.reduce_while(:ok, fn [first | _] = run, :ok ->
+        result =
+          if history_tombstone?(first) do
+            keydir = keydir_override || keydir(instance_ctx, shard_index)
+            append_history_tombstones(instance_ctx, shard_index, shard_data_path, keydir, run)
+          else
+            project_entries(instance_ctx, shard_index, shard_data_path, run, nil, keydir_override)
+          end
+
+        if result == :ok, do: {:cont, :ok}, else: {:halt, result}
+      end)
+      |> case do
+        :ok ->
+          project_entries(
+            instance_ctx,
+            shard_index,
+            shard_data_path,
+            [],
+            requested_index,
+            keydir_override
+          )
+
+        error ->
+          error
+      end
+    else
+      project_entries(
+        instance_ctx,
+        shard_index,
+        shard_data_path,
+        entries,
+        requested_index,
+        keydir_override
+      )
+    end
+  end
+
+  defp history_tombstone?(%{tombstone: true}), do: true
+  defp history_tombstone?(_entry), do: false
+
+  defp append_history_tombstones(instance_ctx, shard_index, shard_data_path, keydir, tombstones) do
+    with {:ok, _file_id, file_path} <- history_append_file(shard_data_path, keydir),
+         :ok <-
+           Trim.append_tombstones(file_path, Enum.map(tombstones, & &1.key), %{
+             sync_history_log_before_publish: &Storage.sync_history_log_before_publish/1
+           }) do
+      clear_disk_pressure(instance_ctx, shard_index)
+      :ok
+    else
+      error ->
+        set_disk_pressure(instance_ctx, shard_index)
+        if match?({:error, _reason}, error), do: error, else: {:error, error}
+    end
+  rescue
+    error ->
+      set_disk_pressure(instance_ctx, shard_index)
+      {:error, {:history_projection_exception, error}}
+  end
+
+  defp project_entries(
          instance_ctx,
          shard_index,
          shard_data_path,
@@ -925,7 +1066,7 @@ defmodule Ferricstore.Flow.HistoryProjector do
       {:error, {:history_projection_exception, error}}
   end
 
-  defp do_project(
+  defp project_entries(
          instance_ctx,
          shard_index,
          shard_data_path,
