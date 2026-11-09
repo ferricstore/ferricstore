@@ -116,10 +116,18 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.PublicApi do
 
       @doc false
       @spec starting?() :: boolean()
-      def starting?, do: :persistent_term.get(@starting_key, false) == true
+      def starting? do
+        case :persistent_term.get(@starting_key, nil) do
+          starter when is_pid(starter) -> Process.alive?(starter)
+          _not_starting -> false
+        end
+      end
 
+      # The fence belongs to the process running the start. Killed mid-start,
+      # it runs no `after`, and its fence would refuse every write until the
+      # next start.
       defp with_startup_write_fence(startup_budget, fun) when is_function(fun, 0) do
-        :persistent_term.put(@starting_key, true)
+        :persistent_term.put(@starting_key, self())
 
         try do
           with_startup_storage_timeout(startup_budget, fun)

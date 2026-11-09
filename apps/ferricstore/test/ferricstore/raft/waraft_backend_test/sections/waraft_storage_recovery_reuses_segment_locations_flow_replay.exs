@@ -708,6 +708,53 @@ defmodule Ferricstore.Raft.WARaftBackendTest.Sections.WaraftStorageRecoveryReuse
         end
       end
 
+      test "a startup caller killed mid-start takes its write fence with it", %{root: root} do
+        fence_root = Path.join(root, "fence-caller-exit")
+        Ferricstore.DataDir.ensure_layout!(fence_root, 1)
+        Ferricstore.Store.ActiveFile.init(1)
+        ctx = build_ctx(fence_root, shard_count: 1)
+        parent = self()
+        handler_id = {:fence_caller_exit, make_ref()}
+
+        # Telemetry handlers run in the starter, so this one holds it mid-start.
+        :ok =
+          :telemetry.attach(
+            handler_id,
+            [:ferricstore, :waraft, :backend, :startup_phase],
+            fn _event, _measurements, metadata, _config ->
+              if metadata.phase == :ensure_storage_runtime do
+                send(parent, {:starter_held, self()})
+
+                receive do
+                  :never -> :ok
+                end
+              end
+            end,
+            nil
+          )
+
+        starter =
+          spawn(fn ->
+            WARaftBackend.start(ctx, log_module: :ferricstore_waraft_spike_segment_log)
+          end)
+
+        try do
+          assert_receive {:starter_held, ^starter}, 5_000
+          assert WARaftBackend.starting?()
+
+          monitor = Process.monitor(starter)
+          Process.exit(starter, :kill)
+          assert_receive {:DOWN, ^monitor, :process, ^starter, :killed}, 2_000
+
+          refute WARaftBackend.starting?()
+        after
+          :telemetry.detach(handler_id)
+          Process.exit(starter, :kill)
+          WARaftBackend.stop()
+          FerricStore.Instance.cleanup(ctx.name)
+        end
+      end
+
       @tag :startup_preopen
       test "four preopen workers require six GiB and four schedulers" do
         alias Ferricstore.Raft.WARaftBackend.StartupPreopen
