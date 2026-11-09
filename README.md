@@ -185,9 +185,51 @@ the next state.
 The SDKs' registration API looks like Temporal's: workflow types, handlers,
 `start`, workers, and signals, and `ctx.step()` records an activity's result as
 Temporal records one. The difference is where a Flow resumes after a crash: at
-its last committed state, not inside a function. If a handler runs two steps and
-its worker dies between them, the Flow resumes in the first step's target
-state, and that state needs its own handler.
+its last committed state, not inside a function. A handler can still run
+several activities in a row. Give each one a `ctx.step()` whose target is the
+handler's own state. If the worker dies between two steps, the handler runs
+again from the top: each committed step returns its stored result without
+running again, and the rest run for the first time. A step's name identifies its
+stored result, so give each call its own name, with the iteration in it inside a
+loop.
+
+### Answers to the usual concerns
+
+**"It is a young `0.x` project."** It is, and
+[Project Status](#project-status) says what that means and how to adopt it
+safely. The usual path is to pin exact versions, port one queue-shaped workflow,
+and run it beside Temporal.
+
+**"Every `await` becomes a named state."** Only the waits do. Consecutive
+activity calls stay in one handler as `ctx.step()` calls, as described above.
+A named state is needed only where the Flow waits for something (a timer, a
+signal, child Flows) or hands work to another service.
+
+**"Handlers can run more than once."** So do Temporal's: activities run at
+least once, and workflow code is replayed whenever a worker rebuilds its state.
+In FerricFlow a committed step never runs again and an outcome commits only
+once, because every commit is fenced by the claim's lease and fencing token.
+What can repeat is the activity a worker was running when it died. Give such
+calls an idempotency key, as Temporal recommends for activities, or record them
+in FerricStore's effect ledger (`FLOW.EFFECT.*`).
+
+**"It is new infrastructure: a Raft cluster on the BEAM."** It is one container
+image with no external database or broker. Run one node, or three for high
+availability. Operating it does not require Elixir; see
+[Running it](#running-it). A self-hosted Temporal cluster needs its services
+plus a database, and often Elasticsearch.
+
+**"You lose Temporal's tooling."** The operations dashboard replaces the
+Temporal UI, and the [`ferric` CLI](#command-line-tools) replaces the Temporal
+CLI. Tests skip time by passing an explicit current time to claims; see
+[Testing workflows](#testing-workflows). Replay debugging and replay tests are
+not needed; see [Why there is no replay](#why-there-is-no-replay).
+
+**"Fan-in is unproven in the TypeScript SDK."** `waitForChildren()` and
+`childResults()` shipped in TypeScript SDK 0.15.0, and Python has
+`ctx.wait_for_children()` and `child_results()`. Both SDKs' CI runs their
+fan-out examples against a live server on every change. Fan-in needs server
+`0.11.19` or newer.
 
 ### Which one fits
 
@@ -196,15 +238,15 @@ state, and that state needs its own handler.
 | Queues, retries, and pipelines of a few steps | FerricFlow |
 | Processes whose steps run in different services or languages | FerricFlow |
 | Many short workflows that you query by state, attribute, or partition | FerricFlow |
-| Long functions with many sequential `await`s, loops over `await`s, or deep branching | Temporal |
-| Teams that depend on Temporal's ecosystem: its UI, time-skipping test server, and replay debugging | Temporal |
+| Long functions that interleave many waits (timers, signals, child results) with loops and branching | Temporal |
+| Teams invested in Temporal Cloud or in tooling built around Temporal | Temporal |
 
 ### Concepts
 
 | Temporal | FerricFlow |
 | --- | --- |
 | Workflow function | Workflow type with one handler per named state |
-| Activity call | Ordinary code in a handler; `ctx.step()` stores its result with the move to the next state |
+| Activity call | Ordinary code in a handler; `ctx.step()` stores its result so a rerun of the handler does not call it again |
 | Local variables across `await` | Named values on the transition, read back with `ctx.value()` |
 | Child workflows, waiting for all of them | Child groups: the parent waits without a lease and reads `child_results` |
 | Signals | `FLOW.SIGNAL`: durable, idempotent, state-guarded, optionally moving the Flow |
@@ -220,10 +262,43 @@ state, and that state needs its own handler.
 | Temporal UI and CLI | The operations dashboard and the [`ferric` CLI](https://github.com/ferricstore/command-line) |
 | Temporal cluster and its database | One FerricStore node, or three for high availability; no external database |
 
+### Why there is no replay
+
+Temporal keeps a workflow's progress in the function's local variables and call
+stack, which live only in a worker's memory. To rebuild them after a crash, or
+on another worker, it runs the function again against the event history. Most
+of Temporal's rules and tools exist because of that replay:
+
+- workflow code must be deterministic: no direct clock reads, random numbers,
+  or I/O;
+- changing code under running workflows needs `patched()` or versioning;
+- replay tests check that new code still matches old histories;
+- long histories need `continueAsNew`;
+- debugging a past run means replaying it.
+
+FerricFlow stores the progress itself. Every commit writes the Flow's state, its
+named values, and the results of its steps. A worker that picks a Flow up reads
+them; it never runs earlier code to rebuild them. So:
+
+- **Handlers are ordinary code.** They can read the clock, generate random ids,
+  and call services directly.
+- **New code applies to running Flows on their next claim.** Deploy it
+  whenever you like. Keep a handler for every state that running Flows can
+  still be in, and keep step names stable: a renamed step runs again.
+- **There is nothing to replay-test and no history to outgrow.** History is an
+  audit log; resuming a Flow never reads it.
+- **Debugging reads the record instead of rebuilding it.** History shows every
+  transition, retry and its error, signal, and child event. The Flow's current
+  values are one `FLOW.GET` away. After fixing a bug, rewind the Flow to an
+  earlier history event where it was waiting in a state (`FLOW.REWIND`, or
+  Rewind on the dashboard's Flow page). It returns to that event's state and
+  values, and the next claim runs the fixed code from there.
+
 ### What porting costs
 
-- **The orchestration is rewritten, not ported.** Each `await` that must
-  survive a crash becomes a named state. Activities stay ordinary functions.
+- **The orchestration is rewritten, not ported.** Each wait (a timer, a
+  signal, child Flows) becomes a named state; consecutive activity calls stay in
+  one handler as steps. Activities stay ordinary functions.
   The TypeScript SDK's
   [`examples/tenant-sync.ts`](https://github.com/ferricstore/ferricstore-typescript/blob/main/examples/tenant-sync.ts)
   ports a Temporal workflow that runs integrations in parallel, waits for all of
@@ -269,7 +344,7 @@ image in CI and point the SDK at it.
   `nowMs`, or pass `now_ms` to Python's `claim_due()`.
 
 There is no equivalent of Temporal's replay test, because there is no replay
-determinism to protect.
+determinism to protect; see [Why there is no replay](#why-there-is-no-replay).
 
 ### Inspecting and debugging
 
