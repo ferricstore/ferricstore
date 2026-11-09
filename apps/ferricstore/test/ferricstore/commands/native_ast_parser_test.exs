@@ -157,6 +157,43 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
   end
 
+  test "Flow item commands read an option value spelled ITEMS as a value" do
+    assert {:ok, "FLOW.SPAWN_CHILDREN", _args,
+            {:flow_spawn_children, "parent",
+             [{"child", [type: "child-type", payload: "payload"]}], spawn_opts}, _keys} =
+             NativeAstParser.parse("FLOW.SPAWN_CHILDREN", [
+               "parent",
+               "GROUP",
+               "items",
+               "FENCING",
+               "1",
+               "ITEMS",
+               "child",
+               "child-type",
+               "payload"
+             ])
+
+    assert spawn_opts[:group_id] == "items"
+
+    assert {:ok, "FLOW.CREATE_MANY", _args,
+            {:flow_create_many, "tenant", [{:id, "flow-a", :payload, "payload-a"}], create_opts},
+            _keys} =
+             NativeAstParser.parse("FLOW.CREATE_MANY", [
+               "tenant",
+               "TYPE",
+               "items",
+               "ATTRIBUTE",
+               "source",
+               "ITEMS",
+               "ITEMS",
+               "flow-a",
+               "payload-a"
+             ])
+
+    assert create_opts[:type] == "items"
+    assert create_opts[:attributes] == %{"source" => "ITEMS"}
+  end
+
   test "generic Flow command families expose their effective ACL scopes" do
     for {command, args, expected_keys} <- [
           {"FLOW.STEP_CONTINUE", ["tenant:a:flow"], ["tenant:a:flow"]},

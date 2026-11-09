@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A text Flow item command (`FLOW.SPAWN_CHILDREN`, `FLOW.CREATE_MANY`, and the
+  `*_MANY` terminal commands, as sent over HTTP) no longer fails when an option
+  value is spelled `items`. The parser ended the options at the first token
+  spelled `ITEMS`, so `GROUP items` or `TYPE items` lost its value and the
+  command failed with `ERR unsupported command AST`. `ITEMS` now ends the
+  options only where an option name is expected.
+
 - Deleting members of a hash, set or sorted set past the promotion threshold
   (100 entries by default), or deleting the whole key, no longer leaves the
   members' keys in the shard's WARaft storage process. The keys were marked

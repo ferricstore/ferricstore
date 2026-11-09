@@ -2372,13 +2372,38 @@ defmodule Ferricstore.Commands.NativeAstParser do
     |> String.replace("_", ".")
   end
 
-  defp split_items(args) do
-    case Enum.split_while(args, &(String.upcase(&1) != "ITEMS")) do
-      {_before, []} -> {:error, "ERR flow items are required"}
-      {before_items, [_items | raw_items]} when raw_items != [] -> {:ok, before_items, raw_items}
-      {_before, _} -> {:error, "ERR syntax error"}
+  # ITEMS ends the options only where an option name is expected, so an option
+  # value spelled "items" (a group, type, or attribute) stays a value.
+  defp split_items(args), do: split_items(args, [])
+
+  defp split_items([], _options), do: {:error, "ERR flow items are required"}
+
+  defp split_items([name | rest], options) do
+    case {String.upcase(name), rest} do
+      {"ITEMS", []} ->
+        {:error, "ERR syntax error"}
+
+      {"ITEMS", raw_items} ->
+        {:ok, Enum.reverse(options), raw_items}
+
+      {option, rest} ->
+        width = flow_option_value_count(option)
+
+        case Enum.split(rest, width) do
+          {values, tail} when length(values) == width ->
+            split_items(tail, Enum.reverse(values, [name | options]))
+
+          _short ->
+            {:error, "ERR syntax error"}
+        end
     end
   end
+
+  # Matches the option shapes parse_flow_options/3 reads.
+  defp flow_option_value_count(option) when option in ~w(ATTRIBUTE ATTRIBUTE_MERGE STATE_META),
+    do: 2
+
+  defp flow_option_value_count(_option), do: 1
 
   defp create_many_item_width(true, true), do: 2
   defp create_many_item_width(true, false), do: 3
