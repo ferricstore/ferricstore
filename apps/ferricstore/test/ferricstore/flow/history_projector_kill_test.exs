@@ -39,7 +39,7 @@ defmodule Ferricstore.Flow.HistoryProjectorKillTest do
 
     # Newer history on the shard is written past the lost one.
     create!(later, later_partition)
-    flush!()
+    write_past_loss!(ctx, shard)
 
     :ok = restart_as_new_process(isolated, ctx.shard_count)
     flush!()
@@ -98,6 +98,19 @@ defmodule Ferricstore.Flow.HistoryProjectorKillTest do
 
     assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
     ctx
+  end
+
+  # Until the node restarts, the shard that lost history publishes no index
+  # past the loss, so its flush fails once WARaft asks for one. It still
+  # writes its newer history: then it has none left to write.
+  defp write_past_loss!(ctx, lost_shard) do
+    for shard <- 0..(ctx.shard_count - 1), shard != lost_shard do
+      assert :ok = HistoryProjector.flush(ctx, shard, 30_000)
+    end
+
+    assert HistoryProjector.flush(ctx, lost_shard, 30_000) in [:ok, {:error, :flush_failed}]
+    assert {:ok, 0} = HistoryProjector.pending_count(ctx, lost_shard)
+    assert :ok = Ferricstore.Flow.LMDBWriter.flush_all(ctx.name, ctx.shard_count, 30_000)
   end
 
   # WARaft asks the projector to write whenever it moves its release cursor,
