@@ -1,7 +1,8 @@
 defmodule Ferricstore.Commands.NativeAstParserTest do
   use ExUnit.Case, async: true
 
-  alias Ferricstore.Commands.{Extension, KeyDiscovery, NativeAstParser}
+  alias Ferricstore.Commands.{Dispatcher, Extension, KeyDiscovery, NativeAstParser}
+  alias Ferricstore.Test.MockStore
   alias FerricstoreServer.Acl.CommandCategories
 
   @protocol_control_commands ~w(
@@ -192,6 +193,28 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
 
     assert create_opts[:type] == "items"
     assert create_opts[:attributes] == %{"source" => "ITEMS"}
+  end
+
+  test "malformed Flow item commands return the parser's error" do
+    for {command, args} <- [
+          {"FLOW.SPAWN_CHILDREN",
+           ["parent", "GROUP", "g", "BOGUS", "x", "ITEMS", "child", "type", "payload"]},
+          {"FLOW.SPAWN_CHILDREN", ["parent", "GROUP", "g", "ITEMS", "child", "type"]},
+          {"FLOW.CREATE_MANY", ["tenant", "TYPE", "t", "ITEMS", "flow-a", "payload-a", "x"]},
+          {"FLOW.COMPLETE_MANY", ["tenant", "BOGUS", "x", "ITEMS", "flow-a", "lease", "1"]},
+          {"FLOW.CANCEL_MANY", ["tenant", "ITEMS", "flow-a"]},
+          {"FLOW.TRANSITION_MANY", ["tenant", "a", "b", "ITEMS", "flow-a", "lease"]}
+        ] do
+      result =
+        case NativeAstParser.parse(command, args) do
+          {:ok, _name, _args, ast, _keys} -> Dispatcher.dispatch_ast(ast, MockStore.make())
+          {:error, _reason} = error -> error
+        end
+
+      assert {:error, reason} = result, "#{command} #{inspect(args)}"
+      assert reason =~ "ERR ", "#{command} #{inspect(args)}"
+      refute reason =~ "unsupported command AST", "#{command} #{inspect(args)}"
+    end
   end
 
   test "generic Flow command families expose their effective ACL scopes" do

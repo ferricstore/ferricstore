@@ -817,6 +817,14 @@ defmodule Ferricstore.Commands.Dispatcher do
   def dispatch_ast({tag, args}, _store) when is_atom(tag) and is_list(args),
     do: wrong_arity_ast(tag)
 
+  # A parser that cannot build a command returns its error as the last element.
+  def dispatch_ast(ast, _store) when is_tuple(ast) and tuple_size(ast) >= 2 do
+    case elem(ast, tuple_size(ast) - 1) do
+      {:error, reason} when is_binary(reason) -> {:error, reason}
+      _other -> {:error, "ERR unsupported command AST"}
+    end
+  end
+
   def dispatch_ast(_ast, _store), do: {:error, "ERR unsupported command AST"}
 
   defp safe_ferricstore_metrics(args) do

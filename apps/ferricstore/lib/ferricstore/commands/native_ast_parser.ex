@@ -2281,10 +2281,17 @@ defmodule Ferricstore.Commands.NativeAstParser do
       auto? = String.upcase(partition) == "AUTO"
       item_width = create_many_item_width(mixed?, shared_payload?)
 
-      items =
-        parse_fixed_items(raw_items, item_width, &create_many_item(&1, mixed?, shared_payload?))
+      case parse_fixed_items(
+             raw_items,
+             item_width,
+             &create_many_item(&1, mixed?, shared_payload?)
+           ) do
+        items when is_list(items) ->
+          {:flow_create_many, if(mixed? or auto?, do: nil, else: partition), items, opts}
 
-      {:flow_create_many, if(mixed? or auto?, do: nil, else: partition), items, opts}
+        {:error, reason} ->
+          {:flow_create_many, partition, {:error, reason}}
+      end
     else
       {:error, reason} -> {:flow_create_many, partition, {:error, reason}}
       error -> {:flow_create_many, partition, error}
@@ -2297,8 +2304,11 @@ defmodule Ferricstore.Commands.NativeAstParser do
       mixed? = String.upcase(hd(raw_items)) == "MIXED"
       item_values = if mixed?, do: tl(raw_items), else: raw_items
       width = if mixed?, do: 4, else: 3
-      items = parse_fixed_items(item_values, width, &spawn_child_item(&1, mixed?))
-      {:flow_spawn_children, parent, items, opts}
+
+      case parse_fixed_items(item_values, width, &spawn_child_item(&1, mixed?)) do
+        items when is_list(items) -> {:flow_spawn_children, parent, items, opts}
+        {:error, reason} -> {:flow_spawn_children, parent, {:error, reason}}
+      end
     else
       {:error, reason} -> {:flow_spawn_children, parent, {:error, reason}}
       error -> {:flow_spawn_children, parent, error}
