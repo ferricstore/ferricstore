@@ -29,24 +29,26 @@ defmodule Ferricstore.Commands.LatencyTest do
   end
 
   test "spikes over the threshold are sampled per event", %{d: d} do
-    :ok = d.("CONFIG", ["SET", "latency-monitor-threshold", "2"])
+    # The test's own commands are sampled too, so the threshold and spikes
+    # are seconds: a command this slow on a loaded runner would be news.
+    :ok = d.("CONFIG", ["SET", "latency-monitor-threshold", "2000"])
 
-    assert ["latency-monitor-threshold", "2"] ==
+    assert ["latency-monitor-threshold", "2000"] ==
              d.("CONFIG", ["GET", "latency-monitor-threshold"])
 
     now = System.os_time(:second)
     # Under the threshold: not sampled.
-    LatencyMonitor.record("SET", 1_000, now - 20)
+    LatencyMonitor.record("SET", 1_000_000, now - 20)
     # Spikes in one second keep that second's worst, as Redis's samples do.
-    LatencyMonitor.record("SET", 5_000, now - 10)
-    LatencyMonitor.record("GET", 3_000, now - 10)
-    LatencyMonitor.record("GET", 3_000, now)
+    LatencyMonitor.record("SET", 5_000_000, now - 10)
+    LatencyMonitor.record("GET", 3_000_000, now - 10)
+    LatencyMonitor.record("GET", 3_000_000, now)
     LatencyMonitor.sync()
 
-    assert [["command", ^now, 3, 5]] = d.("LATENCY", ["LATEST"])
-    assert [[now - 10, 5], [now, 3]] == d.("LATENCY", ["HISTORY", "command"])
+    assert [["command", ^now, 3000, 5000]] = d.("LATENCY", ["LATEST"])
+    assert [[now - 10, 5000], [now, 3000]] == d.("LATENCY", ["HISTORY", "command"])
 
-    assert d.("LATENCY", ["GRAPH", "command"]) =~ "command - high 5 ms, low 3 ms"
+    assert d.("LATENCY", ["GRAPH", "command"]) =~ "command - high 5000 ms, low 3000 ms"
     assert d.("LATENCY", ["DOCTOR"]) =~ "command"
 
     assert {:error, "ERR No samples available for event 'nope'"} ==
