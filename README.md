@@ -108,12 +108,12 @@ All five native SDK release lines retain FerricStore `0.11.4` as their
 minimum server version and negotiate the Stream mode-34 producer fast path when
 the server advertises it. Native wire protocol v1 is unchanged.
 
-## Beta Status
+## Project Status
 
-FerricStore is currently a `0.x` beta release. The core durability path, Flow
-commands, precompiled NIFs, Docker image, and SDKs are published and usable, but
-public APIs, command details, operational defaults, and storage/projection
-internals may still change before `1.0`.
+FerricStore is a `0.x` beta and a young project: its first commit was in March
+2026, and a small team has shipped about 80 releases since. Public APIs, command
+details, operational defaults, and storage/projection internals may still
+change before `1.0`.
 
 Beta does not mean lightly tested. The project is thoroughly tested across the
 durability path, FerricFlow workflow commands, FQL1 and index lifecycle, durable
@@ -121,10 +121,29 @@ schedules, governance, Rust NIFs, storage behavior, security, dashboard/API
 surfaces, the embedded API, published SDK integration suites, restart/recovery,
 cluster/quorum behavior, benchmarks, and longer soak runs.
 
+What that means for adopting it today:
+
+- **Pin exact versions** of the server and SDKs, and test upgrades on your data
+  model. The [changelog](CHANGELOG.md) records each release.
+- **Upgrades are rolling.** Upgrade nodes one at a time. Behavior that older
+  releases would apply differently stays off until you raise the cluster's
+  feature level, so a mixed-version cluster applies every write the same way.
+  See [Upgrading a Cluster](guides/deployment.md#upgrading-a-cluster).
+- **SDKs are tested against servers.** Each SDK's CI runs its live suite
+  against a current server release; the Python, TypeScript, Go, and Elixir
+  SDKs also run it against the oldest supported server, `0.11.4`.
+- **Data can move out.** `FerricStore.export/1` and `FerricStore.restore/1`
+  copy every key, Flow, schedule, policy, and value between clusters; stop
+  writers first for a consistent copy. See
+  [Moving Data to Format 2](guides/deployment.md#moving-data-to-format-2).
+- **Benchmarks are the project's own.** [Benchmarks](docs/benchmarks.md) lists
+  the hardware and workload shapes, and the scripts live in the
+  [Python SDK](https://github.com/ferricstore/ferricstore-python) repository so
+  you can rerun them on your own hardware.
+
 Use it today for development, benchmarks, pilots, and controlled production
-experiments. For critical production workloads, pin exact versions, test
-upgrades on your data model, and expect compatibility guarantees to harden with
-the `1.0` release line.
+experiments. Expect compatibility guarantees to harden with the `1.0` release
+line.
 
 ## What Is A Flow?
 
@@ -154,12 +173,134 @@ Queue workers usually process one state and complete/fail/retry. Workflow worker
 
 A long workflow does not need to live in one codebase or one workflow runtime. One service can claim `fraud_check`, another can claim `charge_card`, and another can claim `send_email`; the work moves by durable state transition instead of ad hoc queue messages, retry tables, and status tables.
 
+## Coming From Temporal
+
+FerricFlow is a durable state machine, not a durable-execution engine. Temporal
+records a workflow function's history and replays the function to rebuild its
+local variables. FerricFlow keeps one record per Flow with its current state
+and never replays code: a worker claims a state, runs that state's handler, and
+commits the handler's outcome. Any worker, in any SDK language, can then run
+the next state.
+
+The SDKs' registration API looks like Temporal's: workflow types, handlers,
+`start`, workers, and signals, and `ctx.step()` records an activity's result as
+Temporal records one. The difference is where a Flow resumes after a crash: at
+its last committed state, not inside a function. If a handler runs two steps and
+its worker dies between them, the Flow resumes in the first step's target
+state, and that state needs its own handler.
+
+### Which one fits
+
+| Workload | Better fit |
+| --- | --- |
+| Queues, retries, and pipelines of a few steps | FerricFlow |
+| Processes whose steps run in different services or languages | FerricFlow |
+| Many short workflows that you query by state, attribute, or partition | FerricFlow |
+| Long functions with many sequential `await`s, loops over `await`s, or deep branching | Temporal |
+| Teams that depend on Temporal's ecosystem: its UI, time-skipping test server, and replay debugging | Temporal |
+
+### Concepts
+
+| Temporal | FerricFlow |
+| --- | --- |
+| Workflow function | Workflow type with one handler per named state |
+| Activity call | Ordinary code in a handler; `ctx.step()` stores its result with the move to the next state |
+| Local variables across `await` | Named values on the transition, read back with `ctx.value()` |
+| Child workflows, waiting for all of them | Child groups: the parent waits without a lease and reads `child_results` |
+| Signals | `FLOW.SIGNAL`: durable, idempotent, state-guarded, optionally moving the Flow |
+| Queries | `FLOW.GET` and FQL1 `FLOW.QUERY` |
+| Search attributes | Policy-indexed attributes, queried with FQL1 |
+| Durable timers and `sleep` | A transition with `run_at_ms` |
+| Retry policies | Type and state retry policies with backoff and exhaustion routing |
+| Activity heartbeats and timeouts | Leases with fencing tokens; a handler extends its lease with `extend_lease`, and TypeScript workers renew it automatically |
+| Workflow execution timeout | `MAX_ACTIVE_MS` |
+| Schedules and cron workflows | Durable cron, interval, and one-shot schedules with overlap and catch-up policies |
+| `continueAsNew` | Not needed: history is never replayed, and it is capped per Flow (100,000 events by default, oldest trimmed) |
+| `patched()` and workflow versioning | Not needed for code changes; keep a handler for every state that in-flight Flows can still be in |
+| Temporal UI and CLI | The operations dashboard and the [`ferric` CLI](https://github.com/ferricstore/command-line) |
+| Temporal cluster and its database | One FerricStore node, or three for high availability; no external database |
+
+### What porting costs
+
+- **The orchestration is rewritten, not ported.** Each `await` that must
+  survive a crash becomes a named state. Activities stay ordinary functions.
+  The TypeScript SDK's
+  [`examples/tenant-sync.ts`](https://github.com/ferricstore/ferricstore-typescript/blob/main/examples/tenant-sync.ts)
+  ports a Temporal workflow that runs integrations in parallel, waits for all of
+  them, and branches twice on their results; the Temporal original is in the
+  file's header.
+- **Handler code runs at least once; committed outcomes apply once.** A worker
+  can stop after an activity ran but before its outcome was committed, so
+  activities need idempotency keys, as Temporal activities do. Every outcome is
+  fenced by the claim's lease and fencing token, so a stale or duplicate worker
+  cannot apply a second transition, and a step whose result was committed is
+  not run again.
+- **There is no replay history to outgrow.** History is an audit log, capped
+  per Flow and never replayed, so a long-running Flow does not slow down.
+  Requests are still bounded: 16 MB per native frame by default
+  (`native_max_frame_bytes`), and reads return payloads inline up to 64 KiB
+  (`flow_payload_return_max_bytes`). Keep large data in object storage and store
+  a reference in a named value.
+- **Start with one workflow.** Port a queue-shaped workflow first and run it
+  beside the existing ones; both systems can run side by side.
+
+### Running it
+
+FerricStore is one container image with no external database or broker. Run
+one node for development and small deployments, or three nodes for high
+availability (writes commit through a Raft quorum). Operating it does not
+require Elixir: configuration is environment variables, metrics are
+Prometheus-compatible, and the dashboard, health probes, and doctor diagnostics
+cover day-to-day operation. A few administrative actions, such as export and
+restore, are run as Elixir expressions through `bin/ferricstore rpc`; the
+[Deployment](guides/deployment.md) guide gives each one verbatim.
+
+### Testing workflows
+
+Test against a real single-node server rather than a mock: start the Docker
+image in CI and point the SDK at it.
+
+- Drive workers yourself with `run_once()` (`runOnce()` in TypeScript), which
+  claims one batch, runs it, and returns.
+- Pass activities into the function that defines the workflow, so tests can
+  give it fakes that record their calls.
+- Skip time instead of waiting. Claims accept an explicit current time, so a
+  test fires a one-hour timer immediately: create the TypeScript worker with
+  `nowMs`, or pass `now_ms` to Python's `claim_due()`.
+
+There is no equivalent of Temporal's replay test, because there is no replay
+determinism to protect.
+
+### Inspecting and debugging
+
+Every Flow keeps its history: each transition, retry, signal, child event, and
+terminal outcome. Read it with an SDK's `history()`, the dashboard's Flow page,
+or `ferric workflow history <id>`. The dashboard also shows a Flow's current
+state, values, lineage, and signals, and runs FQL1 queries across Flows.
+
 ## Command-Line Tools
 
-FerricStore ships operational Mix tasks for source checkouts and embedded
+The [`ferric` CLI](https://github.com/ferricstore/command-line) works against
+a running server over the native protocol. It is non-interactive, for terminals,
+scripts, and CI:
+
+```bash
+export FERRIC_URL=ferric://127.0.0.1:6388 FERRIC_USERNAME=operator FERRIC_PASSWORD_FILE=/run/secrets/ferric
+ferric workflow describe order-1
+ferric workflow history order-1
+ferric workflow query \
+  'FROM runs WHERE partition_key = @partition AND type = @type ORDER BY updated_at_ms DESC LIMIT 20 RETURN RECORDS' \
+  --param partition=tenant-a --param type=order
+ferric workflow schedule list
+```
+
+The CLI always authenticates, so it needs an ACL user with a password (see
+[Security](guides/security.md)). `ferric auth login` saves a profile instead of
+using environment variables.
+
+FerricStore also ships operational Mix tasks for source checkouts and embedded
 Elixir deployments. These tasks start and operate on the default local
-FerricStore application; they are not a standalone shell for a remote native
-TCP server. Use a published SDK or the operations dashboard for remote access.
+FerricStore application; they are not a shell for a remote server.
 
 | Task | Purpose |
 | --- | --- |
@@ -424,30 +565,49 @@ orders.worker(claim_values=["customer"]).run(handle_customer_step)
 
 ### Fanout
 
-A parent Flow can spawn child Flows. Children run independently with their own state, retries, leases, history, and terminal status; parent/child links are queryable later.
+A parent Flow can spawn child Flows and wait for them. Children run
+independently with their own state, retries, leases, history, and terminal
+status; parent/child links are queryable later.
 
 ```python
-from ferricstore import ChildSpec, WorkflowClient, transition
+from ferricstore import ChildSpec, WorkflowClient, complete
 
 client = WorkflowClient.from_url("ferric://127.0.0.1:6388")
 campaign = client.workflow(type="campaign", initial_state="dispatch")
 
 
 @campaign.state("dispatch")
-def dispatch(job):
-    job.flow.spawn_children(
+def dispatch(ctx):
+    # Creating the children and parking the parent is one fenced command.
+    # The parent holds no lease or worker while its children run.
+    ctx.wait_for_children(
         [
             ChildSpec(
-                id=f"device:{device_id}:cmd:{job.id}",
+                id=f"device:{device_id}:cmd:{ctx.id}",
                 type="device-command",
                 payload=device_id.encode(),
             )
             for device_id in device_ids
         ],
-        wait_state="done",
+        group_id="devices",
+        wait_state="waiting_for_devices",
+        success="devices_done",
+        failure="device_failed",
     )
-    return transition("waiting_for_children")
+
+
+@campaign.state("devices_done")
+def devices_done(ctx):
+    devices = ctx.flow.child_results("devices")
+    return complete(result=b"%d devices acknowledged" % len(devices.children))
 ```
+
+FerricStore moves the parent to `success` once every child is terminal
+(`wait="any"` resolves at the first completed child). By default the first
+failed child moves it to `failure` instead and cancels the children still
+running. `child_results()` returns each child's status and decoded result or
+error. The TypeScript SDK has the same pair: `waitForChildren()` and
+`ctx.flow.childResults()`. Both need SDK `0.15.0` or newer.
 
 ## Failure Model
 
