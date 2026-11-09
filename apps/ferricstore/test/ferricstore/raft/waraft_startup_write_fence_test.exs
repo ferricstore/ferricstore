@@ -37,7 +37,7 @@ defmodule Ferricstore.Raft.WARaftStartupWriteFenceTest do
     shard: shard,
     server_pid: server_pid
   } do
-    :persistent_term.put(@starting_key, true)
+    :persistent_term.put(@starting_key, self())
     :ok = :sys.suspend(server_pid)
 
     write = Task.async(fn -> GenServer.call(shard, {:put, key, "value", 0}, 5_000) end)
@@ -52,7 +52,7 @@ defmodule Ferricstore.Raft.WARaftStartupWriteFenceTest do
   end
 
   test "startup rejects asynchronous writes before backend submission", %{key: key} do
-    :persistent_term.put(@starting_key, true)
+    :persistent_term.put(@starting_key, self())
     reply_ref = make_ref()
 
     assert :ok = WARaftBackend.write_async(0, {:put, key, "value", 0}, {self(), reply_ref})
@@ -61,7 +61,7 @@ defmodule Ferricstore.Raft.WARaftStartupWriteFenceTest do
   end
 
   test "startup rejects multi-command admission as one fenced operation", %{key: key} do
-    :persistent_term.put(@starting_key, true)
+    :persistent_term.put(@starting_key, self())
 
     assert [
              {:error, :backend_unavailable},

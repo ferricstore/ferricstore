@@ -20,6 +20,12 @@ All notable changes to FerricStore will be documented here.
   burst of writes the writer fell behind and kept the disk syncing for
   seconds after the burst ended.
 
+- A process killed while it started the WARaft backend no longer leaves the
+  startup write fence up. The fence is cleared when the start returns, and a
+  killed process never returns, so every write was refused as
+  `:backend_unavailable` until the backend was next started. The fence now
+  belongs to the starting process and drops when it dies.
+
 ## 0.12.19 - 2026-11-08
 
 - History a Flow history projector held when it was killed outright is no

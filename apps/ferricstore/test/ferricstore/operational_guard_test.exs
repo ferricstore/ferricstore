@@ -62,6 +62,8 @@ defmodule Ferricstore.OperationalGuardTest do
       }
     }
 
+    # The default memory_stats_fun asks the live MemoryGuard, which can be busy
+    # for longer than the test waits.
     start_supervised!(
       {OperationalGuard,
        name: name,
@@ -72,6 +74,7 @@ defmodule Ferricstore.OperationalGuardTest do
          send(parent, {:limits_opts, opts})
          snapshot
        end,
+       memory_stats_fun: fn -> %{} end,
        apply_disk_pressure_fun: fn ctx, shard_count, level ->
          send(parent, {:disk_pressure, ctx, shard_count, level})
        end,
@@ -83,11 +86,14 @@ defmodule Ferricstore.OperationalGuardTest do
        end}
     )
 
-    assert_receive {:limits_opts, [data_dir: "/data", shard_count: 2]}
-    assert_receive {:disk_pressure, nil, 2, :reject}
-    assert_receive {:memory_pressure, :pressure}
+    # One check runs these in turn, with Flow admission and logging between
+    # them: the default 100 ms is short on a loaded runner.
+    assert_receive {:limits_opts, [data_dir: "/data", shard_count: 2]}, 1_000
+    assert_receive {:disk_pressure, nil, 2, :reject}, 1_000
+    assert_receive {:memory_pressure, :pressure}, 1_000
 
-    assert_receive {:telemetry, [:ferricstore, :operational, :guard], measurements, metadata}
+    assert_receive {:telemetry, [:ferricstore, :operational, :guard], measurements, metadata},
+                   1_000
 
     assert measurements.disk_used_bytes == 91
     assert measurements.disk_total_bytes == 100
