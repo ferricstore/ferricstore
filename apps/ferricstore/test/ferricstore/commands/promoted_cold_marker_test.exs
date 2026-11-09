@@ -96,10 +96,8 @@ defmodule Ferricstore.Commands.PromotedColdMarkerTest do
 
     keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
 
-    for row_key <- [CompoundKey.type_key(key), CompoundKey.hash_field(key, "fresh")] do
-      [row] = :ets.lookup(keydir, row_key)
-      assert {:evicted, _bytes, _size} = MemoryGuard.coldify_candidate(keydir, row)
-    end
+    evict_row!(keydir, CompoundKey.type_key(key))
+    evict_row!(keydir, CompoundKey.hash_field(key, "fresh"))
 
     assert {:simple, "hash"} == Dispatcher.dispatch("TYPE", [key], ctx)
     assert ["fresh", "1"] == Dispatcher.dispatch("HGETALL", [key], ctx)
@@ -117,24 +115,39 @@ defmodule Ferricstore.Commands.PromotedColdMarkerTest do
     keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
     marker = CompoundKey.promotion_marker_key(key)
 
-    evicted =
+    rows =
       keydir
       |> :ets.tab2list()
       |> Enum.filter(fn {row_key, value, _exp, _lfu, fid, _off, _size} ->
         value != nil and fid != :pending and
           (row_key == marker or CompoundKey.extract_redis_key(row_key) == key)
       end)
-      |> Enum.map(&MemoryGuard.coldify_candidate(keydir, &1))
 
-    assert Enum.count(evicted, &match?({:evicted, _bytes, _size}, &1)) > 150
+    assert length(rows) > 150
+    Enum.each(rows, &evict_row!(keydir, elem(&1, 0)))
     assert [{^marker, nil, _exp, _lfu, _fid, _off, _size}] = :ets.lookup(keydir, marker)
   end
 
   defp evict_marker!(ctx, key) do
     keydir = elem(ctx.keydir_refs, Router.shard_for(ctx, key))
-    [row] = :ets.lookup(keydir, CompoundKey.promotion_marker_key(key))
-    assert {:evicted, _bytes, _size} = MemoryGuard.coldify_candidate(keydir, row)
-    assert [{_key, nil, _exp, _lfu, _fid, _off, _size}] = :ets.lookup(keydir, elem(row, 0))
+    marker = CompoundKey.promotion_marker_key(key)
+    evict_row!(keydir, marker)
+    assert [{^marker, nil, _exp, _lfu, _fid, _off, _size}] = :ets.lookup(keydir, marker)
+  end
+
+  # Eviction only replaces the row it was given, so a read that touches the
+  # row's LFU in between makes it refuse, and MemoryGuard tries again on its
+  # next sweep. A pending row is not on disk yet, and MemoryGuard skips it.
+  defp evict_row!(keydir, row_key) do
+    ShardHelpers.eventually(
+      fn ->
+        [row] = :ets.lookup(keydir, row_key)
+
+        elem(row, 4) != :pending and
+          match?({:evicted, _bytes, _size}, MemoryGuard.coldify_candidate(keydir, row))
+      end,
+      "expected #{inspect(row_key)} to be evicted"
+    )
   end
 
   defp promoted?(ctx, key),
