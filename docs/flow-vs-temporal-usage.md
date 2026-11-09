@@ -1,5 +1,8 @@
 # Workflow Runtime Shapes And FerricFlow Examples
 
+For how FerricFlow's model differs from Temporal's, what porting costs, and how
+to test workflows, see [Coming From Temporal](../README.md#coming-from-temporal).
+
 This document shows common workflow patterns in two shapes:
 
 | Shape | Description |
@@ -195,26 +198,39 @@ children = [
 FerricFlow shape:
 
 ```python
-from ferricstore import ChildSpec, transition
+from ferricstore import ChildSpec, complete
 
 campaign = client.workflow(type="campaign", initial_state="dispatch")
 
 
 @campaign.state("dispatch")
-def dispatch(job):
-    job.flow.spawn_children(
+def dispatch(ctx):
+    ctx.wait_for_children(
         [
             ChildSpec(
-                id=f"device:{device_id}:cmd:{job.id}",
+                id=f"device:{device_id}:cmd:{ctx.id}",
                 type="device-command",
                 payload=device_id.encode(),
             )
             for device_id in device_ids
         ],
-        wait_state="done",
+        group_id="devices",
+        wait_state="waiting_for_devices",
+        success="devices_done",
+        failure="device_failed",
     )
-    return transition("waiting_for_children")
+
+
+@campaign.state("devices_done")
+def devices_done(ctx):
+    devices = ctx.flow.child_results("devices")
+    return complete(result=b"%d devices acknowledged" % len(devices.children))
 ```
+
+`wait_for_children()` creates the children and parks the parent in
+`wait_state` in one fenced command, so the parent holds no worker while it
+waits. FerricStore moves it to `success` when the group resolves, and
+`child_results()` reads each child's status and result.
 
 Child Flows have their own state, retry, lease, history, and terminal status. Parent/child links are queryable later.
 
