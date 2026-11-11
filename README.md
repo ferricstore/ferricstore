@@ -225,11 +225,20 @@ CLI. Tests skip time by passing an explicit current time to claims; see
 [Testing workflows](#testing-workflows). Replay debugging and replay tests are
 not needed; see [Why there is no replay](#why-there-is-no-replay).
 
-**"Fan-in is unproven in the TypeScript SDK."** `waitForChildren()` and
-`childResults()` shipped in TypeScript SDK 0.15.0, and Python has
-`ctx.wait_for_children()` and `child_results()`. Both SDKs' CI runs their
-fan-out examples against a live server on every change. Fan-in needs server
-`0.11.19` or newer.
+**"Fan-in is unproven in the TypeScript SDK."** Every SDK has it. A handler
+creates the children and parks the parent in one fenced command, then reads
+every child's result in one call:
+
+| SDK | Wait for children | Read their results |
+| --- | --- | --- |
+| TypeScript 0.15.0 | `waitForChildren()` | `ctx.flow.childResults()` |
+| Python 0.15.0 | `ctx.wait_for_children()` | `ctx.flow.child_results()` |
+| Go 0.14.0 | `WaitForChildren` | `WorkflowContext.ChildResults` |
+| Java 0.4.0 | `Outcomes.waitForChildren` | `ctx.childResults()` |
+| Elixir 0.14.0 | `Workflow.wait_for_children/4` | `Workflow.child_results/3` |
+
+Each SDK's CI runs a fan-out workflow against a live server on every change.
+Fan-in needs server `0.11.19` or newer.
 
 ### Which one fits
 
@@ -681,8 +690,9 @@ FerricStore moves the parent to `success` once every child is terminal
 (`wait="any"` resolves at the first completed child). By default the first
 failed child moves it to `failure` instead and cancels the children still
 running. `child_results()` returns each child's status and decoded result or
-error. The TypeScript SDK has the same pair: `waitForChildren()` and
-`ctx.flow.childResults()`. Both need SDK `0.15.0` or newer.
+error. Every SDK has the same pair; see
+[Answers to the usual concerns](#answers-to-the-usual-concerns) for their
+names and the first release of each that has them.
 
 ## Failure Model
 
