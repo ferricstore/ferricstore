@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.20 - 2026-11-13
+
 - A text Flow item command (`FLOW.SPAWN_CHILDREN`, `FLOW.CREATE_MANY`, and the
   `*_MANY` terminal commands, as sent over HTTP) no longer fails when an option
   value is spelled `items`. The parser ended the options at the first token
