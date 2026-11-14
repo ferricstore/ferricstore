@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.21 - 2026-11-14
+
 - A text `FLOW.GET`, `FLOW.CLAIM_DUE` or `FLOW.RECLAIM` (as sent over HTTP or
   RESP) with more than one `VALUE name` option returns every named value. Each
   `VALUE` became its own option and only the first was read, so a read of
