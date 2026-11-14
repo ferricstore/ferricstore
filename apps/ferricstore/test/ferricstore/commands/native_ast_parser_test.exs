@@ -520,6 +520,35 @@ defmodule Ferricstore.Commands.NativeAstParserTest do
              ])
   end
 
+  test "Flow reads keep every VALUE option" do
+    assert {:ok, "FLOW.GET", _args, {:flow_get, "flow-1", [values: ["tenant", "rows"]]}, _keys} =
+             NativeAstParser.parse("flow.get", ["flow-1", "VALUE", "tenant", "VALUE", "rows"])
+
+    assert {:ok, "FLOW.CLAIM_DUE", _args, {:flow_claim_due, "checkout", opts}, _keys} =
+             NativeAstParser.parse("flow.claim_due", [
+               "checkout",
+               "VALUE",
+               "tenant",
+               "PARTITION",
+               "tenant:a",
+               "VALUE",
+               "rows"
+             ])
+
+    assert Keyword.get_values(opts, :values) == [["tenant", "rows"]]
+
+    assert {:ok, "FLOW.RECLAIM", _args, {:flow_reclaim, "checkout", opts}, _keys} =
+             NativeAstParser.parse("flow.reclaim", [
+               "checkout",
+               "VALUE",
+               "tenant",
+               "VALUE",
+               "rows"
+             ])
+
+    assert Keyword.get_values(opts, :values) == [["tenant", "rows"]]
+  end
+
   test "extracts namespace ACL keys from direct Flow metadata commands" do
     assert {:ok, "FLOW.GET", _args, {:flow_get, "flow-1", [partition_key: "tenant:a"]},
             ["tenant:a"]} =
