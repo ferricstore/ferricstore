@@ -75,4 +75,41 @@ defmodule Ferricstore.Commands.FlowSignalCommandTest do
                MockStore.make()
              )
   end
+
+  test "FLOW.GET returns every value its VALUE options name" do
+    id = uid("signal-values")
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.CREATE",
+               [id, "TYPE", "signal-values", "STATE", "waiting", "NOW", "1000"],
+               MockStore.make()
+             )
+
+    assert "OK" =
+             Dispatcher.dispatch(
+               "FLOW.SIGNAL",
+               [
+                 id,
+                 "SIGNAL",
+                 "ready",
+                 "VALUE",
+                 "tenant",
+                 "acme",
+                 "VALUE",
+                 "rows",
+                 "3",
+                 "NOW",
+                 "1100"
+               ],
+               MockStore.make()
+             )
+
+    assert %{"values" => %{"tenant" => "acme", "rows" => "3"}} =
+             Dispatcher.dispatch(
+               "FLOW.GET",
+               [id, "VALUE", "tenant", "VALUE", "rows"],
+               MockStore.make()
+             )
+  end
 end

@@ -1817,7 +1817,7 @@ defmodule Ferricstore.Commands.NativeAstParser do
         parse_flow_read_options(tail, specs, [{:payload, true} | acc])
 
       {"VALUE", [value | tail]} ->
-        parse_flow_read_options(tail, specs, [{:values, [value]} | acc])
+        parse_flow_read_options(tail, specs, append_list_opt(:values, value, acc))
 
       {"PARTITIONS", [count | tail]} ->
         parse_flow_partitions(count, tail, specs, acc)

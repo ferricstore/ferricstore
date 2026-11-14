@@ -4,6 +4,11 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A text `FLOW.GET`, `FLOW.CLAIM_DUE` or `FLOW.RECLAIM` (as sent over HTTP or
+  RESP) with more than one `VALUE name` option returns every named value. Each
+  `VALUE` became its own option and only the first was read, so a read of
+  `VALUE tenant VALUE rows` returned `tenant` alone.
+
 ## 0.12.20 - 2026-11-13
 
 - A text Flow item command (`FLOW.SPAWN_CHILDREN`, `FLOW.CREATE_MANY`, and the
