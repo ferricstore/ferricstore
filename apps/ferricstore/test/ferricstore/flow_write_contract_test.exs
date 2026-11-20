@@ -533,8 +533,8 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     assert precheck_source =~ "NativeFlowIndex.due_keys_present"
     assert precheck_source =~ "flow_claim_due_auto_precheck_keys"
-    assert source =~ "flow_auto_partition_keys_for_shard"
-    assert source =~ "{__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}"
+    assert source =~ "flow_auto_partition_tags_for_shard"
+    assert source =~ "{__MODULE__, :flow_auto_partition_tags_for_shard, ctx.name, ctx.slot_map}"
   end
 
   test "flow claim_due AUTO encodes invariant due-key components once per precheck" do
@@ -549,8 +549,11 @@ defmodule Ferricstore.FlowWriteContractTest do
 
     assert function_source =~ "Keys.index_component(type)"
     assert function_source =~ "Keys.index_component(state)"
-    assert function_source =~ "Keys.tag(partition_key)"
+    assert function_source =~ "flow_auto_partition_tags_for_shard(ctx, idx)"
     assert function_source =~ "Keys.due_key_from_tag_and_index_components"
+
+    refute function_source =~ "Keys.tag(",
+           "a shard's automatic partition tags are cached with its partition grouping and must not be hashed on every precheck"
 
     refute function_source =~ "Keys.due_key(type, state",
            "type and state are invariant across priority and partition loops and must not be encoded for every generated key"
