@@ -100,12 +100,15 @@ defmodule FerricstoreServer.Native.Connection do
     :preauth_max_frame_bytes,
     :frame_assembly_timeout_ms,
     :lane_barrier_timeout_ms,
+    :lane_idle_ms,
     :frame_assembly_deadline_ms,
     :chunk_assembly_deadline_ms,
     :inbound_buffer_token,
     compression: :none,
     buffer: %FrameBuffer{},
     lanes: %{},
+    lane_idle_at: %{},
+    lane_reap_timer: nil,
     chunk_buffers: %{},
     pending_chunk_bytes: 0,
     pending_chunk_metadata_bytes: 0,
@@ -283,6 +286,7 @@ defmodule FerricstoreServer.Native.Connection do
               preauth_max_frame_bytes: preauth_max_frame_bytes,
               frame_assembly_timeout_ms: frame_assembly_timeout_ms,
               lane_barrier_timeout_ms: lane_barrier_timeout_ms(),
+              lane_idle_ms: Application.get_env(:ferricstore, :native_lane_idle_ms, 5_000),
               multi_queue_byte_limit: min(max_frame_bytes * 2, 32 * 1024 * 1024),
               watch_key_byte_limit: min(max_frame_bytes, 16 * 1024 * 1024),
               max_pubsub_subscription_bytes:
@@ -444,6 +448,11 @@ defmodule FerricstoreServer.Native.Connection do
       :client_kill ->
         cleanup_connection(state)
         transport.close(socket)
+
+      :native_reap_idle_lanes ->
+        state = %{state | lane_reap_timer: nil}
+        state = reap_idle_lanes(state, state.lane_idle_ms)
+        loop(schedule_lane_reap(state))
 
       {:native_goaway, payload} ->
         native_send(state, Responses.encode_event(state, @op_goaway, payload), :event)
@@ -1639,7 +1648,7 @@ defmodule FerricstoreServer.Native.Connection do
           end
         end
 
-      {:error, reason} ->
+      {:error, reason, state} ->
         dispatch_ordered_error(
           frame,
           rest,
@@ -1920,6 +1929,10 @@ defmodule FerricstoreServer.Native.Connection do
       :native_decode_continue ->
         # Decoding resumes after the barrier; replay the trigger then.
         wait.(%{state | barrier_decode_continue: true})
+
+      :native_reap_idle_lanes ->
+        # Lanes are not stopped during a barrier; check again later.
+        wait.(schedule_lane_reap(%{state | lane_reap_timer: nil}))
 
       {:native_goaway, payload} ->
         native_send(state, Responses.encode_event(state, @op_goaway, payload), :event)
@@ -2747,33 +2760,103 @@ defmodule FerricstoreServer.Native.Connection do
            "message" => "ERR native max lanes per connection exceeded",
            "scope" => "connection",
            "retry_after_ms" => 10
-         }}
+         }, state}
 
       :error ->
-        case Lane.start_link(self(), lane_id, state.command_state) do
-          {:ok, pid} ->
-            state = %{state | lanes: Map.put(state.lanes, lane_id, pid)}
-            {:ok, pid, remember_connection_state(state)}
-
-          {:error, {:limit, :lanes}} ->
-            {:error,
-             %{
-               "code" => "global_lane_limit_exceeded",
-               "message" => "ERR native global lane limit exceeded",
-               "scope" => "server",
-               "retry_after_ms" => 10
-             }}
-
-          {:error, _reason} ->
-            {:error,
-             %{
-               "code" => "resource_budget_unavailable",
-               "message" => "ERR native resource budget unavailable",
-               "scope" => "server",
-               "retry_after_ms" => 10
-             }}
-        end
+        start_lane(state, lane_id, :reap_idle_on_limit)
     end
+  end
+
+  # When the server-wide lane budget is full, this connection's own idle lanes
+  # are stopped to make room before the new lane is refused.
+  defp start_lane(state, lane_id, retry) do
+    case Lane.start_link(self(), lane_id, state.command_state) do
+      {:ok, pid} ->
+        state = %{state | lanes: Map.put(state.lanes, lane_id, pid)}
+        {:ok, pid, remember_connection_state(state)}
+
+      {:error, {:limit, :lanes}} ->
+        reaped = reap_idle_lanes(state, 0)
+
+        if retry == :reap_idle_on_limit and map_size(reaped.lanes) < map_size(state.lanes) do
+          start_lane(reaped, lane_id, :no_retry)
+        else
+          {:error,
+           %{
+             "code" => "global_lane_limit_exceeded",
+             "message" => "ERR native global lane limit exceeded",
+             "scope" => "server",
+             "retry_after_ms" => 10
+           }, reaped}
+        end
+
+      {:error, _reason} ->
+        {:error,
+         %{
+           "code" => "resource_budget_unavailable",
+           "message" => "ERR native resource budget unavailable",
+           "scope" => "server",
+           "retry_after_ms" => 10
+         }, state}
+    end
+  end
+
+  # A lane with nothing in flight, queued, deferred or blocked holds only its
+  # process and its server-wide lane slot; its next frame starts a new lane.
+  defp mark_lane_idle(%{lane_idle_ms: idle_ms} = state, lane_id)
+       when is_integer(idle_ms) and is_map_key(state.lanes, lane_id) do
+    state = %{
+      state
+      | lane_idle_at: Map.put(state.lane_idle_at, lane_id, System.monotonic_time(:millisecond))
+    }
+
+    schedule_lane_reap(state)
+  end
+
+  defp mark_lane_idle(state, _lane_id), do: state
+
+  defp schedule_lane_reap(%{lane_reap_timer: nil, lane_idle_ms: idle_ms} = state)
+       when is_integer(idle_ms) and map_size(state.lane_idle_at) > 0 do
+    %{state | lane_reap_timer: Process.send_after(self(), :native_reap_idle_lanes, idle_ms)}
+  end
+
+  defp schedule_lane_reap(state), do: state
+
+  defp reap_idle_lanes(%{multi_state: :none} = state, min_idle_ms) do
+    now = System.monotonic_time(:millisecond)
+
+    {lanes, idle_at} =
+      Enum.reduce(state.lane_idle_at, {state.lanes, state.lane_idle_at}, fn
+        {lane_id, idle_since}, {lanes, idle_at} ->
+          cond do
+            not idle_lane?(state, lane_id) ->
+              {lanes, Map.delete(idle_at, lane_id)}
+
+            now - idle_since >= min_idle_ms ->
+              Lane.retire(Map.fetch!(lanes, lane_id))
+              {Map.delete(lanes, lane_id), Map.delete(idle_at, lane_id)}
+
+            true ->
+              {lanes, idle_at}
+          end
+      end)
+
+    if map_size(lanes) == map_size(state.lanes) do
+      %{state | lane_idle_at: idle_at}
+    else
+      remember_connection_state(%{state | lanes: lanes, lane_idle_at: idle_at})
+    end
+  end
+
+  defp reap_idle_lanes(state, _min_idle_ms), do: state
+
+  defp idle_lane?(state, lane_id) do
+    is_map_key(state.lanes, lane_id) and
+      not is_map_key(state.lane_inflight, lane_id) and
+      not is_map_key(state.deferred_lane_inflight, lane_id) and
+      not is_map_key(state.lane_queued_request_bytes, lane_id) and
+      not is_map_key(state.blocked_lane_counts, lane_id) and
+      not is_map_key(state.deferred_frames, lane_id)
   end
 
   defp refresh_command_state_and_lanes(state) do
@@ -2906,7 +2989,10 @@ defmodule FerricstoreServer.Native.Connection do
         lane_inflight: lane_inflight
     }
 
-    state = if lane_count == 0, do: mark_deferred_release_due(state, lane_id), else: state
+    state =
+      if lane_count == 0,
+        do: state |> mark_deferred_release_due(lane_id) |> mark_lane_idle(lane_id),
+        else: state
 
     release_queued_request_bytes(state, lane_id, request_bytes)
   end
