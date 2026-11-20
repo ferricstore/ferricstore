@@ -587,7 +587,7 @@ defmodule Ferricstore.FlowWriteContractTest do
       )
 
     assert function_source =~ "cold_due_state_bucket_prefix"
-    refute function_source =~ "flow_auto_partition_keys_for_shard"
+    refute function_source =~ "flow_auto_partition_tags_for_shard"
   end
 
   test "flow claim_due AUTO cold precheck does not repeat the same LMDB probe per priority" do
