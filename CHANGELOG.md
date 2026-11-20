@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- The Flow LMDB writer catches up after a burst in about half the CPU. When a
+  shard's projection was rebuilt (as it is after terminal writes), each
+  completed Flow pruned from memory checked on its own that its source row was
+  on disk, which read and decoded the Raft command's whole batch once per Flow.
+  The rows of each rebuild chunk are now checked together, reading each batch
+  once. On the Python SDK queue benchmark (100k Flows, 16 shards, Apple M4 Max)
+  the work after the run fell from about 186 to 78 CPU seconds.
+
 ## 0.12.21 - 2026-11-14
 
 - A text `FLOW.GET`, `FLOW.CLAIM_DUE` or `FLOW.RECLAIM` (as sent over HTTP or

@@ -846,16 +846,13 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
           )
 
         if prune_terminal_keydir? do
-          Enum.each(Enum.reverse(terminal_prunes), fn {key, record} ->
-            safe_prune_terminal_keydir_entry(
-              keydir,
-              shard_path,
-              shard_index,
-              key,
-              record,
-              instance_ctx
-            )
-          end)
+          prune_terminal_keydir_entries(
+            keydir,
+            shard_path,
+            shard_index,
+            Enum.reverse(terminal_prunes),
+            instance_ctx
+          )
         end
 
         %{
@@ -2061,14 +2058,42 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
     end
   end
 
-  defp safe_prune_terminal_keydir_entry(
-         keydir,
-         shard_path,
-         shard_index,
-         key,
-         record,
-         instance_ctx
-       ) do
+  # Each row is checked on its own, then the apply-projection rows that passed
+  # are made durable in one call, which reads each Raft command's batch from
+  # disk once instead of once per row. If that call fails, each row is made
+  # durable on its own, so one bad row keeps only itself in the keydir.
+  defp prune_terminal_keydir_entries(keydir, shard_path, shard_index, prunes, instance_ctx) do
+    candidates =
+      Enum.flat_map(prunes, fn {key, record} ->
+        case prunable_terminal_keydir_row(
+               keydir,
+               shard_path,
+               shard_index,
+               key,
+               record,
+               instance_ctx
+             ) do
+          {:ok, row, current} -> [{key, row, current}]
+          :skip -> []
+        end
+      end)
+
+    rows_durable? =
+      ensure_apply_projection_rows_durable(
+        instance_ctx,
+        shard_index,
+        Enum.map(candidates, fn {_key, row, _current} -> row end)
+      ) == :ok
+
+    Enum.each(candidates, fn {key, row, current} ->
+      if rows_durable? or
+           ensure_apply_projection_row_durable(instance_ctx, shard_index, row) == :ok do
+        delete_pruned_terminal_row(keydir, shard_index, key, row, current, instance_ctx)
+      end
+    end)
+  end
+
+  defp prunable_terminal_keydir_row(keydir, shard_path, shard_index, key, record, instance_ctx) do
     version = Map.get(record, :version)
     incarnation = Map.get(record, :incarnation)
 
@@ -2078,9 +2103,17 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
            prune_terminal_keydir_record(row, shard_path, shard_index, key, instance_ctx),
          ^version <- Map.get(current, :version),
          ^incarnation <- Map.get(current, :incarnation),
-         true <- LMDB.terminal_state?(Map.get(current, :state)),
-         :ok <- ensure_apply_projection_row_durable(instance_ctx, shard_index, row),
-         true <- Ferricstore.Store.Keydir.delete_unchanged_source(keydir, row) do
+         true <- LMDB.terminal_state?(Map.get(current, :state)) do
+      {:ok, row, current}
+    else
+      _not_prunable -> :skip
+    end
+  rescue
+    ArgumentError -> :skip
+  end
+
+  defp delete_pruned_terminal_row(keydir, shard_index, key, row, current, instance_ctx) do
+    if Ferricstore.Store.Keydir.delete_unchanged_source(keydir, row) do
       track_pruned_binary_remove(row, shard_index, instance_ctx)
       KeydirSpill.request(instance_ctx, shard_index, keydir, current, key)
     end
@@ -2089,6 +2122,34 @@ defmodule Ferricstore.Flow.LMDBRebuilder do
   rescue
     ArgumentError -> :ok
   end
+
+  defp ensure_apply_projection_rows_durable(%{data_dir: data_dir}, shard_index, rows)
+       when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 do
+    refs =
+      for {key, _value, _expire_at_ms, _lfu, {:waraft_apply_projection, index}, _offset,
+           _value_size} <- rows,
+          is_binary(key) and is_integer(index) and index > 0,
+          do: {index, key}
+
+    case refs do
+      [] ->
+        :ok
+
+      [_ | _] ->
+        case Ferricstore.Raft.WARaftSegmentReader.ensure_apply_projection_entries_durable(
+               data_dir,
+               shard_index,
+               refs
+             ) do
+          {:ok, _removed} -> :ok
+          {:error, reason} -> {:error, {:source_not_durable, reason}}
+        end
+    end
+  rescue
+    error -> {:error, {:source_not_durable, error}}
+  end
+
+  defp ensure_apply_projection_rows_durable(_instance_ctx, _shard_index, _rows), do: :ok
 
   defp ensure_apply_projection_row_durable(
          %{data_dir: data_dir},
