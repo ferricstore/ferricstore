@@ -53,6 +53,20 @@ defmodule Ferricstore.Cluster.BootstrapFeatureLevelTest do
     assert {:ok, %{active: 0}} = FeatureLevel.status(FerricStore.Instance.get(:default))
   end
 
+  describe "standalone_bootstrap?/4" do
+    alias Ferricstore.Raft.WARaftBackend
+
+    test "holds only for an unnamed node that bootstrapped every shard alone" do
+      assert WARaftBackend.standalone_bootstrap?(4, 4, [node()], nil)
+      refute WARaftBackend.standalone_bootstrap?(3, 4, [node()], nil)
+      refute WARaftBackend.standalone_bootstrap?(4, 4, [node(), :other@host], nil)
+    end
+
+    test "a node configured with a node name runs for a cluster and is not standalone" do
+      refute WARaftBackend.standalone_bootstrap?(4, 4, [node()], :"ferricstore@fs-node1")
+    end
+  end
+
   describe "run/1" do
     test "raises a fresh node to the configured level, retrying until the raise succeeds" do
       parent = self()

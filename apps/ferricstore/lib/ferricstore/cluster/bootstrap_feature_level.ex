@@ -4,7 +4,8 @@ defmodule Ferricstore.Cluster.BootstrapFeatureLevel do
 
   Feature levels keep a mixed-version cluster applying every write the same
   way, so a cluster upgraded in place stays at its level until an operator
-  raises it. A standalone node that bootstrapped every shard in this start
+  raises it. A standalone node (no `FERRICSTORE_NODE_NAME`) that bootstrapped
+  every shard in this start
   (`Ferricstore.Raft.WARaftBackend.fresh_standalone_bootstrap?/0`) has no
   other member and no data an older release wrote, so it raises right away
   and runs the current behavior instead of the level-0 compatibility paths:
@@ -13,9 +14,9 @@ defmodule Ferricstore.Cluster.BootstrapFeatureLevel do
 
   `:bootstrap_feature_level` picks the level: `:supported` (the default), a
   level number, or `0` to stay at level 0 so the data directory can still be
-  opened by an older release. A node that restarts on existing data, joins a
-  cluster or forms a multi-node cluster is left alone; raise those with
-  `FerricStore.raise_cluster_feature_level/1`.
+  opened by an older release. A node that restarts on existing data or has a
+  node name (and so may form or join a cluster) is left alone; raise those
+  with `FerricStore.raise_cluster_feature_level/1`.
   """
 
   require Logger

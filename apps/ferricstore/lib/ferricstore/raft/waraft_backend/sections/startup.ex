@@ -96,12 +96,28 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
       def fresh_standalone_bootstrap?,
         do: :persistent_term.get({__MODULE__, :fresh_standalone_bootstrap}, false)
 
+      @doc false
+      # A node configured with a name (FERRICSTORE_NODE_NAME) runs for a
+      # cluster even before it has peers, so only an unnamed node that
+      # bootstrapped every shard as the sole member is standalone.
+      @spec standalone_bootstrap?(non_neg_integer(), non_neg_integer(), [node()], node() | nil) ::
+              boolean()
+      def standalone_bootstrap?(bootstrapped, shard_count, initial_nodes, configured_node_name) do
+        bootstrapped == shard_count and initial_nodes == [node()] and
+          is_nil(configured_node_name)
+      end
+
       defp finish_start(shard_count, opts) do
         :persistent_term.put({__MODULE__, :fresh_standalone_bootstrap}, false)
 
         with {:ok, bootstrapped} <- finish_start_partitions(shard_count, opts),
              :ok <- maybe_rollout_apply_context(shard_count, opts) do
-          if bootstrapped == shard_count and initial_bootstrap_nodes() == [node()] do
+          if standalone_bootstrap?(
+               bootstrapped,
+               shard_count,
+               initial_bootstrap_nodes(),
+               Application.get_env(:ferricstore, :node_name)
+             ) do
             :persistent_term.put({__MODULE__, :fresh_standalone_bootstrap}, true)
           end
 
