@@ -4,13 +4,7 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-- The Flow LMDB writer catches up after a burst in about half the CPU. When a
-  shard's projection was rebuilt (as it is after terminal writes), each
-  completed Flow pruned from memory checked on its own that its source row was
-  on disk, which read and decoded the Raft command's whole batch once per Flow.
-  The rows of each rebuild chunk are now checked together, reading each batch
-  once. On the Python SDK queue benchmark (100k Flows, 16 shards, Apple M4 Max)
-  the work after the run fell from about 186 to 78 CPU seconds.
+## 0.12.22 - 2026-11-20
 
 - Flow commands use about half the server CPU per Flow. Since 0.8.0, encoding
   and decoding Flow records and planning claims ran on dirty CPU schedulers,
@@ -21,6 +15,22 @@ All notable changes to FerricStore will be documented here.
   server CPU fell from about 1.09 s to 0.55 s per 1,000 Flows and throughput
   rose from about 11.4k to 17.2k Flows/s.
 
+- The Flow LMDB writer catches up after a burst in about half the CPU. When a
+  shard's projection was rebuilt (as it is after terminal writes), each
+  completed Flow pruned from memory checked on its own that its source row was
+  on disk, which read and decoded the Raft command's whole batch once per Flow.
+  The rows of each rebuild chunk are now checked together, reading each batch
+  once. On the Python SDK queue benchmark (100k Flows, 16 shards, Apple M4 Max)
+  the work after the run fell from about 186 to 78 CPU seconds.
+
+- A claim without a partition key on an empty queue costs about a third of the
+  server CPU it did. Each priority the claim tries (2, 1 and 0 when none is
+  given) checked every shard's index on its own; one check per shard now covers
+  all of them, and the shard's partition tags are computed once instead of on
+  every check. With 16 workers polling an empty queue on a 16-shard node, the
+  server spent about 4.6 ms of CPU per claim (34 ms at feature level 0, where
+  the check also reads the cold due rows); now about 1.5 ms (10 ms).
+
 - New native connections succeed while the server is saturated. HELLO, PING,
   QUIT, GOAWAY, STARTUP and WINDOW_UPDATE took a slot of the server-wide
   execution budget without waiting, and under load lanes queue for those slots,
@@ -29,6 +39,10 @@ All notable changes to FerricStore will be documented here.
   together, a third of each client's producer connections failed this way.
   These frames now skip the execution budget; other control commands, such as
   AUTH and OPTIONS, still take a slot.
+
+- Plug is 1.20.4, the fix for EEF-CVE-2026-120287 (GHSA-qj4r-jh2r-rw3f, the
+  multipart `:length` limit). FerricStore does not parse multipart bodies, so
+  it was not affected; the update keeps dependency audits clean.
 
 ## 0.12.21 - 2026-11-14
 
