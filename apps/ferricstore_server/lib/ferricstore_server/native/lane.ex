@@ -81,6 +81,32 @@ defmodule FerricstoreServer.Native.Lane do
     :ok
   end
 
+  @doc """
+  Stops a lane with nothing queued and waits until it has released its
+  server-wide lane slot, so the caller can start another lane in its place.
+  """
+  @spec retire(pid(), timeout()) :: :ok
+  def retire(pid, timeout \\ 1_000) when is_pid(pid) do
+    Process.unlink(pid)
+    monitor = Process.monitor(pid)
+    send(pid, :shutdown)
+
+    receive do
+      {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+    after
+      timeout ->
+        Process.exit(pid, :kill)
+
+        receive do
+          {:DOWN, ^monitor, :process, ^pid, _reason} -> :ok
+        after
+          timeout -> Process.demonitor(monitor, [:flush])
+        end
+
+        :ok
+    end
+  end
+
   @spec update_command_state(pid(), map()) :: :ok
   def update_command_state(pid, command_state) when is_pid(pid) and is_map(command_state) do
     send(pid, {:native_lane_command_state, command_state})

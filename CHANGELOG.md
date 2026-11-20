@@ -4,6 +4,16 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A native client that spreads requests over many lanes no longer runs the
+  server out of lanes. A connection kept a lane process, and a slot of the
+  server-wide lane budget (`native_max_global_lanes`, 32 per scheduler), for
+  every lane id it had used until it closed; the Python SDK spreads requests
+  over 32 lanes on each connection, so one queue benchmark client with 48
+  connections hit the budget after about 250k Flows, and further requests got
+  `ERR native global lane limit exceeded`. Lanes idle for
+  `native_lane_idle_ms` (5 s) now stop, and when the budget is full a
+  connection stops its own idle lanes before refusing a new one.
+
 ## 0.12.22 - 2026-11-20
 
 - Flow commands use about half the server CPU per Flow. Since 0.8.0, encoding
