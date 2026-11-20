@@ -334,6 +334,7 @@ defmodule Ferricstore.Application do
               case Ferricstore.Raft.WARaftBackend.start(default_ctx, waraft_backend_opts()) do
                 :ok ->
                   :ok = Ferricstore.Flow.LMDB.ensure_shard_dirs(data_dir, shard_count)
+                  maybe_start_bootstrap_feature_level(pid, default_ctx)
                   mark_started(shard_count, started_at_ms)
                   {:ok, pid, app_state}
 
@@ -370,6 +371,25 @@ defmodule Ferricstore.Application do
   @spec starting?() :: boolean()
   def starting? do
     :persistent_term.get({__MODULE__, :starting}, false)
+  end
+
+  # A brand-new standalone node raises itself to its release's feature level
+  # (Ferricstore.Cluster.BootstrapFeatureLevel); the raise waits for nothing.
+  defp maybe_start_bootstrap_feature_level(supervisor, ctx) do
+    if Ferricstore.Raft.WARaftBackend.fresh_standalone_bootstrap?() do
+      case Supervisor.start_child(
+             supervisor,
+             {Ferricstore.Cluster.BootstrapFeatureLevel, instance_ctx: ctx}
+           ) do
+        {:ok, _pid} ->
+          :ok
+
+        other ->
+          Logger.warning("feature level bootstrap not started: #{inspect(other)}")
+      end
+    end
+
+    :ok
   end
 
   defp waraft_backend_opts do

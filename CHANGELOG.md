@@ -4,6 +4,18 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A brand-new standalone node starts at the feature level its release
+  supports (12) instead of 0. Before, a new node ran the level-0 compatibility
+  paths until an operator raised the level, though nothing in it could be
+  applied differently by an older release: every claim with room left also
+  scanned the node-local LMDB mirror for hibernated Flows to promote, which
+  doubled the time each Raft batch spent in apply on the Python SDK queue
+  benchmark, and the level 7 and 8 claim fixes stayed off. A node that
+  restarts on existing data, joins a cluster or is started with
+  `FERRICSTORE_CLUSTER_NODES` keeps its level. `FERRICSTORE_BOOTSTRAP_FEATURE_LEVEL`
+  (`:bootstrap_feature_level`) sets a lower level, or 0 to keep the data
+  directory readable by older releases.
+
 ## 0.12.23 - 2026-11-20
 
 - A native client that spreads requests over many lanes no longer runs the
