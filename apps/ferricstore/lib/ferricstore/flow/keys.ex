@@ -202,24 +202,24 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def policy_indexed_attribute_count_key(name) when is_binary(name) and name != "" do
-    @policy_attribute_count_prefix <> digest(name)
+    @policy_attribute_count_prefix <> type_digest(name)
   end
 
   def policy_indexed_attribute_member_prefix(name) when is_binary(name) and name != "" do
-    @policy_attribute_member_prefix <> digest(name) <> ":"
+    @policy_attribute_member_prefix <> type_digest(name) <> ":"
   end
 
   def policy_indexed_attribute_member_key(name, type)
       when is_binary(name) and name != "" and is_binary(type) and type != "" do
-    policy_indexed_attribute_member_prefix(name) <> digest(type)
+    policy_indexed_attribute_member_prefix(name) <> type_digest(type)
   end
 
   def policy_indexed_attribute_revision_key(name) when is_binary(name) and name != "" do
-    @policy_attribute_revision_prefix <> digest(name)
+    @policy_attribute_revision_prefix <> type_digest(name)
   end
 
   def policy_indexed_attribute_repair_key(name) when is_binary(name) and name != "" do
-    policy_indexed_attribute_repair_prefix() <> digest(name)
+    policy_indexed_attribute_repair_prefix() <> type_digest(name)
   end
 
   def policy_indexed_attribute_repair_prefix do
@@ -253,7 +253,7 @@ defmodule Ferricstore.Flow.Keys do
     case flow_key_tag_prefix(state_key, "}:s:") do
       {:ok, tag_prefix} ->
         tag_prefix <>
-          ":tc:1:" <> digest(type) <> ":" <> digest(state_key)
+          ":tc:1:" <> type_digest(type) <> ":" <> digest(state_key)
 
       :error ->
         raise ArgumentError, "invalid Flow state key"
@@ -261,7 +261,7 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   def type_catalog_descriptor_key(type) when is_binary(type) and type != "" do
-    type_catalog_descriptor_key_from_digest(digest(type))
+    type_catalog_descriptor_key_from_digest(type_digest(type))
   end
 
   def type_catalog_descriptor_key_from_member(key) when is_binary(key) do
@@ -288,13 +288,13 @@ defmodule Ferricstore.Flow.Keys do
   def type_catalog_member_owns_state_key?(_key, _state_key), do: false
 
   def policy_migration_job_key(type) when is_binary(type) and type != "" do
-    "f:" <> @global_tag <> ":pm:1:" <> digest(type)
+    "f:" <> @global_tag <> ":pm:1:" <> type_digest(type)
   end
 
   def policy_migration_job_prefix, do: "f:" <> @global_tag <> ":pm:1:"
 
   def policy_migration_marker_key(type) when is_binary(type) and type != "" do
-    "f:" <> @global_tag <> ":pmg:1:" <> digest(type)
+    "f:" <> @global_tag <> ":pmg:1:" <> type_digest(type)
   end
 
   def policy_catalog_backfill_key(shard_index)
@@ -308,7 +308,7 @@ defmodule Ferricstore.Flow.Keys do
   def policy_migration_job_key?(_key), do: false
 
   def policy_catalog_projection_prefix(type) when is_binary(type) and type != "" do
-    policy_catalog_projection_global_prefix() <> digest(type) <> ":"
+    policy_catalog_projection_global_prefix() <> type_digest(type) <> ":"
   end
 
   def policy_catalog_projection_global_prefix, do: <<0, "fpc:1:">>
@@ -323,7 +323,7 @@ defmodule Ferricstore.Flow.Keys do
   def decode_policy_catalog_projection_key(type, key)
       when is_binary(type) and type != "" and is_binary(key) do
     with {:ok, decoded} <- decode_policy_catalog_projection_key(key),
-         true <- decoded.type_digest == digest(type) do
+         true <- decoded.type_digest == type_digest(type) do
       {:ok, Map.delete(decoded, :type_digest)}
     else
       _invalid -> :error
@@ -782,6 +782,29 @@ defmodule Ferricstore.Flow.Keys do
   end
 
   defp digest(value), do: Digest.encode(value)
+
+  # The digest of a Flow type or policy attribute name. Every Flow write builds
+  # several keys from its type (catalog member and descriptor, policy migration
+  # job and marker), and a node sees few types and names, so each process keeps
+  # the digests it computed, by data format, up to @type_digest_cache_max.
+  @type_digest_cache {__MODULE__, :type_digests}
+  @type_digest_cache_max 1_024
+
+  defp type_digest(value) do
+    format = Digest.format()
+    cache = Process.get(@type_digest_cache, %{})
+
+    case cache do
+      %{{^format, ^value} => digest} ->
+        digest
+
+      _missing ->
+        digest = Digest.encode(value, format)
+        cache = if map_size(cache) >= @type_digest_cache_max, do: %{}, else: cache
+        Process.put(@type_digest_cache, Map.put(cache, {format, value}, digest))
+        digest
+    end
+  end
 
   defp valid_digest?(digest), do: canonical_digest?(digest)
 

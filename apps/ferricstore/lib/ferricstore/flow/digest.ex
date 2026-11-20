@@ -36,9 +36,12 @@ defmodule Ferricstore.Flow.Digest do
   @spec encode(binary()) :: binary()
   def encode(value) when is_binary(value), do: encode(value, format())
 
-  defp encode(value, 1), do: Base.url_encode64(:crypto.hash(:sha256, value), padding: false)
+  @doc false
+  @spec encode(binary(), 1 | 2) :: binary()
+  def encode(value, 1) when is_binary(value),
+    do: Base.url_encode64(:crypto.hash(:sha256, value), padding: false)
 
-  defp encode(value, 2) do
+  def encode(value, 2) when is_binary(value) do
     <<prefix::binary-size(16), _rest::binary>> = :crypto.hash(:sha256, value)
     Base.url_encode64(prefix, padding: false)
   end

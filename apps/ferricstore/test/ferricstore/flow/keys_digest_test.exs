@@ -61,4 +61,56 @@ defmodule Ferricstore.Flow.KeysDigestTest do
     # Three digest checks per call; decode + re-encode cost ~375 reductions per call.
     assert (after_calls - before) / 1_000 < 220
   end
+
+  describe "type digests" do
+    alias Ferricstore.Flow.Digest
+
+    test "keys built from a Flow type hash the type once per process" do
+      type = "type-digest-cache-#{System.unique_integer([:positive])}"
+      state_key = Keys.state_key("order-1", "tenant-1")
+      mfa = {:crypto, :hash, 2}
+      :erlang.trace_pattern(mfa, true, [:call_count])
+      :erlang.trace(self(), true, [:call])
+
+      try do
+        for _ <- 1..10 do
+          Keys.type_catalog_descriptor_key(type)
+          Keys.policy_migration_job_key(type)
+          Keys.policy_migration_marker_key(type)
+        end
+
+        # One hash for the type; the state key is hashed by the member key.
+        assert {:call_count, 1} = :erlang.trace_info(mfa, :call_count)
+        _member = Keys.type_catalog_member_key(type, state_key)
+        assert {:call_count, 2} = :erlang.trace_info(mfa, :call_count)
+      after
+        :erlang.trace(self(), false, [:call])
+        :erlang.trace_pattern(mfa, false, [:call_count])
+      end
+    end
+
+    test "cached type digests equal the digest of the type" do
+      type = "invoice.process"
+      expected = Digest.encode(type)
+
+      for _ <- 1..2 do
+        assert String.ends_with?(Keys.type_catalog_descriptor_key(type), expected)
+        assert String.contains?(Keys.policy_migration_job_key(type), expected)
+        assert String.contains?(Keys.policy_migration_marker_key(type), expected)
+      end
+    end
+
+    test "the per-process type digest cache stays bounded" do
+      for i <- 1..3_000, do: Keys.type_catalog_descriptor_key("bounded-type-#{i}")
+
+      cached =
+        Process.get_keys()
+        |> Enum.map(&Process.get/1)
+        |> Enum.filter(&is_map/1)
+        |> Enum.map(&map_size/1)
+        |> Enum.max(fn -> 0 end)
+
+      assert cached <= 1_024
+    end
+  end
 end
