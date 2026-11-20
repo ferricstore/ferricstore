@@ -1034,6 +1034,40 @@ defmodule FerricstoreServer.Native.ConnectionDecodeBudgetTest do
     assert [{226, 4}] = receive_response_statuses(socket, 1)
   end
 
+  # Lanes queue for execution slots while the server is saturated, so a
+  # fail-fast handshake would be refused for as long as the load lasts and
+  # no new client could connect.
+  @tag :control_execution_budget
+  test "handshake and heartbeat frames answer while server execution capacity is exhausted" do
+    execution_limit =
+      Application.get_env(
+        :ferricstore,
+        :native_max_global_executions,
+        max(System.schedulers_online(), 1) * 8
+      )
+
+    assert eventually(fn -> ResourceBudget.usage(ResourceBudget).executions == 0 end)
+
+    assert {:ok, budget_token} =
+             ResourceBudget.acquire(ResourceBudget, :executions, self(), execution_limit)
+
+    on_exit(fn -> ResourceBudget.release(ResourceBudget, budget_token) end)
+
+    socket = connect()
+    on_exit(fn -> :gen_tcp.close(socket) end)
+
+    body = Codec.encode_value(%{})
+
+    assert :ok =
+             :gen_tcp.send(socket, [
+               Codec.encode_frame(@hello_opcode, 0, 227, body),
+               Codec.encode_frame(@startup_opcode, 0, 228, body),
+               Codec.encode_frame(@ping_opcode, 0, 229, "")
+             ])
+
+    assert [{227, 0}, {228, 0}, {229, 0}] = receive_response_statuses(socket, 3)
+  end
+
   test "NO_REPLY suppresses delayed native blocking responses" do
     socket = connect()
     on_exit(fn -> :gen_tcp.close(socket) end)

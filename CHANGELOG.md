@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- New native connections succeed while the server is saturated. HELLO, PING,
+  QUIT, GOAWAY, STARTUP and WINDOW_UPDATE took a slot of the server-wide
+  execution budget without waiting, and under load lanes queue for those slots,
+  so every handshake got `ERR native global execution limit exceeded` for as
+  long as the load lasted. With four Python SDK queue benchmark clients started
+  together, a third of each client's producer connections failed this way.
+  These frames now skip the execution budget; other control commands, such as
+  AUTH and OPTIONS, still take a slot.
+
 ## 0.12.21 - 2026-11-14
 
 - A text `FLOW.GET`, `FLOW.CLAIM_DUE` or `FLOW.RECLAIM` (as sent over HTTP or
