@@ -4,6 +4,13 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Flow writes hash each Flow type once per process instead of several times
+  per write. The type catalog member and descriptor keys and the policy
+  migration job and marker keys each embed the type's digest (SHA-256 and
+  base64), about 330k digests a second on the Python SDK queue benchmark; the
+  digests of types and policy attribute names are now kept per process (up to
+  1,024). Server CPU fell about 6% per Flow on the benchmark.
+
 - A brand-new standalone node (no `FERRICSTORE_NODE_NAME`) starts at the
   feature level its release supports (12) instead of 0. Before, a new node ran
   the level-0 compatibility paths until an operator raised the level, though
