@@ -1,6 +1,11 @@
 import Config
 
 config :ferricstore, :flow_governance_limit_reconcile_interval_ms, 60_000
+
+# Tests assume a fresh node starts at feature level 0 and raise levels
+# themselves; production starts a brand-new standalone node at the supported
+# level (Ferricstore.Cluster.BootstrapFeatureLevel).
+config :ferricstore, :bootstrap_feature_level, 0
 config :ferricstore, :flow_governance_limit_storage_cleanup_interval_ms, 86_400_000
 
 # Keep test runs quiet by default. A warning floor prevents debug/info/notice

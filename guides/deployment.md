@@ -582,6 +582,17 @@ it. A node stuck there starts once its hint files are gone: stop it, back up
 the data directory, delete `data/shard_*/*.hint` and `data/shard_*/*.hint.meta`
 under it, and start it again. The shard then reads its log files instead.
 
+A brand-new standalone node (an empty data directory and no
+`FERRICSTORE_NODE_NAME`) raises itself to the highest level its release
+supports as soon as it starts, since no other member and no data from an older
+release can apply anything differently. It then runs the current behavior
+instead of the level-0 compatibility paths. Such a data directory can no longer
+be opened by a release that supports a lower level; set
+`FERRICSTORE_BOOTSTRAP_FEATURE_LEVEL=0` (or a lower level number) before the
+first start to keep that option. A node that restarts on existing data or is
+started with `FERRICSTORE_NODE_NAME` (a node that may form or join a cluster)
+keeps its level until you raise it as below.
+
 After every node runs the new release, check and raise the level:
 
 ```bash

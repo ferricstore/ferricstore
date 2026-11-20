@@ -89,9 +89,38 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
         |> then(&positive_integer_option!(:waraft_start_wait_timeout_ms, &1))
       end
 
+      @doc false
+      # True after a start in which this standalone node bootstrapped every
+      # shard: a brand-new cluster, whose log no older release has written.
+      @spec fresh_standalone_bootstrap?() :: boolean()
+      def fresh_standalone_bootstrap?,
+        do: :persistent_term.get({__MODULE__, :fresh_standalone_bootstrap}, false)
+
+      @doc false
+      # A node configured with a name (FERRICSTORE_NODE_NAME) runs for a
+      # cluster even before it has peers, so only an unnamed node that
+      # bootstrapped every shard as the sole member is standalone.
+      @spec standalone_bootstrap?(non_neg_integer(), non_neg_integer(), [node()], node() | nil) ::
+              boolean()
+      def standalone_bootstrap?(bootstrapped, shard_count, initial_nodes, configured_node_name) do
+        bootstrapped == shard_count and initial_nodes == [node()] and
+          is_nil(configured_node_name)
+      end
+
       defp finish_start(shard_count, opts) do
-        with :ok <- finish_start_partitions(shard_count, opts),
+        :persistent_term.put({__MODULE__, :fresh_standalone_bootstrap}, false)
+
+        with {:ok, bootstrapped} <- finish_start_partitions(shard_count, opts),
              :ok <- maybe_rollout_apply_context(shard_count, opts) do
+          if standalone_bootstrap?(
+               bootstrapped,
+               shard_count,
+               initial_bootstrap_nodes(),
+               Application.get_env(:ferricstore, :node_name)
+             ) do
+            :persistent_term.put({__MODULE__, :fresh_standalone_bootstrap}, true)
+          end
+
           %{apply_context: %Ferricstore.Raft.ApplyContext{} = apply_context} = context!(@table)
           batcher_opts = Keyword.put(opts, :apply_context, apply_context)
 
@@ -363,14 +392,15 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
           ordered: false,
           timeout: :infinity
         )
-        |> Enum.reduce_while(:ok, fn
-          {:ok, :ok}, :ok -> {:cont, :ok}
-          {:ok, {:error, _reason} = error}, :ok -> {:halt, error}
-          {:exit, reason}, :ok -> {:halt, {:error, {:finish_start_exit, reason}}}
+        |> Enum.reduce_while({:ok, 0}, fn
+          {:ok, {:ok, :bootstrapped}}, {:ok, count} -> {:cont, {:ok, count + 1}}
+          {:ok, {:ok, :existing}}, acc -> {:cont, acc}
+          {:ok, {:error, _reason} = error}, _acc -> {:halt, error}
+          {:exit, reason}, _acc -> {:halt, {:error, {:finish_start_exit, reason}}}
         end)
       end
 
-      defp finish_start_partitions(_shard_count, _opts), do: :ok
+      defp finish_start_partitions(_shard_count, _opts), do: {:ok, 0}
 
       defp finish_start_partition(shard_index, opts) do
         server = :wa_raft_server.registered_name(@table, partition(shard_index))
@@ -379,37 +409,46 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
         wait_attempts = startup_wait_attempts()
 
         with {:ok, status} <- wait_status(server, wait_attempts),
-             :ok <- finish_start_status(shard_index, server, status, bootstrap?, wait_attempts),
+             {:ok, start} <-
+               finish_start_status(shard_index, server, status, bootstrap?, wait_attempts),
              :ok <- wait_log_replayed(server, replay_target, wait_attempts),
-             :ok <- wait_storage_replayed(shard_index, replay_target, wait_attempts) do
-          maybe_cache_current_config(shard_index)
+             :ok <- wait_storage_replayed(shard_index, replay_target, wait_attempts),
+             :ok <- maybe_cache_current_config(shard_index) do
+          {:ok, start}
         end
       end
 
-      defp finish_start_status(_shard_index, _server, _status, false, _wait_attempts), do: :ok
+      # `start` is :bootstrapped when this call created the shard's Raft group
+      # and :existing when it found one.
+      defp finish_start_status(_shard_index, _server, _status, false, _wait_attempts),
+        do: {:ok, :existing}
 
       defp finish_start_status(shard_index, server, status, true, wait_attempts) do
         case Keyword.get(status, :state) do
           :stalled ->
-            with {:ok, config} <- bootstrap(shard_index, server) do
-              wait_initial_leader(shard_index, server, config, wait_attempts)
+            with {:ok, config, start} <- bootstrap(shard_index, server),
+                 :ok <- wait_initial_leader(shard_index, server, config, wait_attempts) do
+              {:ok, start}
             end
 
           :leader ->
-            :ok
+            {:ok, :existing}
 
           _other ->
             config = Keyword.get(status, :config, %{})
 
-            if cluster_config?(config) do
-              wait_known_leader(shard_index, server, wait_attempts)
-            else
-              case backend_call(fn -> :wa_raft_server.promote(server, :next, true) end) do
-                :ok -> wait_leader(server, wait_attempts)
-                {:error, _reason} = error -> error
-                other -> {:error, other}
+            result =
+              if cluster_config?(config) do
+                wait_known_leader(shard_index, server, wait_attempts)
+              else
+                case backend_call(fn -> :wa_raft_server.promote(server, :next, true) end) do
+                  :ok -> wait_leader(server, wait_attempts)
+                  {:error, _reason} = error -> error
+                  other -> {:error, other}
+                end
               end
-            end
+
+            with :ok <- result, do: {:ok, :existing}
         end
       end
 
@@ -421,10 +460,12 @@ defmodule Ferricstore.Raft.WARaftBackend.Sections.Startup do
              end) do
           :ok ->
             :ok = cache_config(shard_index, config)
-            {:ok, config}
+            {:ok, config, :bootstrapped}
 
           {:error, :already_bootstrapped} ->
-            handle_already_bootstrapped_initial_partition(shard_index, config)
+            with {:ok, config} <-
+                   handle_already_bootstrapped_initial_partition(shard_index, config),
+                 do: {:ok, config, :existing}
 
           {:error, reason} ->
             {:error, reason}
