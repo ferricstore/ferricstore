@@ -1,6 +1,7 @@
 defmodule Ferricstore.Flow.CodecNifScheduleTest do
   use ExUnit.Case, async: true
 
+  alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.Codec
   alias Ferricstore.Flow.NifSchedule
 
@@ -68,6 +69,19 @@ defmodule Ferricstore.Flow.CodecNifScheduleTest do
 
     assert Enum.map(Codec.decode_records(values), & &1.id) ==
              Enum.map(1..300, &"flow-#{&1}")
+  end
+
+  test "the normal-scheduled entry points refuse inputs past their bound" do
+    large = Codec.encode_record(record(String.duplicate("f", 1_100_000)))
+    assert_raise ArgumentError, fn -> NIF.flow_record_decode(large) end
+    assert_raise ArgumentError, fn -> NIF.flow_record_decode_meta(large) end
+    assert {:ok, _fields} = NIF.flow_record_decode_dirty(large)
+
+    batch = for i <- 1..257, do: Codec.encode_record(record("flow-#{i}"))
+    assert_raise ArgumentError, fn -> NIF.flow_records_decode(batch) end
+    assert {:ok, decoded} = NIF.flow_records_decode_dirty(batch)
+    assert length(decoded) == 257
+    assert {:ok, _decoded} = NIF.flow_records_decode(Enum.take(batch, 256))
   end
 
   defp record(id) do

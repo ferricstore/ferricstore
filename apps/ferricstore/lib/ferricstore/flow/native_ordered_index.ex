@@ -494,7 +494,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         worker_key,
         state_key_prefix
       ) do
-    if NifSchedule.normal_claim_plan?(length(candidates), false) and
+    if NifSchedule.normal_claim_plan?(max(length(candidates), length(values)), false) and
          NifSchedule.normal_record?(NifSchedule.binary_bytes(values)) do
       NIF.flow_record_plan_claims(
         candidates,
@@ -570,7 +570,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         state_key_prefix,
         history_key_prefix
       ) do
-    if NifSchedule.normal_claim_plan?(length(candidates), true) and
+    if NifSchedule.normal_claim_plan?(max(length(candidates), length(values)), true) and
          NifSchedule.normal_record?(NifSchedule.binary_bytes(values)) do
       NIF.flow_record_plan_claims_with_history(
         candidates,

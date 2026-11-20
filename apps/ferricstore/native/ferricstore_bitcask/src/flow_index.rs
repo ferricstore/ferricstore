@@ -1,4 +1,6 @@
-use rustler::{Binary, Decoder, Encoder, Env, NifResult, OwnedBinary, ResourceArc, Term};
+use rustler::{
+    Binary, Decoder, Encoder, Env, ListIterator, NifResult, OwnedBinary, ResourceArc, Term,
+};
 use std::cmp::Ordering;
 use std::collections::{btree_set::Range as BTreeSetRange, BTreeSet, BinaryHeap, HashMap};
 use std::ops::Bound::{Excluded, Included, Unbounded};
@@ -8,6 +10,60 @@ const MAX_FLOW_INDEX_REQUEST_ITEMS: usize = 100_000;
 const MAX_FLOW_INDEX_REQUEST_BYTES: usize = 64 * 1024 * 1024;
 const MAX_FLOW_INDEX_PAGE_ITEMS: usize = 4_096;
 const FLOW_INDEX_REQUEST_TOO_LARGE: &str = "flow index native request exceeds safety budget";
+
+// The Normal-scheduled Flow codec entry points refuse inputs past these bounds,
+// which keep a call near 250 µs; Ferricstore.Flow.NifSchedule sends such inputs
+// to the `_dirty` twin instead.
+const NORMAL_CODEC_MAX_BYTES: usize = 1024 * 1024;
+const NORMAL_RECORD_BATCH_ITEMS: usize = 256;
+const NORMAL_CLAIM_PLAN_ITEMS: usize = 512;
+const NORMAL_CLAIM_PLAN_WITH_HISTORY_ITEMS: usize = 256;
+const NORMAL_TERMINAL_CHECK_ITEMS: usize = 2_048;
+
+fn normal_codec_bytes(total: usize) -> NifResult<()> {
+    if total <= NORMAL_CODEC_MAX_BYTES {
+        Ok(())
+    } else {
+        Err(rustler::Error::BadArg)
+    }
+}
+
+fn optional_binary_len(value: &Option<Binary<'_>>) -> usize {
+    value.as_ref().map_or(0, |binary| binary.len())
+}
+
+// Counts a list's items and its binaries' bytes, stopping at the bounds. A term
+// that is not a list is left to the codec's own validation.
+fn normal_codec_list(term: Term<'_>, max_items: usize) -> NifResult<()> {
+    let Ok(items) = term.decode::<ListIterator>() else {
+        return Ok(());
+    };
+    let mut count = 0usize;
+    let mut bytes = 0usize;
+
+    for item in items {
+        count += 1;
+        if count > max_items {
+            return Err(rustler::Error::BadArg);
+        }
+        if let Ok(binary) = item.decode::<Binary>() {
+            bytes += binary.len();
+            normal_codec_bytes(bytes)?;
+        }
+    }
+
+    Ok(())
+}
+
+fn normal_claim_plan(candidates: Term<'_>, values: Term<'_>, max_items: usize) -> NifResult<()> {
+    if candidates
+        .list_length()
+        .is_ok_and(|length| length > max_items)
+    {
+        return Err(rustler::Error::BadArg);
+    }
+    normal_codec_list(values, max_items)
+}
 
 struct FlowIndexRequestBudget {
     items: usize,
@@ -1482,7 +1538,7 @@ fn flow_record_plan_claims_impl<'a>(
     Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_record_plan_claims<'a>(
     env: Env<'a>,
@@ -1502,6 +1558,7 @@ pub fn flow_record_plan_claims<'a>(
     worker_key: Binary<'a>,
     state_key_prefix: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    normal_claim_plan(candidates_term, values_term, NORMAL_CLAIM_PLAN_ITEMS)?;
     flow_record_plan_claims_impl(
         env,
         candidates_term,
@@ -1793,7 +1850,7 @@ fn flow_record_plan_claims_with_history_impl<'a>(
     Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_record_plan_claims_with_history<'a>(
     env: Env<'a>,
@@ -1814,6 +1871,11 @@ pub fn flow_record_plan_claims_with_history<'a>(
     state_key_prefix: Binary<'a>,
     history_key_prefix: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    normal_claim_plan(
+        candidates_term,
+        values_term,
+        NORMAL_CLAIM_PLAN_WITH_HISTORY_ITEMS,
+    )?;
     flow_record_plan_claims_with_history_impl(
         env,
         candidates_term,
@@ -1947,7 +2009,7 @@ fn flow_record_encode_impl<'a>(
     binary_term(env, &out)
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_record_encode<'a>(
     env: Env<'a>,
@@ -1982,6 +2044,24 @@ pub fn flow_record_encode<'a>(
     rewound_to_event_id: Option<Binary<'a>>,
     child_groups_encoded: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    normal_codec_bytes(
+        optional_binary_len(&id)
+            + optional_binary_len(&flow_type)
+            + optional_binary_len(&state)
+            + optional_binary_len(&partition_key)
+            + optional_binary_len(&payload_ref)
+            + optional_binary_len(&parent_flow_id)
+            + optional_binary_len(&parent_partition_key)
+            + optional_binary_len(&root_flow_id)
+            + optional_binary_len(&correlation_id)
+            + optional_binary_len(&result_ref)
+            + optional_binary_len(&error_ref)
+            + optional_binary_len(&lease_owner)
+            + optional_binary_len(&lease_token)
+            + optional_binary_len(&run_state)
+            + optional_binary_len(&rewound_to_event_id)
+            + child_groups_encoded.len(),
+    )?;
     flow_record_encode_impl(
         env,
         id,
@@ -2263,9 +2343,10 @@ fn flow_record_decode_impl<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Ter
     Ok((crate::atoms::ok(), flow_record_fields(env, &record)?).encode(env))
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    normal_codec_bytes(value.len())?;
     flow_record_decode_impl(env, value)
 }
 
@@ -2301,9 +2382,10 @@ fn flow_records_decode_impl<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResul
     Ok((crate::atoms::ok(), decoded).encode(env))
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_records_decode<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult<Term<'a>> {
+    normal_codec_list(values_term, NORMAL_RECORD_BATCH_ITEMS)?;
     flow_records_decode_impl(env, values_term)
 }
 
@@ -2378,9 +2460,10 @@ fn flow_record_decode_meta_impl<'a>(env: Env<'a>, value: Binary<'a>) -> NifResul
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    normal_codec_bytes(value.len())?;
     flow_record_decode_meta_impl(env, value)
 }
 
@@ -2414,12 +2497,13 @@ fn flow_records_terminal_after_noop_impl<'a>(
     Ok(flags.encode(env))
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_records_terminal_after_noop<'a>(
     env: Env<'a>,
     values_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
+    normal_codec_list(values_term, NORMAL_TERMINAL_CHECK_ITEMS)?;
     flow_records_terminal_after_noop_impl(env, values_term)
 }
 
@@ -2483,7 +2567,7 @@ fn flow_history_encode_impl<'a>(
     binary_term(env, &out)
 }
 
-// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+// Refuses inputs past its NORMAL_ bound; NifSchedule sends those to the _dirty twin.
 #[rustler::nif(schedule = "Normal")]
 pub fn flow_history_encode<'a>(
     env: Env<'a>,
@@ -2510,6 +2594,21 @@ pub fn flow_history_encode<'a>(
     rewound_to_event_id: Option<Binary<'a>>,
     meta_encoded: Binary<'a>,
 ) -> NifResult<Term<'a>> {
+    normal_codec_bytes(
+        event.len()
+            + optional_binary_len(&_id)
+            + optional_binary_len(&_flow_type)
+            + optional_binary_len(&state)
+            + optional_binary_len(&lease_owner)
+            + optional_binary_len(&payload_ref)
+            + optional_binary_len(&_parent_flow_id)
+            + optional_binary_len(&_root_flow_id)
+            + optional_binary_len(&_correlation_id)
+            + optional_binary_len(&result_ref)
+            + optional_binary_len(&error_ref)
+            + optional_binary_len(&rewound_to_event_id)
+            + meta_encoded.len(),
+    )?;
     flow_history_encode_impl(
         env,
         event,
@@ -4906,15 +5005,15 @@ mod tests {
             "flow_index_due_keys_present",
             "flow_index_count_many",
             "flow_index_earliest_due_score",
-            "flow_record_plan_claims",
-            "flow_record_plan_claims_with_history",
-            "flow_record_encode",
-            "flow_record_decode",
-            "flow_records_decode",
-            "flow_record_decode_meta",
-            "flow_records_terminal_after_noop",
-            "flow_history_encode",
             "flow_history_decode",
+            "flow_record_plan_claims_dirty",
+            "flow_record_plan_claims_with_history_dirty",
+            "flow_record_encode_dirty",
+            "flow_record_decode_dirty",
+            "flow_records_decode_dirty",
+            "flow_record_decode_meta_dirty",
+            "flow_records_terminal_after_noop_dirty",
+            "flow_history_encode_dirty",
         ] {
             let declaration = format!("pub fn {function}");
             let declaration_offset = source.find(&declaration).unwrap();
@@ -4925,6 +5024,39 @@ mod tests {
             assert!(
                 attribute.contains("schedule = \"DirtyCpu\""),
                 "{function} accepts unbounded work and must not monopolize a normal scheduler"
+            );
+        }
+    }
+
+    #[test]
+    fn normal_scheduled_codec_nifs_refuse_inputs_past_their_bound() {
+        let source = include_str!("flow_index.rs");
+        for function in [
+            "flow_record_plan_claims",
+            "flow_record_plan_claims_with_history",
+            "flow_record_encode",
+            "flow_record_decode",
+            "flow_records_decode",
+            "flow_record_decode_meta",
+            "flow_records_terminal_after_noop",
+            "flow_history_encode",
+        ] {
+            let declaration = format!("pub fn {function}<");
+            let declaration_offset = source.find(&declaration).unwrap();
+            let attribute_start = source[..declaration_offset]
+                .rfind("#[rustler::nif")
+                .unwrap();
+            assert!(
+                source[attribute_start..declaration_offset].contains("schedule = \"Normal\""),
+                "{function} is the Normal-scheduled entry point"
+            );
+            let body = &source[declaration_offset..];
+            let body = &body[..body.find("\n}\n").unwrap()];
+            assert!(
+                body.contains("normal_codec_bytes(")
+                    || body.contains("normal_codec_list(")
+                    || body.contains("normal_claim_plan("),
+                "{function} runs on a normal scheduler and must refuse inputs past its bound"
             );
         }
     }
