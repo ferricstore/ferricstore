@@ -4,6 +4,15 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Flow commands use about half the server CPU per Flow. Since 0.8.0, encoding
+  and decoding Flow records and planning claims ran on dirty CPU schedulers,
+  and moving each call to a dirty scheduler and back cost more than the work
+  itself. These calls run on normal schedulers again; inputs too large to
+  finish well inside a millisecond still go to a dirty scheduler. On the
+  Python SDK queue benchmark (100k Flows, 16 shards, one client, Apple M4 Max)
+  server CPU fell from about 1.09 s to 0.55 s per 1,000 Flows and throughput
+  rose from about 11.4k to 17.2k Flows/s.
+
 - New native connections succeed while the server is saturated. HELLO, PING,
   QUIT, GOAWAY, STARTUP and WINDOW_UPDATE took a slot of the server-wide
   execution budget without waiting, and under load lanes queue for those slots,
