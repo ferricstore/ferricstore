@@ -62,6 +62,12 @@ defmodule FerricstoreServer.Native.Connection do
   @queued_behind_parked_lane "ERR native command cannot join the transaction behind parked work on its lane; EXEC will abort"
   @transaction_with_parked_work "ERR native MULTI cannot start while blocking commands or parked lane work are pending on this connection"
   @unordered_control_opcodes [0x0003, 0x0005, 0x0006, 0x0007, 0x0008, 0x000B, 0x000D, 0x000F]
+  # HELLO, PING, QUIT, GOAWAY, STARTUP and WINDOW_UPDATE open and keep a
+  # connection and do constant work on it alone, so they skip the server-wide
+  # execution budget. Lanes queue for execution slots under load, and a
+  # fail-fast slot for these frames would refuse every new connection for as
+  # long as the load lasts.
+  @connection_protocol_opcodes [0x0001, 0x0003, 0x0009, 0x000A, 0x000C, 0x000D]
 
   defstruct [
     :socket,
@@ -1319,23 +1325,20 @@ defmodule FerricstoreServer.Native.Connection do
   end
 
   defp execute_control_frame(frame, state) do
+    if opcode(frame) in @connection_protocol_opcodes do
+      run_control_frame(frame, state)
+    else
+      execute_governed_control_frame(frame, state)
+    end
+  end
+
+  defp execute_governed_control_frame(frame, state) do
     budget = state.resource_budget
 
     case ResourceBudget.acquire(budget, :executions, self(), 1) do
       {:ok, token} ->
         try do
-          case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
-            {:ok, payload} ->
-              Commands.mark_command_seen(state)
-              previous_state = state
-              {status, value, state} = Commands.execute(opcode(frame), payload, state)
-              :ok = Session.refresh_pubsub_delivery_capability(previous_state, state)
-              state = refresh_command_state_and_lanes(state)
-              {:reply, maybe_encode_response(frame, state, status, value), state}
-
-            {:error, reason} ->
-              {:reply, maybe_encode_response(frame, state, :bad_request, reason), state}
-          end
+          run_control_frame(frame, state)
         after
           ResourceBudget.release_async(budget, token)
         end
@@ -1353,6 +1356,21 @@ defmodule FerricstoreServer.Native.Connection do
         {:reply,
          maybe_encode_response(frame, state, :busy, "ERR native resource budget unavailable"),
          state}
+    end
+  end
+
+  defp run_control_frame(frame, state) do
+    case Codec.decode_body(opcode(frame), flags(frame), body(frame)) do
+      {:ok, payload} ->
+        Commands.mark_command_seen(state)
+        previous_state = state
+        {status, value, state} = Commands.execute(opcode(frame), payload, state)
+        :ok = Session.refresh_pubsub_delivery_capability(previous_state, state)
+        state = refresh_command_state_and_lanes(state)
+        {:reply, maybe_encode_response(frame, state, status, value), state}
+
+      {:error, reason} ->
+        {:reply, maybe_encode_response(frame, state, :bad_request, reason), state}
     end
   end
 

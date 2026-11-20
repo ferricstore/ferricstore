@@ -10,6 +10,7 @@ defmodule Ferricstore.Store.Router.Part08 do
       alias Ferricstore.HyperLogLog, as: HLL
       alias Ferricstore.Flow.Locator
       alias Ferricstore.Flow.NativeOrderedIndex, as: NativeFlowIndex
+      alias Ferricstore.Flow.NifSchedule
       alias Ferricstore.Raft.ReplyAwaiter
       alias Ferricstore.Stats
       alias Ferricstore.Store.BlobRef
@@ -330,13 +331,20 @@ defmodule Ferricstore.Store.Router.Part08 do
         end)
       end
 
+      defp terminal_after_noop_nif(binaries) do
+        if NifSchedule.normal_terminal_check?(length(binaries)) and
+             NifSchedule.normal_record?(NifSchedule.binary_bytes(binaries)),
+           do: Ferricstore.Bitcask.NIF.flow_records_terminal_after_noop(binaries),
+           else: Ferricstore.Bitcask.NIF.flow_records_terminal_after_noop_dirty(binaries)
+      end
+
       defp flow_terminal_many_noop_flags(values) do
         binaries = for value <- values, is_binary(value), do: value
 
         flags =
           case binaries do
             [] -> []
-            [_ | _] -> Ferricstore.Bitcask.NIF.flow_records_terminal_after_noop(binaries)
+            [_ | _] -> terminal_after_noop_nif(binaries)
           end
 
         {result, _remaining} =

@@ -6,6 +6,7 @@ defmodule Ferricstore.Flow.Codec do
   alias Ferricstore.Bitcask.NIF
   alias Ferricstore.Flow.Codec.Primitives
   alias Ferricstore.Flow.Codec.Support
+  alias Ferricstore.Flow.NifSchedule
 
   @history_tag :flow_history_v1
 
@@ -69,7 +70,7 @@ defmodule Ferricstore.Flow.Codec do
   # are not public-persisted yet, so this intentionally supports one current
   # format.
   def encode_record(record) when is_map(record) do
-    NIF.flow_record_encode(
+    args = [
       Map.get(record, :id),
       Map.get(record, :type),
       Map.get(record, :state),
@@ -100,7 +101,11 @@ defmodule Ferricstore.Flow.Codec do
       Map.get(record, :run_state),
       Map.get(record, :rewound_to_event_id),
       record |> Support.encode_record_sidecar() |> IO.iodata_to_binary()
-    )
+    ]
+
+    if NifSchedule.normal_record?(NifSchedule.binary_bytes(args)),
+      do: apply(NIF, :flow_record_encode, args),
+      else: apply(NIF, :flow_record_encode_dirty, args)
   end
 
   @doc false
@@ -231,7 +236,12 @@ defmodule Ferricstore.Flow.Codec do
   def record_blob?(_value), do: false
 
   def decode_record(@record_bin_magic <> _rest = value) do
-    case NIF.flow_record_decode(value) do
+    decoded =
+      if NifSchedule.normal_record?(byte_size(value)),
+        do: NIF.flow_record_decode(value),
+        else: NIF.flow_record_decode_dirty(value)
+
+    case decoded do
       {:ok, fields} -> decode_record_fields(fields)
       _ -> raise(ArgumentError, "invalid flow record")
     end
@@ -244,9 +254,14 @@ defmodule Ferricstore.Flow.Codec do
   def decode_records([]), do: []
 
   def decode_records(values) when is_list(values) do
-    case validate_record_batch(values, 0) do
-      {:ok, count} ->
-        case NIF.flow_records_decode(values) do
+    case validate_record_batch(values, 0, 0) do
+      {:ok, count, bytes} ->
+        decoded =
+          if NifSchedule.normal_record_batch?(count) and NifSchedule.normal_record?(bytes),
+            do: NIF.flow_records_decode(values),
+            else: NIF.flow_records_decode_dirty(values)
+
+        case decoded do
           {:ok, decoded} when is_list(decoded) and length(decoded) == count ->
             Enum.map(decoded, &decode_record_fields/1)
 
@@ -263,16 +278,21 @@ defmodule Ferricstore.Flow.Codec do
 
   def decode_records(_values), do: raise(ArgumentError, "invalid flow record batch")
 
-  defp validate_record_batch([], count), do: {:ok, count}
+  defp validate_record_batch([], count, bytes), do: {:ok, count, bytes}
 
-  defp validate_record_batch([@record_bin_magic <> _rest | values], count)
+  defp validate_record_batch([@record_bin_magic <> _rest = value | values], count, bytes)
        when count < @max_record_decode_batch,
-       do: validate_record_batch(values, count + 1)
+       do: validate_record_batch(values, count + 1, bytes + byte_size(value))
 
-  defp validate_record_batch(_values, _count), do: :error
+  defp validate_record_batch(_values, _count, _bytes), do: :error
 
   def decode_record_meta(@record_bin_magic <> _rest = value) do
-    case NIF.flow_record_decode_meta(value) do
+    decoded =
+      if NifSchedule.normal_record?(byte_size(value)),
+        do: NIF.flow_record_decode_meta(value),
+        else: NIF.flow_record_decode_meta_dirty(value)
+
+    case decoded do
       {:ok, fields} -> decode_record_meta_fields(fields)
       _ -> raise(ArgumentError, "invalid flow record")
     end
@@ -449,7 +469,7 @@ defmodule Ferricstore.Flow.Codec do
          rewound_to_event_id,
          meta_fields
        ) do
-    NIF.flow_history_encode(
+    args = [
       event,
       version,
       now_ms,
@@ -472,7 +492,11 @@ defmodule Ferricstore.Flow.Codec do
       error_ref,
       rewound_to_event_id,
       meta_fields |> Support.encode_history_meta() |> IO.iodata_to_binary()
-    )
+    ]
+
+    if NifSchedule.normal_record?(NifSchedule.binary_bytes(args)),
+      do: apply(NIF, :flow_history_encode, args),
+      else: apply(NIF, :flow_history_encode_dirty, args)
   end
 
   defp encode_history_parts_elixir(
