@@ -113,18 +113,25 @@ defmodule Ferricstore.Store.Router.Part07 do
         do: {:error, "ERR invalid flow governance release outbox completion"}
 
       @doc false
+      # Polling workers mostly find their queue empty. One precheck per shard
+      # covers every priority the claim would try (the precheck builds keys for
+      # all of them), so an empty queue answers without a pass per priority.
       def flow_claim_due(ctx, %{partition_key: :auto, limit: limit} = attrs)
           when is_integer(limit) and limit > 0 do
-        start_idx = flow_claim_due_start_shard(ctx, attrs)
+        if flow_claim_due_auto_empty?(ctx, attrs) do
+          {:ok, []}
+        else
+          start_idx = flow_claim_due_start_shard(ctx, attrs)
 
-        flow_claim_due_auto_priorities(
-          ctx,
-          attrs,
-          start_idx,
-          flow_claim_any_priorities(Map.get(attrs, :priority)),
-          limit,
-          []
-        )
+          flow_claim_due_auto_priorities(
+            ctx,
+            attrs,
+            start_idx,
+            flow_claim_any_priorities(Map.get(attrs, :priority)),
+            limit,
+            []
+          )
+        end
       end
 
       def flow_claim_due(ctx, %{partition_keys: [_ | _] = partition_keys, limit: limit} = attrs)
@@ -830,16 +837,11 @@ defmodule Ferricstore.Store.Router.Part07 do
         with {:ok, states} <- flow_claim_due_precheck_states(state),
              priorities <- flow_claim_any_priorities(priority),
              true <- Enum.all?(priorities, &is_integer/1),
-             [_ | _] = partition_keys <- flow_auto_partition_keys_for_shard(ctx, idx) do
+             [_ | _] = partition_tags <- flow_auto_partition_tags_for_shard(ctx, idx) do
           encoded_type = Ferricstore.Flow.Keys.index_component(type)
 
           encoded_states =
             Enum.map(states, fn state -> Ferricstore.Flow.Keys.index_component(state) end)
-
-          partition_tags =
-            Enum.map(partition_keys, fn partition_key ->
-              Ferricstore.Flow.Keys.tag(partition_key)
-            end)
 
           keys =
             for encoded_state <- encoded_states,
@@ -861,9 +863,20 @@ defmodule Ferricstore.Store.Router.Part07 do
 
       defp flow_claim_due_auto_precheck_keys(_ctx, _idx, _type, _state, _priority), do: :unknown
 
-      defp flow_auto_partition_keys_for_shard(%{shard_count: shard_count} = ctx, idx)
+      defp flow_claim_due_auto_empty?(%{shard_count: shard_count} = ctx, attrs)
+           when is_integer(shard_count) and shard_count > 0 do
+        Enum.all?(0..(shard_count - 1)//1, fn idx ->
+          flow_claim_due_auto_empty_precheck(ctx, idx, attrs) == :empty
+        end)
+      end
+
+      defp flow_claim_due_auto_empty?(_ctx, _attrs), do: false
+
+      # The hash tags of the automatic partitions a shard owns; computed once per
+      # slot map, as every empty-queue precheck needs them.
+      defp flow_auto_partition_tags_for_shard(%{shard_count: shard_count} = ctx, idx)
            when is_integer(shard_count) and shard_count > 0 and is_integer(idx) do
-        key = {__MODULE__, :flow_auto_partition_keys_for_shard, ctx.name, ctx.slot_map}
+        key = {__MODULE__, :flow_auto_partition_tags_for_shard, ctx.name, ctx.slot_map}
 
         key
         |> :persistent_term.get(nil)
@@ -871,11 +884,14 @@ defmodule Ferricstore.Store.Router.Part07 do
           nil ->
             groups =
               Ferricstore.Flow.Keys.auto_partition_keys()
-              |> Enum.group_by(fn partition_key ->
-                "__auto_probe__"
-                |> Ferricstore.Flow.Keys.due_key("__auto_probe__", 0, partition_key)
-                |> then(&shard_for(ctx, &1))
-              end)
+              |> Enum.group_by(
+                fn partition_key ->
+                  "__auto_probe__"
+                  |> Ferricstore.Flow.Keys.due_key("__auto_probe__", 0, partition_key)
+                  |> then(&shard_for(ctx, &1))
+                end,
+                &Ferricstore.Flow.Keys.tag/1
+              )
 
             :persistent_term.put(key, groups)
             Map.get(groups, idx, [])
@@ -885,7 +901,7 @@ defmodule Ferricstore.Store.Router.Part07 do
         end
       end
 
-      defp flow_auto_partition_keys_for_shard(_ctx, _idx), do: []
+      defp flow_auto_partition_tags_for_shard(_ctx, _idx), do: []
 
       defp flow_claim_due_partition_key_results(results, limit) do
         results
