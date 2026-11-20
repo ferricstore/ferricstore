@@ -2,6 +2,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
   @moduledoc false
 
   alias Ferricstore.Bitcask.NIF
+  alias Ferricstore.Flow.NifSchedule
 
   @registry_key {__MODULE__, :resource}
   @busy_retry_initial_ms 1
@@ -493,7 +494,13 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         worker_key,
         state_key_prefix
       ) do
-    NIF.flow_record_plan_claims(
+    function =
+      if NifSchedule.normal_claim_plan?(length(candidates), false) and
+           NifSchedule.normal_record?(NifSchedule.binary_bytes(values)),
+         do: :flow_record_plan_claims,
+         else: :flow_record_plan_claims_dirty
+
+    apply(NIF, function, [
       candidates,
       values,
       type,
@@ -509,7 +516,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       inflight_key,
       worker_key,
       state_key_prefix
-    )
+    ])
   end
 
   @spec plan_claims_with_history(
@@ -548,7 +555,13 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         state_key_prefix,
         history_key_prefix
       ) do
-    NIF.flow_record_plan_claims_with_history(
+    function =
+      if NifSchedule.normal_claim_plan?(length(candidates), true) and
+           NifSchedule.normal_record?(NifSchedule.binary_bytes(values)),
+         do: :flow_record_plan_claims_with_history,
+         else: :flow_record_plan_claims_with_history_dirty
+
+    apply(NIF, function, [
       candidates,
       values,
       type,
@@ -565,7 +578,7 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
       worker_key,
       state_key_prefix,
       history_key_prefix
-    )
+    ])
   end
 
   defp registry_key(index_table, lookup_table), do: {@registry_key, index_table, lookup_table}

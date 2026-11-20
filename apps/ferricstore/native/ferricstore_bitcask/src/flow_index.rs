@@ -1305,8 +1305,7 @@ pub fn flow_index_rollback_claim_entries<'a>(
     Ok(crate::atoms::ok().encode(env))
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_record_plan_claims<'a>(
+fn flow_record_plan_claims_impl<'a>(
     env: Env<'a>,
     candidates_term: Term<'a>,
     values_term: Term<'a>,
@@ -1483,8 +1482,86 @@ pub fn flow_record_plan_claims<'a>(
     Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
 }
 
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_record_plan_claims<'a>(
+    env: Env<'a>,
+    candidates_term: Term<'a>,
+    values_term: Term<'a>,
+    flow_type: Binary<'a>,
+    expected_state: Binary<'a>,
+    worker: Binary<'a>,
+    lease_ms: u64,
+    now_ms: u64,
+    remaining: usize,
+    from_due_key: Binary<'a>,
+    to_due_key: Binary<'a>,
+    from_state_key: Binary<'a>,
+    to_state_key: Binary<'a>,
+    inflight_key: Binary<'a>,
+    worker_key: Binary<'a>,
+    state_key_prefix: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_record_plan_claims_impl(
+        env,
+        candidates_term,
+        values_term,
+        flow_type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+    )
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_record_plan_claims_with_history<'a>(
+pub fn flow_record_plan_claims_dirty<'a>(
+    env: Env<'a>,
+    candidates_term: Term<'a>,
+    values_term: Term<'a>,
+    flow_type: Binary<'a>,
+    expected_state: Binary<'a>,
+    worker: Binary<'a>,
+    lease_ms: u64,
+    now_ms: u64,
+    remaining: usize,
+    from_due_key: Binary<'a>,
+    to_due_key: Binary<'a>,
+    from_state_key: Binary<'a>,
+    to_state_key: Binary<'a>,
+    inflight_key: Binary<'a>,
+    worker_key: Binary<'a>,
+    state_key_prefix: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_record_plan_claims_impl(
+        env,
+        candidates_term,
+        values_term,
+        flow_type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+    )
+}
+
+fn flow_record_plan_claims_with_history_impl<'a>(
     env: Env<'a>,
     candidates_term: Term<'a>,
     values_term: Term<'a>,
@@ -1716,8 +1793,90 @@ pub fn flow_record_plan_claims_with_history<'a>(
     Ok((crate::atoms::ok(), plan_terms, stale_terms, accepted).encode(env))
 }
 
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_record_plan_claims_with_history<'a>(
+    env: Env<'a>,
+    candidates_term: Term<'a>,
+    values_term: Term<'a>,
+    flow_type: Binary<'a>,
+    expected_state: Binary<'a>,
+    worker: Binary<'a>,
+    lease_ms: u64,
+    now_ms: u64,
+    remaining: usize,
+    from_due_key: Binary<'a>,
+    to_due_key: Binary<'a>,
+    from_state_key: Binary<'a>,
+    to_state_key: Binary<'a>,
+    inflight_key: Binary<'a>,
+    worker_key: Binary<'a>,
+    state_key_prefix: Binary<'a>,
+    history_key_prefix: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_record_plan_claims_with_history_impl(
+        env,
+        candidates_term,
+        values_term,
+        flow_type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+        history_key_prefix,
+    )
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_record_encode<'a>(
+pub fn flow_record_plan_claims_with_history_dirty<'a>(
+    env: Env<'a>,
+    candidates_term: Term<'a>,
+    values_term: Term<'a>,
+    flow_type: Binary<'a>,
+    expected_state: Binary<'a>,
+    worker: Binary<'a>,
+    lease_ms: u64,
+    now_ms: u64,
+    remaining: usize,
+    from_due_key: Binary<'a>,
+    to_due_key: Binary<'a>,
+    from_state_key: Binary<'a>,
+    to_state_key: Binary<'a>,
+    inflight_key: Binary<'a>,
+    worker_key: Binary<'a>,
+    state_key_prefix: Binary<'a>,
+    history_key_prefix: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_record_plan_claims_with_history_impl(
+        env,
+        candidates_term,
+        values_term,
+        flow_type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+        history_key_prefix,
+    )
+}
+
+fn flow_record_encode_impl<'a>(
     env: Env<'a>,
     id: Option<Binary<'a>>,
     flow_type: Option<Binary<'a>>,
@@ -1786,6 +1945,145 @@ pub fn flow_record_encode<'a>(
     };
 
     binary_term(env, &out)
+}
+
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_record_encode<'a>(
+    env: Env<'a>,
+    id: Option<Binary<'a>>,
+    flow_type: Option<Binary<'a>>,
+    state: Option<Binary<'a>>,
+    version: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    priority: Option<u64>,
+    ttl_ms: Option<u64>,
+    history_hot_max_events: Option<u64>,
+    history_max_events: Option<u64>,
+    retention_ttl_ms: Option<u64>,
+    terminal_retention_until_ms: Option<u64>,
+    max_active_ms: Option<u64>,
+    partition_key: Option<Binary<'a>>,
+    payload_ref: Option<Binary<'a>>,
+    parent_flow_id: Option<Binary<'a>>,
+    parent_partition_key: Option<Binary<'a>>,
+    root_flow_id: Option<Binary<'a>>,
+    correlation_id: Option<Binary<'a>>,
+    result_ref: Option<Binary<'a>>,
+    error_ref: Option<Binary<'a>>,
+    lease_owner: Option<Binary<'a>>,
+    lease_token: Option<Binary<'a>>,
+    lease_deadline_ms: Option<u64>,
+    run_state: Option<Binary<'a>>,
+    rewound_to_event_id: Option<Binary<'a>>,
+    child_groups_encoded: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_record_encode_impl(
+        env,
+        id,
+        flow_type,
+        state,
+        version,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        priority,
+        ttl_ms,
+        history_hot_max_events,
+        history_max_events,
+        retention_ttl_ms,
+        terminal_retention_until_ms,
+        max_active_ms,
+        partition_key,
+        payload_ref,
+        parent_flow_id,
+        parent_partition_key,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        lease_owner,
+        lease_token,
+        lease_deadline_ms,
+        run_state,
+        rewound_to_event_id,
+        child_groups_encoded,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_record_encode_dirty<'a>(
+    env: Env<'a>,
+    id: Option<Binary<'a>>,
+    flow_type: Option<Binary<'a>>,
+    state: Option<Binary<'a>>,
+    version: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    priority: Option<u64>,
+    ttl_ms: Option<u64>,
+    history_hot_max_events: Option<u64>,
+    history_max_events: Option<u64>,
+    retention_ttl_ms: Option<u64>,
+    terminal_retention_until_ms: Option<u64>,
+    max_active_ms: Option<u64>,
+    partition_key: Option<Binary<'a>>,
+    payload_ref: Option<Binary<'a>>,
+    parent_flow_id: Option<Binary<'a>>,
+    parent_partition_key: Option<Binary<'a>>,
+    root_flow_id: Option<Binary<'a>>,
+    correlation_id: Option<Binary<'a>>,
+    result_ref: Option<Binary<'a>>,
+    error_ref: Option<Binary<'a>>,
+    lease_owner: Option<Binary<'a>>,
+    lease_token: Option<Binary<'a>>,
+    lease_deadline_ms: Option<u64>,
+    run_state: Option<Binary<'a>>,
+    rewound_to_event_id: Option<Binary<'a>>,
+    child_groups_encoded: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_record_encode_impl(
+        env,
+        id,
+        flow_type,
+        state,
+        version,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        priority,
+        ttl_ms,
+        history_hot_max_events,
+        history_max_events,
+        retention_ttl_ms,
+        terminal_retention_until_ms,
+        max_active_ms,
+        partition_key,
+        payload_ref,
+        parent_flow_id,
+        parent_partition_key,
+        root_flow_id,
+        correlation_id,
+        result_ref,
+        error_ref,
+        lease_owner,
+        lease_token,
+        lease_deadline_ms,
+        run_state,
+        rewound_to_event_id,
+        child_groups_encoded,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1957,8 +2255,7 @@ fn encode_flow_record_compact(
     Some(out)
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+fn flow_record_decode_impl<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
     let Some(record) = decode_flow_record(value.as_slice()) else {
         return Ok(crate::atoms::error().encode(env));
     };
@@ -1966,8 +2263,18 @@ pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term
     Ok((crate::atoms::ok(), flow_record_fields(env, &record)?).encode(env))
 }
 
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_record_decode<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    flow_record_decode_impl(env, value)
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_records_decode<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult<Term<'a>> {
+pub fn flow_record_decode_dirty<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    flow_record_decode_impl(env, value)
+}
+
+fn flow_records_decode_impl<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult<Term<'a>> {
     let Some(values) = decode_bounded_list::<Binary<'a>>(values_term, MAX_FLOW_INDEX_PAGE_ITEMS)?
     else {
         return Ok(crate::atoms::error().encode(env));
@@ -1992,6 +2299,17 @@ pub fn flow_records_decode<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult
     }
 
     Ok((crate::atoms::ok(), decoded).encode(env))
+}
+
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_records_decode<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult<Term<'a>> {
+    flow_records_decode_impl(env, values_term)
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_records_decode_dirty<'a>(env: Env<'a>, values_term: Term<'a>) -> NifResult<Term<'a>> {
+    flow_records_decode_impl(env, values_term)
 }
 
 fn flow_record_fields<'a>(env: Env<'a>, record: &FlowRecordParts<'_>) -> NifResult<Vec<Term<'a>>> {
@@ -2029,8 +2347,7 @@ fn flow_record_fields<'a>(env: Env<'a>, record: &FlowRecordParts<'_>) -> NifResu
     ])
 }
 
-#[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+fn flow_record_decode_meta_impl<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
     let Some(record) = decode_flow_record(value.as_slice()) else {
         return Ok(crate::atoms::error().encode(env));
     };
@@ -2061,8 +2378,18 @@ pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult
     Ok((crate::atoms::ok(), fields).encode(env))
 }
 
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_record_decode_meta<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    flow_record_decode_meta_impl(env, value)
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_records_terminal_after_noop<'a>(
+pub fn flow_record_decode_meta_dirty<'a>(env: Env<'a>, value: Binary<'a>) -> NifResult<Term<'a>> {
+    flow_record_decode_meta_impl(env, value)
+}
+
+fn flow_records_terminal_after_noop_impl<'a>(
     env: Env<'a>,
     values_term: Term<'a>,
 ) -> NifResult<Term<'a>> {
@@ -2087,8 +2414,24 @@ pub fn flow_records_terminal_after_noop<'a>(
     Ok(flags.encode(env))
 }
 
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_records_terminal_after_noop<'a>(
+    env: Env<'a>,
+    values_term: Term<'a>,
+) -> NifResult<Term<'a>> {
+    flow_records_terminal_after_noop_impl(env, values_term)
+}
+
 #[rustler::nif(schedule = "DirtyCpu")]
-pub fn flow_history_encode<'a>(
+pub fn flow_records_terminal_after_noop_dirty<'a>(
+    env: Env<'a>,
+    values_term: Term<'a>,
+) -> NifResult<Term<'a>> {
+    flow_records_terminal_after_noop_impl(env, values_term)
+}
+
+fn flow_history_encode_impl<'a>(
     env: Env<'a>,
     event: Binary<'a>,
     version: Option<u64>,
@@ -2138,6 +2481,113 @@ pub fn flow_history_encode<'a>(
     };
 
     binary_term(env, &out)
+}
+
+// Ferricstore.Flow.NifSchedule sends inputs past its size limit to the _dirty twin.
+#[rustler::nif(schedule = "Normal")]
+pub fn flow_history_encode<'a>(
+    env: Env<'a>,
+    event: Binary<'a>,
+    version: Option<u64>,
+    now_ms: Option<u64>,
+    _id: Option<Binary<'a>>,
+    _flow_type: Option<Binary<'a>>,
+    state: Option<Binary<'a>>,
+    priority: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    lease_deadline_ms: Option<u64>,
+    lease_owner: Option<Binary<'a>>,
+    payload_ref: Option<Binary<'a>>,
+    _parent_flow_id: Option<Binary<'a>>,
+    _root_flow_id: Option<Binary<'a>>,
+    _correlation_id: Option<Binary<'a>>,
+    result_ref: Option<Binary<'a>>,
+    error_ref: Option<Binary<'a>>,
+    rewound_to_event_id: Option<Binary<'a>>,
+    meta_encoded: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_history_encode_impl(
+        env,
+        event,
+        version,
+        now_ms,
+        _id,
+        _flow_type,
+        state,
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        _parent_flow_id,
+        _root_flow_id,
+        _correlation_id,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_encoded,
+    )
+}
+
+#[rustler::nif(schedule = "DirtyCpu")]
+pub fn flow_history_encode_dirty<'a>(
+    env: Env<'a>,
+    event: Binary<'a>,
+    version: Option<u64>,
+    now_ms: Option<u64>,
+    _id: Option<Binary<'a>>,
+    _flow_type: Option<Binary<'a>>,
+    state: Option<Binary<'a>>,
+    priority: Option<u64>,
+    attempts: Option<u64>,
+    fencing_token: Option<u64>,
+    created_at_ms: Option<u64>,
+    updated_at_ms: Option<u64>,
+    next_run_at_ms: Option<u64>,
+    lease_deadline_ms: Option<u64>,
+    lease_owner: Option<Binary<'a>>,
+    payload_ref: Option<Binary<'a>>,
+    _parent_flow_id: Option<Binary<'a>>,
+    _root_flow_id: Option<Binary<'a>>,
+    _correlation_id: Option<Binary<'a>>,
+    result_ref: Option<Binary<'a>>,
+    error_ref: Option<Binary<'a>>,
+    rewound_to_event_id: Option<Binary<'a>>,
+    meta_encoded: Binary<'a>,
+) -> NifResult<Term<'a>> {
+    flow_history_encode_impl(
+        env,
+        event,
+        version,
+        now_ms,
+        _id,
+        _flow_type,
+        state,
+        priority,
+        attempts,
+        fencing_token,
+        created_at_ms,
+        updated_at_ms,
+        next_run_at_ms,
+        lease_deadline_ms,
+        lease_owner,
+        payload_ref,
+        _parent_flow_id,
+        _root_flow_id,
+        _correlation_id,
+        result_ref,
+        error_ref,
+        rewound_to_event_id,
+        meta_encoded,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
