@@ -283,6 +283,42 @@ defmodule Ferricstore.Bitcask.NIF do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_record_plan_claims_dirty(
+          [{binary(), float()}],
+          [binary() | nil],
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary()
+        ) :: {:ok, [flow_record_claim_plan()], [binary()], non_neg_integer()} | :fallback
+  def flow_record_plan_claims_dirty(
+        _candidates,
+        _values,
+        _type,
+        _expected_state,
+        _worker,
+        _lease_ms,
+        _now_ms,
+        _remaining,
+        _from_due_key,
+        _to_due_key,
+        _from_state_key,
+        _to_state_key,
+        _inflight_key,
+        _worker_key,
+        _state_key_prefix
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_record_plan_claims_with_history(
           [{binary(), float()}],
           [binary() | nil],
@@ -303,6 +339,45 @@ defmodule Ferricstore.Bitcask.NIF do
         ) ::
           {:ok, [flow_record_claim_history_plan()], [binary()], non_neg_integer()} | :fallback
   def flow_record_plan_claims_with_history(
+        _candidates,
+        _values,
+        _type,
+        _expected_state,
+        _worker,
+        _lease_ms,
+        _now_ms,
+        _remaining,
+        _from_due_key,
+        _to_due_key,
+        _from_state_key,
+        _to_state_key,
+        _inflight_key,
+        _worker_key,
+        _state_key_prefix,
+        _history_key_prefix
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_record_plan_claims_with_history_dirty(
+          [{binary(), float()}],
+          [binary() | nil],
+          binary(),
+          binary(),
+          binary(),
+          non_neg_integer(),
+          non_neg_integer(),
+          non_neg_integer(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary(),
+          binary()
+        ) ::
+          {:ok, [flow_record_claim_history_plan()], [binary()], non_neg_integer()} | :fallback
+  def flow_record_plan_claims_with_history_dirty(
         _candidates,
         _values,
         _type,
@@ -388,17 +463,95 @@ defmodule Ferricstore.Bitcask.NIF do
       ),
       do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_record_encode_dirty(
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary()
+        ) :: binary()
+  def flow_record_encode_dirty(
+        _id,
+        _type,
+        _state,
+        _version,
+        _attempts,
+        _fencing_token,
+        _created_at_ms,
+        _updated_at_ms,
+        _next_run_at_ms,
+        _priority,
+        _ttl_ms,
+        _history_hot_max_events,
+        _history_max_events,
+        _retention_ttl_ms,
+        _terminal_retention_until_ms,
+        _max_active_ms,
+        _partition_key,
+        _payload_ref,
+        _parent_flow_id,
+        _parent_partition_key,
+        _root_flow_id,
+        _correlation_id,
+        _result_ref,
+        _error_ref,
+        _lease_owner,
+        _lease_token,
+        _lease_deadline_ms,
+        _run_state,
+        _rewound_to_event_id,
+        _child_groups_encoded
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_record_decode(binary()) :: {:ok, list()} | :error
   def flow_record_decode(_value), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_record_decode_dirty(binary()) :: {:ok, list()} | :error
+  def flow_record_decode_dirty(_value), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec flow_records_decode([binary()]) :: {:ok, [list()]} | :error
   def flow_records_decode(_values), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_records_decode_dirty([binary()]) :: {:ok, [list()]} | :error
+  def flow_records_decode_dirty(_values), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_record_decode_meta(binary()) :: {:ok, list()} | :error
   def flow_record_decode_meta(_value), do: :erlang.nif_error(:nif_not_loaded)
 
+  @spec flow_record_decode_meta_dirty(binary()) :: {:ok, list()} | :error
+  def flow_record_decode_meta_dirty(_value), do: :erlang.nif_error(:nif_not_loaded)
+
   @spec flow_records_terminal_after_noop([binary()]) :: [boolean()]
   def flow_records_terminal_after_noop(_values), do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_records_terminal_after_noop_dirty([binary()]) :: [boolean()]
+  def flow_records_terminal_after_noop_dirty(_values), do: :erlang.nif_error(:nif_not_loaded)
 
   @spec flow_history_encode(
           binary(),
@@ -425,6 +578,56 @@ defmodule Ferricstore.Bitcask.NIF do
           binary()
         ) :: binary()
   def flow_history_encode(
+        _event,
+        _version,
+        _now_ms,
+        _id,
+        _type,
+        _state,
+        _priority,
+        _attempts,
+        _fencing_token,
+        _created_at_ms,
+        _updated_at_ms,
+        _next_run_at_ms,
+        _lease_deadline_ms,
+        _lease_owner,
+        _payload_ref,
+        _parent_flow_id,
+        _root_flow_id,
+        _correlation_id,
+        _result_ref,
+        _error_ref,
+        _rewound_to_event_id,
+        _meta_encoded
+      ),
+      do: :erlang.nif_error(:nif_not_loaded)
+
+  @spec flow_history_encode_dirty(
+          binary(),
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          non_neg_integer() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary() | nil,
+          binary()
+        ) :: binary()
+  def flow_history_encode_dirty(
         _event,
         _version,
         _now_ms,

@@ -4,13 +4,23 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
-- A claim without a partition key on an empty queue costs about a third of the
-  server CPU it did. Each priority the claim tries (2, 1 and 0 when none is
-  given) checked every shard's index on its own; one check per shard now covers
-  all of them, and the shard's partition tags are computed once instead of on
-  every check. With 16 workers polling an empty queue on a 16-shard node, the
-  server spent about 4.6 ms of CPU per claim (34 ms at feature level 0, where
-  the check also reads the cold due rows); now about 1.5 ms (10 ms).
+- Flow commands use about half the server CPU per Flow. Since 0.8.0, encoding
+  and decoding Flow records and planning claims ran on dirty CPU schedulers,
+  and moving each call to a dirty scheduler and back cost more than the work
+  itself. These calls run on normal schedulers again; inputs too large to
+  finish well inside a millisecond still go to a dirty scheduler. On the
+  Python SDK queue benchmark (100k Flows, 16 shards, one client, Apple M4 Max)
+  server CPU fell from about 1.09 s to 0.55 s per 1,000 Flows and throughput
+  rose from about 11.4k to 17.2k Flows/s.
+
+- New native connections succeed while the server is saturated. HELLO, PING,
+  QUIT, GOAWAY, STARTUP and WINDOW_UPDATE took a slot of the server-wide
+  execution budget without waiting, and under load lanes queue for those slots,
+  so every handshake got `ERR native global execution limit exceeded` for as
+  long as the load lasted. With four Python SDK queue benchmark clients started
+  together, a third of each client's producer connections failed this way.
+  These frames now skip the execution budget; other control commands, such as
+  AUTH and OPTIONS, still take a slot.
 
 ## 0.12.21 - 2026-11-14
 
