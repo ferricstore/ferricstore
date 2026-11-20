@@ -4,6 +4,8 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+## 0.12.23 - 2026-11-20
+
 - A native client that spreads requests over many lanes no longer runs the
   server out of lanes. A connection kept a lane process, and a slot of the
   server-wide lane budget (`native_max_global_lanes`, 32 per scheduler), for
