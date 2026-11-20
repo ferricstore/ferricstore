@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- A claim without a partition key on an empty queue costs about a third of the
+  server CPU it did. Each priority the claim tries (2, 1 and 0 when none is
+  given) checked every shard's index on its own; one check per shard now covers
+  all of them, and the shard's partition tags are computed once instead of on
+  every check. With 16 workers polling an empty queue on a 16-shard node, the
+  server spent about 4.6 ms of CPU per claim (34 ms at feature level 0, where
+  the check also reads the cold due rows); now about 1.5 ms (10 ms).
+
 ## 0.12.21 - 2026-11-14
 
 - A text `FLOW.GET`, `FLOW.CLAIM_DUE` or `FLOW.RECLAIM` (as sent over HTTP or
