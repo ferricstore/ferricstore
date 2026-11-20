@@ -69,8 +69,15 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
 
         pruning? =
           Enum.any?(stack, fn
-            {LMDBRebuilder, :ensure_apply_projection_row_durable, _, _} -> true
-            _ -> false
+            {LMDBRebuilder, fun, _, _}
+            when fun in [
+                   :ensure_apply_projection_rows_durable,
+                   :ensure_apply_projection_row_durable
+                 ] ->
+              true
+
+            _ ->
+              false
           end)
 
         if pruning? or (before_prune? and not Process.get(:prune_hook_called, false)) do
@@ -200,6 +207,104 @@ defmodule Ferricstore.Flow.LMDBRebuilderPruneRaceTest do
              )
 
     assert :ets.lookup(keydir, key) == [row]
+  end
+
+  # A Raft command's apply projection is one batch on disk; checking each pruned
+  # row on its own decoded the whole batch once per row.
+  test "terminal rebuild pruning reads an apply-projection batch once per chunk" do
+    data_dir =
+      Path.join(System.tmp_dir!(), "rebuild-prune-batch-#{System.unique_integer([:positive])}")
+
+    shard_path = Ferricstore.DataDir.shard_data_path(data_dir, 0)
+    keydir = :ets.new(:rebuild_prune_batch_keydir, [:set])
+    bytes = :atomics.new(1, signed: true)
+
+    rows =
+      for i <- 1..50 do
+        id = "prune-batch-#{i}"
+        key = Keys.state_key(id)
+
+        encoded =
+          Ferricstore.Flow.encode_record(%{
+            id: id,
+            type: "prune",
+            state: "completed",
+            version: 1,
+            incarnation: 1,
+            attempts: 0,
+            fencing_token: 0,
+            created_at_ms: 1,
+            updated_at_ms: 2,
+            next_run_at_ms: nil,
+            priority: 0,
+            partition_key: nil,
+            root_flow_id: id
+          })
+
+        {key, encoded, 0, 0, {:waraft_apply_projection, 1}, 0, byte_size(encoded)}
+      end
+
+    true = :ets.insert(keydir, rows)
+
+    :atomics.put(
+      bytes,
+      1,
+      Enum.sum(Enum.map(rows, fn row -> offheap(elem(row, 0)) + offheap(elem(row, 1)) end))
+    )
+
+    on_exit(fn ->
+      WARaftSegmentReader.clear_apply_projection_cache(data_dir, 0)
+      File.rm_rf!(data_dir)
+    end)
+
+    assert :ok =
+             WARaftSegmentReader.put_apply_projection(
+               data_dir,
+               0,
+               1,
+               Enum.map(rows, fn row -> {elem(row, 0), elem(row, 1), 0} end)
+             )
+
+    test_pid = self()
+
+    Process.put(:ferricstore_waraft_apply_projection_disk_read_hook, fn _root, index, source ->
+      send(test_pid, {:disk_read, index, source})
+      :ok
+    end)
+
+    ctx = %{data_dir: data_dir, shard_count: 1, keydir_binary_bytes: bytes}
+
+    try do
+      assert :ok =
+               LMDBRebuilder.reconcile_shard(
+                 shard_path,
+                 keydir,
+                 0,
+                 ctx,
+                 nil,
+                 nil,
+                 nil,
+                 nil,
+                 prune_terminal_keydir?: true
+               )
+    after
+      Process.delete(:ferricstore_waraft_apply_projection_disk_read_hook)
+    end
+
+    assert :ets.tab2list(keydir) == []
+    assert :atomics.get(bytes, 1) == 0
+    # Once when the chunk's cold rows are written and once when its pruned rows
+    # are made durable; 50 rows read the batch 51 times before.
+    assert disk_reads(1, :latest) == 2
+  end
+
+  defp disk_reads(index, source, count \\ 0) do
+    receive do
+      {:disk_read, ^index, ^source} -> disk_reads(index, source, count + 1)
+      {:disk_read, _index, _source} -> disk_reads(index, source, count)
+    after
+      0 -> count
+    end
   end
 
   defp offheap(binary) when byte_size(binary) > 64, do: byte_size(binary)
