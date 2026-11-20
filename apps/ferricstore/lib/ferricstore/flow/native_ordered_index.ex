@@ -494,29 +494,44 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         worker_key,
         state_key_prefix
       ) do
-    function =
-      if NifSchedule.normal_claim_plan?(length(candidates), false) and
-           NifSchedule.normal_record?(NifSchedule.binary_bytes(values)),
-         do: :flow_record_plan_claims,
-         else: :flow_record_plan_claims_dirty
-
-    apply(NIF, function, [
-      candidates,
-      values,
-      type,
-      expected_state,
-      worker,
-      lease_ms,
-      now_ms,
-      remaining,
-      from_due_key,
-      to_due_key,
-      from_state_key,
-      to_state_key,
-      inflight_key,
-      worker_key,
-      state_key_prefix
-    ])
+    if NifSchedule.normal_claim_plan?(length(candidates), false) and
+         NifSchedule.normal_record?(NifSchedule.binary_bytes(values)) do
+      NIF.flow_record_plan_claims(
+        candidates,
+        values,
+        type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix
+      )
+    else
+      NIF.flow_record_plan_claims_dirty(
+        candidates,
+        values,
+        type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix
+      )
+    end
   end
 
   @spec plan_claims_with_history(
@@ -555,30 +570,46 @@ defmodule Ferricstore.Flow.NativeOrderedIndex do
         state_key_prefix,
         history_key_prefix
       ) do
-    function =
-      if NifSchedule.normal_claim_plan?(length(candidates), true) and
-           NifSchedule.normal_record?(NifSchedule.binary_bytes(values)),
-         do: :flow_record_plan_claims_with_history,
-         else: :flow_record_plan_claims_with_history_dirty
-
-    apply(NIF, function, [
-      candidates,
-      values,
-      type,
-      expected_state,
-      worker,
-      lease_ms,
-      now_ms,
-      remaining,
-      from_due_key,
-      to_due_key,
-      from_state_key,
-      to_state_key,
-      inflight_key,
-      worker_key,
-      state_key_prefix,
-      history_key_prefix
-    ])
+    if NifSchedule.normal_claim_plan?(length(candidates), true) and
+         NifSchedule.normal_record?(NifSchedule.binary_bytes(values)) do
+      NIF.flow_record_plan_claims_with_history(
+        candidates,
+        values,
+        type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+        history_key_prefix
+      )
+    else
+      NIF.flow_record_plan_claims_with_history_dirty(
+        candidates,
+        values,
+        type,
+        expected_state,
+        worker,
+        lease_ms,
+        now_ms,
+        remaining,
+        from_due_key,
+        to_due_key,
+        from_state_key,
+        to_state_key,
+        inflight_key,
+        worker_key,
+        state_key_prefix,
+        history_key_prefix
+      )
+    end
   end
 
   defp registry_key(index_table, lookup_table), do: {@registry_key, index_table, lookup_table}
