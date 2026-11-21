@@ -12,19 +12,6 @@ All notable changes to FerricStore will be documented here.
   Flows/s and server CPU fell from 555 to 511 ms per 1,000 Flows (100k Flows,
   16 shards, Apple M4 Max, level 12).
 
-- A brand-new standalone node (no `FERRICSTORE_NODE_NAME`) starts at the
-  feature level its release supports (12) instead of 0. Before, a new node ran
-  the level-0 compatibility paths until an operator raised the level, though
-  nothing in it could be applied differently by an older release: every claim
-  with room left also scanned the node-local LMDB mirror for hibernated Flows
-  to promote, which doubled the time each Raft batch spent in apply on the
-  Python SDK queue benchmark, and the level 7 and 8 claim fixes stayed off. A
-  node that restarts on existing data or is started with
-  `FERRICSTORE_NODE_NAME` (a node that may form or join a cluster) keeps its
-  level. `FERRICSTORE_BOOTSTRAP_FEATURE_LEVEL` (`:bootstrap_feature_level`)
-  sets a lower level, or 0 to keep the data directory readable by older
-  releases.
-
 ## 0.12.23 - 2026-11-20
 
 - A native client that spreads requests over many lanes no longer runs the
