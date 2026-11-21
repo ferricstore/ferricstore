@@ -125,10 +125,12 @@ jobs:
         working-directory: sdk
         env:
           FERRICSTORE_CANDIDATE_IMAGE: ${{ env.FERRICSTORE_SDK_IMAGE }}
+        run: |
           # The pinned SDK's mise.toml names temurin-21.0.12+101.0.LTS, which
-          # mise no longer lists; use the Java 21 the toolchain step installed.
-          MISE_JAVA_VERSION: temurin-21
-        run: mise run integration:candidate
+          # mise no longer lists, and `mise run` installs every pinned tool
+          # first; use the Java 21 the toolchain step installed instead.
+          sed -i 's/^java = "temurin-21\.0\.12+101\.0\.LTS"$/java = "temurin-21"/' mise.toml
+          mise run integration:candidate
 
       - name: Run official Go integration suite
         if: matrix.id == 'go'
