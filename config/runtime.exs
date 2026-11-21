@@ -691,16 +691,6 @@ if config_env() == :prod do
   # Clustering
   # ---------------------------------------------------------------------------
 
-  # A brand-new standalone node starts at the highest feature level its
-  # release supports; a number picks a lower level and 0 keeps level 0, so
-  # the data directory can still be opened by an older release.
-  config :ferricstore,
-    bootstrap_feature_level:
-      (case System.get_env("FERRICSTORE_BOOTSTRAP_FEATURE_LEVEL", "supported") do
-         "supported" -> :supported
-         level -> String.to_integer(level)
-       end)
-
   node_name = System.get_env("FERRICSTORE_NODE_NAME")
   cookie = System.get_env("FERRICSTORE_COOKIE", "ferricstore")
 
