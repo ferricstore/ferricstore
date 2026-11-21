@@ -350,7 +350,9 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingWrites do
       defp publish_pending_batch(state, file_id, batch, locations, publication) do
         Ferricstore.Store.PromotedPublication.publish_existing(state, fn ->
           Ferricstore.LatencyTrace.maybe_span "server_pending_locations_us" do
-            apply_pending_batch_locations(state, file_id, batch, locations, publication)
+            with_batched_apply_projection_cache_deletes(state, fn ->
+              apply_pending_batch_locations(state, file_id, batch, locations, publication)
+            end)
           end
 
           Ferricstore.LatencyTrace.maybe_span "server_flow_index_update_us" do
