@@ -646,13 +646,19 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
            )
            when is_binary(data_dir) and is_integer(shard_index) and shard_index >= 0 and
                   is_binary(key) and is_integer(index) and index > 0 do
-        Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(
-          data_dir,
-          shard_index,
-          [
-            {index, key}
-          ]
-        )
+        case Process.get(:sm_apply_projection_cache_refs) do
+          refs when is_list(refs) ->
+            Process.put(:sm_apply_projection_cache_refs, [{index, key} | refs])
+
+          _not_batched ->
+            Ferricstore.Raft.WARaftSegmentReader.delete_apply_projection_entries(
+              data_dir,
+              shard_index,
+              [
+                {index, key}
+              ]
+            )
+        end
 
         :ok
       rescue
@@ -660,6 +666,27 @@ defmodule Ferricstore.Raft.StateMachine.Sections.PendingLocations do
       end
 
       defp delete_apply_projection_cache_for_row(_state, _row, _current_file_id), do: :ok
+
+      # Runs `fun` collecting the apply-projection cache entries of the keys it
+      # overwrites (delete_apply_projection_cache_for_row/3) and drops them in
+      # one call at the end: each call takes the cache lock and updates its
+      # counters, so one per key cost a lock round per written key.
+      defp with_batched_apply_projection_cache_deletes(state, fun) do
+        case Process.get(:sm_apply_projection_cache_refs) do
+          refs when is_list(refs) ->
+            fun.()
+
+          _not_batched ->
+            Process.put(:sm_apply_projection_cache_refs, [])
+
+            try do
+              fun.()
+            after
+              refs = Process.delete(:sm_apply_projection_cache_refs)
+              delete_apply_projection_cache_refs(state, if(is_list(refs), do: refs, else: []))
+            end
+        end
+      end
 
       defp replace_pending_location(
              state,

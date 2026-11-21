@@ -4,6 +4,14 @@ All notable changes to FerricStore will be documented here.
 
 ## Unreleased
 
+- Apply drops the apply-projection cache entries of the keys an entry
+  overwrites in one call per entry. Each overwritten key took the cache lock
+  and updated its counters on its own, and on a standalone node every Flow
+  write overwrites cached keys: about 54k lock rounds a second on the Python
+  SDK queue benchmark. With it, throughput rose from about 20.0k to 21.6k
+  Flows/s and server CPU fell from 555 to 511 ms per 1,000 Flows (100k Flows,
+  16 shards, Apple M4 Max, level 12).
+
 - A brand-new standalone node (no `FERRICSTORE_NODE_NAME`) starts at the
   feature level its release supports (12) instead of 0. Before, a new node ran
   the level-0 compatibility paths until an operator raised the level, though
